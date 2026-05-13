@@ -764,6 +764,57 @@ class NVVMTMALoadLowering : public mlir::OpRewritePattern<NVVMTMALoadOp> {
         return mlir::success();
     }
 };
+
+class NVVMTMAStoreLowering : public mlir::OpRewritePattern<NVVMTMAStoreOp> {
+  public:
+    using mlir::OpRewritePattern<NVVMTMAStoreOp>::OpRewritePattern;
+
+    mlir::LogicalResult
+    matchAndRewrite(NVVMTMAStoreOp op,
+                    mlir::PatternRewriter &rewriter) const override {
+        auto builtinSrcType = getBuiltinWorkgroupMemRefType(
+            op.getSrc().getType(), rewriter.getContext(), op.getLoc());
+        if (!builtinSrcType) {
+            return mlir::failure();
+        }
+        auto builtinSrc =
+            castToBuiltinMemRef(op.getSrc(), builtinSrcType, op.getLoc(),
+                                rewriter);
+        if (!builtinSrc) {
+            return mlir::failure();
+        }
+
+        llvm::SmallVector<mlir::Value> coordinates;
+        if (!extractTupleValues(op.getCoords(), coordinates) ||
+            coordinates.empty()) {
+            return mlir::failure();
+        }
+        for (auto &coord : coordinates) {
+            coord = castToIndex(coord, op.getLoc(), rewriter);
+        }
+
+        auto descType =
+            mlir::dyn_cast<mlir::nvgpu::TensorMapDescriptorType>(
+                op.getDesc().getType());
+        if (!descType ||
+            static_cast<int64_t>(coordinates.size()) !=
+                descType.getTensor().getRank()) {
+            return mlir::failure();
+        }
+
+        auto predicate = castIntegerTo(op.getPredicate(), rewriter.getI1Type(),
+                                      op.getLoc(), rewriter);
+        if (!predicate) {
+            return mlir::failure();
+        }
+
+        mlir::nvgpu::TmaAsyncStoreOp::create(
+            rewriter, op.getLoc(), builtinSrc, op.getDesc(), coordinates,
+            predicate);
+        rewriter.eraseOp(op);
+        return mlir::success();
+    }
+};
 class AMDGPUMfmaLowering : public mlir::OpRewritePattern<AMDGPUMfmaOp> {
   public:
     using mlir::OpRewritePattern<AMDGPUMfmaOp>::OpRewritePattern;
@@ -897,7 +948,7 @@ class LowerAveLangGPUToIntrinsicsPass
     void runOnOperation() override {
         mlir::RewritePatternSet patterns(&getContext());
         patterns.add<NVVMMmaLowering, NVVMLdMatrixLowering,
-                     NVVMStMatrixLowering, NVVMTMADescriptorLowering, NVVMTMAFenceLowering, NVVMTMALoadLowering, AMDGPUMfmaLowering,
+                     NVVMStMatrixLowering, NVVMTMADescriptorLowering, NVVMTMAFenceLowering, NVVMTMALoadLowering, NVVMTMAStoreLowering, AMDGPUMfmaLowering,
                      AMDGPURawBufferLoadLowering, AMDGPURawBufferStoreLowering>(
             &getContext());
 

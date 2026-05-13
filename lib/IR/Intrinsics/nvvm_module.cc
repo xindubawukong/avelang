@@ -150,6 +150,10 @@ class NVVMIntrinsic : public NamedModule {
         ast::Call *call_expr, GeneratorContext *ctx,
         llvm::ArrayRef<mlir::Value> resolved_args) const;
 
+    mlir::Value CreateTMAStoreFunction(
+        ast::Call *call_expr, GeneratorContext *ctx,
+        llvm::ArrayRef<mlir::Value> resolved_args) const;
+
   private:
     void AddLdMatrixFactory(const std::string &name, const std::string &shape,
                             int num, int bit_width, bool transpose);
@@ -194,6 +198,9 @@ class NVVMIntrinsic : public NamedModule {
                                      llvm::ArrayRef<mlir::Value> resolved_args) const;
 
     bool CheckTMALoadFunction(ast::Call *call_expr, GeneratorContext *ctx,
+                                     llvm::ArrayRef<mlir::Value> resolved_args) const;
+
+    bool CheckTMAStoreFunction(ast::Call *call_expr, GeneratorContext *ctx,
                                      llvm::ArrayRef<mlir::Value> resolved_args) const;
 
 };
@@ -276,6 +283,17 @@ void NVVMIntrinsic::Initialize() {
         [this](ast::Call *call_expr, GeneratorContext *gen_ctx,
                llvm::ArrayRef<mlir::Value> resolved_args) -> bool {
             return CheckTMALoadFunction(call_expr, gen_ctx, resolved_args);
+        });
+
+    AddFunction(
+        "tma_store",
+        [this](ast::Call *call_expr, GeneratorContext *gen_ctx,
+               llvm::ArrayRef<mlir::Value> resolved_args) -> mlir::Value {
+            return CreateTMAStoreFunction(call_expr, gen_ctx, resolved_args);
+        },
+        [this](ast::Call *call_expr, GeneratorContext *gen_ctx,
+               llvm::ArrayRef<mlir::Value> resolved_args) -> bool {
+            return CheckTMAStoreFunction(call_expr, gen_ctx, resolved_args);
         });
 
 }
@@ -1010,6 +1028,119 @@ bool NVVMIntrinsic::CheckTMALoadFunction(
             if (!checkIntArg(value, name)) {
                 return false;
             }
+        }
+    }
+
+    return true;
+}
+
+mlir::Value NVVMIntrinsic::CreateTMAStoreFunction(
+    ast::Call *call_expr, GeneratorContext *ctx,
+    llvm::ArrayRef<mlir::Value> resolved_args) const {
+    auto &builder = ctx->GetCurrentFunctionGenerator()->GetBuilder();
+    auto location = builder.getUnknownLoc();
+
+    if (!CheckTMAStoreFunction(call_expr, ctx, resolved_args)) {
+        return nullptr;
+    }
+
+    const auto &keywords = call_expr->GetKeywords();
+    size_t keywordCount = keywords.size();
+    size_t positionalCount = resolved_args.size() - keywordCount;
+
+    mlir::Value predicate =
+        positionalCount > 3
+            ? resolved_args[3]
+            : mlir::arith::ConstantIntOp::create(builder, location, 1, 1).getResult();
+
+    for (size_t i = 0; i < keywordCount; ++i) {
+        mlir::Value value = resolved_args[positionalCount + i];
+        llvm::StringRef name = keywords[i];
+        if (name == "predicate") {
+            predicate = value;
+        }
+    }
+
+    cf::NVVMTMAStoreOp::create(builder, location, mlir::ValueRange{resolved_args[0], resolved_args[1], resolved_args[2], predicate}, mlir::ArrayRef<mlir::NamedAttribute>{});
+    return ctx->GetCurrentFunctionGenerator()->GetExprGenerator()->CreateVoidValue();
+}
+
+bool NVVMIntrinsic::CheckTMAStoreFunction(
+    ast::Call *call_expr, GeneratorContext *ctx,
+    llvm::ArrayRef<mlir::Value> resolved_args) const {
+    const auto &keywords = call_expr->GetKeywords();
+    if (resolved_args.size() < keywords.size()) {
+        ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
+                                        call_expr->GetSourceRange().getBegin())
+            << "tma_store internal argument mismatch";
+        return false;
+    }
+
+    size_t keywordCount = keywords.size();
+    size_t positionalCount = resolved_args.size() - keywordCount;
+    if (positionalCount < 3 || positionalCount > 4) {
+        ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
+                                        call_expr->GetSourceRange().getBegin())
+            << "tma_store requires src, desc, coords and optional predicate";
+        return false;
+    }
+
+    for (auto name : keywords) {
+        if (name != "predicate") {
+            ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
+                                            call_expr->GetSourceRange().getBegin())
+                << "tma_store got unsupported keyword argument '" << name << "'";
+            return false;
+        }
+    }
+
+    auto requireArg = [&](size_t index, llvm::StringRef name) -> bool {
+        if (index >= resolved_args.size() || !resolved_args[index]) {
+            ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
+                                            call_expr->GetSourceRange().getBegin())
+                << "Failed to generate " << name << " operand for tma_store";
+            return false;
+        }
+        return true;
+    };
+
+    if (!requireArg(0, "src") || !requireArg(1, "desc") ||
+        !requireArg(2, "coords")) {
+        return false;
+    }
+
+    if (!mlir::isa<cf::MemRefType>(resolved_args[0].getType())) {
+        ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
+                                        call_expr->GetSourceRange().getBegin())
+            << "tma_store src operand must be a memref";
+        return false;
+    }
+
+    if (!mlir::isa<mlir::nvgpu::TensorMapDescriptorType>(
+            resolved_args[1].getType())) {
+        ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
+                                        call_expr->GetSourceRange().getBegin())
+            << "tma_store desc operand must be a TMA descriptor";
+        return false;
+    }
+
+    auto checkIntArg = [&](mlir::Value value, llvm::StringRef name) -> bool {
+        if (value && !value.getType().isIntOrIndex()) {
+            ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
+                                            call_expr->GetSourceRange().getBegin())
+                << "tma_store " << name << " operand must be an integer type";
+            return false;
+        }
+        return true;
+    };
+
+    if (positionalCount > 3 &&
+        !checkIntArg(resolved_args[3], "predicate")) {
+        return false;
+    }
+    for (size_t i = 0; i < keywordCount; ++i) {
+        if (!checkIntArg(resolved_args[positionalCount + i], keywords[i])) {
+            return false;
         }
     }
 

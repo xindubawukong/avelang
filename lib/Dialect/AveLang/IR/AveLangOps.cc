@@ -686,6 +686,15 @@ void NVVMTMALoadOp::build(mlir::OpBuilder &builder,
     state.addOperands(operands);
     state.addAttributes(attributes);
 }
+
+void NVVMTMAStoreOp::build(mlir::OpBuilder &builder,
+                           mlir::OperationState &state,
+                           mlir::ValueRange operands,
+                           mlir::ArrayRef<mlir::NamedAttribute> attributes) {
+    assert(operands.size() == 4u && "mismatched number of parameters");
+    state.addOperands(operands);
+    state.addAttributes(attributes);
+}
 // AMDGPURawBufferLoadOp build method
 void AMDGPURawBufferLoadOp::build(
     mlir::OpBuilder &builder, mlir::OperationState &state,

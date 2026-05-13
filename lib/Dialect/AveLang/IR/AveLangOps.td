@@ -327,6 +327,26 @@ def NVVMTMALoadOp : AveLang_GPU_Op<"nvvm_tma_load", []> {
         OpBuilder<(ins "mlir::ValueRange":$operands, "mlir::ArrayRef<mlir::NamedAttribute>":$attributes)>
     ];
 }
+
+def NVVMTMAStoreOp : AveLang_GPU_Op<"nvvm_tma_store", []> {
+    let summary = "NVVM TMA asynchronous store operation";
+    let description = [{
+        The `ave.gpu.nvvm_tma_store` operation stores a TMA tile from
+        shared memory to global memory using an NVGPU tensor-map descriptor.
+    }];
+
+    let arguments = (ins
+        AveLang_MemRef:$src,
+        AnyType:$desc,
+        AnyType:$coords,
+        AnyType:$predicate
+    );
+    let results = (outs);
+
+    let builders = [
+        OpBuilder<(ins "mlir::ValueRange":$operands, "mlir::ArrayRef<mlir::NamedAttribute>":$attributes)>
+    ];
+}
 //===----------------------------------------------------------------------===//
 // AMDGPU Operations
 //===----------------------------------------------------------------------===//
