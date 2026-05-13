@@ -1451,6 +1451,22 @@ def mbarrier_test():
     RunMLIRGenerationTest(kSourceCode);
 }
 
+TEST_F(MLIRGeneratorTest, GenerateMLIRNVVMCpAsync) {
+    static const std::string kSourceCode = R"""""(
+import avelang
+import avelang.language as S
+
+@avelang.jit
+def cp_async_test(global_mem: S.Tensor((16,), S.i32)):
+    smem = S.make_shared((16,), S.i32)
+    S.nvvm.cp_async_ca_shared_global(smem, global_mem, 0, 0, 16)
+    S.nvvm.cp_async_commit_group()
+    S.nvvm.cp_async_wait_group(0)
+)""""";
+
+    RunMLIRGenerationTest(kSourceCode);
+}
+
 TEST_F(MLIRGeneratorTest, GenerateMLIRAMDGPUMFMASync) {
     static const std::string kSourceCode = R"""""(
 import avelang

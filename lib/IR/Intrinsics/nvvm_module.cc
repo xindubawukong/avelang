@@ -215,6 +215,18 @@ class NVVMIntrinsic : public NamedModule {
         ast::Call *call_expr, GeneratorContext *ctx,
         llvm::ArrayRef<mlir::Value> resolved_args) const;
 
+    mlir::Value CreateCpAsyncCaSharedGlobalFunction(
+        ast::Call *call_expr, GeneratorContext *ctx,
+        llvm::ArrayRef<mlir::Value> resolved_args) const;
+
+    mlir::Value CreateCpAsyncCommitGroupFunction(
+        ast::Call *call_expr, GeneratorContext *ctx,
+        llvm::ArrayRef<mlir::Value> resolved_args) const;
+
+    mlir::Value CreateCpAsyncWaitGroupFunction(
+        ast::Call *call_expr, GeneratorContext *ctx,
+        llvm::ArrayRef<mlir::Value> resolved_args) const;
+
   private:
     void AddLdMatrixFactory(const std::string &name, const std::string &shape,
                             int num, int bit_width, bool transpose);
@@ -301,6 +313,18 @@ class NVVMIntrinsic : public NamedModule {
         llvm::ArrayRef<mlir::Value> resolved_args) const;
 
     bool CheckMBarrierArriveExpectTxFunction(
+        ast::Call *call_expr, GeneratorContext *ctx,
+        llvm::ArrayRef<mlir::Value> resolved_args) const;
+
+    bool CheckCpAsyncCaSharedGlobalFunction(
+        ast::Call *call_expr, GeneratorContext *ctx,
+        llvm::ArrayRef<mlir::Value> resolved_args) const;
+
+    bool CheckCpAsyncCommitGroupFunction(
+        ast::Call *call_expr, GeneratorContext *ctx,
+        llvm::ArrayRef<mlir::Value> resolved_args) const;
+
+    bool CheckCpAsyncWaitGroupFunction(
         ast::Call *call_expr, GeneratorContext *ctx,
         llvm::ArrayRef<mlir::Value> resolved_args) const;
 
@@ -527,6 +551,45 @@ void NVVMIntrinsic::Initialize() {
                llvm::ArrayRef<mlir::Value> resolved_args) -> bool {
             return CheckMBarrierArriveExpectTxFunction(call_expr, gen_ctx,
                                                        resolved_args);
+        });
+
+    AddFunction(
+        "cp_async_ca_shared_global",
+        [this](ast::Call *call_expr, GeneratorContext *gen_ctx,
+               llvm::ArrayRef<mlir::Value> resolved_args) -> mlir::Value {
+            return CreateCpAsyncCaSharedGlobalFunction(call_expr, gen_ctx,
+                                                       resolved_args);
+        },
+        [this](ast::Call *call_expr, GeneratorContext *gen_ctx,
+               llvm::ArrayRef<mlir::Value> resolved_args) -> bool {
+            return CheckCpAsyncCaSharedGlobalFunction(call_expr, gen_ctx,
+                                                      resolved_args);
+        });
+
+    AddFunction(
+        "cp_async_commit_group",
+        [this](ast::Call *call_expr, GeneratorContext *gen_ctx,
+               llvm::ArrayRef<mlir::Value> resolved_args) -> mlir::Value {
+            return CreateCpAsyncCommitGroupFunction(call_expr, gen_ctx,
+                                                    resolved_args);
+        },
+        [this](ast::Call *call_expr, GeneratorContext *gen_ctx,
+               llvm::ArrayRef<mlir::Value> resolved_args) -> bool {
+            return CheckCpAsyncCommitGroupFunction(call_expr, gen_ctx,
+                                                   resolved_args);
+        });
+
+    AddFunction(
+        "cp_async_wait_group",
+        [this](ast::Call *call_expr, GeneratorContext *gen_ctx,
+               llvm::ArrayRef<mlir::Value> resolved_args) -> mlir::Value {
+            return CreateCpAsyncWaitGroupFunction(call_expr, gen_ctx,
+                                                  resolved_args);
+        },
+        [this](ast::Call *call_expr, GeneratorContext *gen_ctx,
+               llvm::ArrayRef<mlir::Value> resolved_args) -> bool {
+            return CheckCpAsyncWaitGroupFunction(call_expr, gen_ctx,
+                                                 resolved_args);
         });
 
     AddFunction(
@@ -1845,6 +1908,206 @@ bool NVVMIntrinsic::CheckMBarrierArriveExpectTxFunction(
         }
     }
 
+    return true;
+}
+
+mlir::Value NVVMIntrinsic::CreateCpAsyncCaSharedGlobalFunction(
+    ast::Call *call_expr, GeneratorContext *ctx,
+    llvm::ArrayRef<mlir::Value> resolved_args) const {
+    auto &builder = ctx->GetCurrentFunctionGenerator()->GetBuilder();
+    auto location = builder.getUnknownLoc();
+
+    if (!CheckCpAsyncCaSharedGlobalFunction(call_expr, ctx, resolved_args)) {
+        return nullptr;
+    }
+
+    auto toIndex = [&](mlir::Value value) -> mlir::Value {
+        if (value.getType().isIndex()) {
+            return value;
+        }
+        return mlir::arith::IndexCastOp::create(
+            builder, location, builder.getIndexType(), value);
+    };
+
+    auto dstBase = cf::AveLangMemRefExtractAlignedPointerAsIndexOp::create(
+        builder, location, builder.getIndexType(), resolved_args[0]);
+    auto srcBase = cf::AveLangMemRefExtractAlignedPointerAsIndexOp::create(
+        builder, location, builder.getIndexType(), resolved_args[1]);
+    auto dstOffset = toIndex(resolved_args[2]);
+    auto srcOffset = toIndex(resolved_args[3]);
+    auto dstAddr = mlir::arith::AddIOp::create(builder, location,
+                                               dstBase.getResult(), dstOffset);
+    auto srcAddr = mlir::arith::AddIOp::create(builder, location,
+                                               srcBase.getResult(), srcOffset);
+
+    auto dstAddrI64 = mlir::arith::IndexCastOp::create(
+        builder, location, builder.getI64Type(), dstAddr.getResult());
+    auto srcAddrI64 = mlir::arith::IndexCastOp::create(
+        builder, location, builder.getI64Type(), srcAddr.getResult());
+
+    auto dstPtrType = mlir::LLVM::LLVMPointerType::get(
+        builder.getContext(),
+        static_cast<unsigned>(mlir::NVVM::NVVMMemorySpace::Shared));
+    auto srcPtrType = mlir::LLVM::LLVMPointerType::get(
+        builder.getContext(),
+        static_cast<unsigned>(mlir::NVVM::NVVMMemorySpace::Global));
+
+    auto dstPtr = mlir::LLVM::IntToPtrOp::create(
+        builder, location, dstPtrType, dstAddrI64.getResult());
+    auto srcPtr = mlir::LLVM::IntToPtrOp::create(
+        builder, location, srcPtrType, srcAddrI64.getResult());
+    auto sizeBytes = static_cast<int64_t>(*getConstantIntValue(resolved_args[4]));
+
+    mlir::NVVM::CpAsyncOp::create(
+        builder, location, dstPtr.getResult(), srcPtr.getResult(),
+        builder.getI32IntegerAttr(sizeBytes),
+        mlir::NVVM::LoadCacheModifierKindAttr::get(
+            builder.getContext(), mlir::NVVM::LoadCacheModifierKind::CA),
+        mlir::Value());
+
+    return ctx->GetCurrentFunctionGenerator()
+        ->GetExprGenerator()
+        ->CreateVoidValue();
+}
+
+bool NVVMIntrinsic::CheckCpAsyncCaSharedGlobalFunction(
+    ast::Call *call_expr, GeneratorContext *ctx,
+    llvm::ArrayRef<mlir::Value> resolved_args) const {
+    if (resolved_args.size() != 5) {
+        ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
+                                        call_expr->GetSourceRange().getBegin())
+            << "cp_async_ca_shared_global requires 5 arguments: dst, src, dst_offset_bytes, src_offset_bytes, size_bytes";
+        return false;
+    }
+    if (!resolved_args[0] || !resolved_args[1] || !resolved_args[2] ||
+        !resolved_args[3] || !resolved_args[4]) {
+        ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
+                                        call_expr->GetSourceRange().getBegin())
+            << "failed to generate one or more operands for cp_async_ca_shared_global";
+        return false;
+    }
+
+    auto dstType = mlir::dyn_cast<cf::MemRefType>(resolved_args[0].getType());
+    auto srcType = mlir::dyn_cast<cf::MemRefType>(resolved_args[1].getType());
+    if (!dstType || !srcType) {
+        ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
+                                        call_expr->GetSourceRange().getBegin())
+            << "cp_async_ca_shared_global dst/src operands must be memrefs";
+        return false;
+    }
+
+    auto gpuSpace = mlir::gpu::AddressSpaceAttr::get(
+        ctx->GetCurrentFunctionGenerator()->GetBuilder().getContext(),
+        mlir::gpu::AddressSpace::Workgroup);
+    if (dstType.getMemorySpace() != gpuSpace) {
+        ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
+                                        call_expr->GetSourceRange().getBegin())
+            << "cp_async_ca_shared_global dst operand must be in workgroup memory";
+        return false;
+    }
+
+    if (!resolved_args[2].getType().isIntOrIndex() ||
+        !resolved_args[3].getType().isIntOrIndex() ||
+        !resolved_args[4].getType().isIntOrIndex()) {
+        ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
+                                        call_expr->GetSourceRange().getBegin())
+            << "cp_async_ca_shared_global offset/size operands must be integer/index";
+        return false;
+    }
+
+    auto sizeBytes = getConstantIntValue(resolved_args[4]);
+    if (!sizeBytes) {
+        ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
+                                        call_expr->GetSourceRange().getBegin())
+            << "cp_async_ca_shared_global size_bytes must be a compile-time constant";
+        return false;
+    }
+
+    if (*sizeBytes != 4 && *sizeBytes != 8 && *sizeBytes != 16) {
+        ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
+                                        call_expr->GetSourceRange().getBegin())
+            << "cp_async_ca_shared_global size_bytes must be one of 4, 8, or 16";
+        return false;
+    }
+
+    return true;
+}
+
+mlir::Value NVVMIntrinsic::CreateCpAsyncCommitGroupFunction(
+    ast::Call *call_expr, GeneratorContext *ctx,
+    llvm::ArrayRef<mlir::Value> resolved_args) const {
+    auto &builder = ctx->GetCurrentFunctionGenerator()->GetBuilder();
+    auto location = builder.getUnknownLoc();
+
+    if (!CheckCpAsyncCommitGroupFunction(call_expr, ctx, resolved_args)) {
+        return nullptr;
+    }
+
+    mlir::NVVM::CpAsyncCommitGroupOp::create(builder, location);
+    return ctx->GetCurrentFunctionGenerator()
+        ->GetExprGenerator()
+        ->CreateVoidValue();
+}
+
+bool NVVMIntrinsic::CheckCpAsyncCommitGroupFunction(
+    ast::Call *call_expr, GeneratorContext *ctx,
+    llvm::ArrayRef<mlir::Value> resolved_args) const {
+    if (!resolved_args.empty()) {
+        ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
+                                        call_expr->GetSourceRange().getBegin())
+            << "cp_async_commit_group takes no arguments";
+        return false;
+    }
+    return true;
+}
+
+mlir::Value NVVMIntrinsic::CreateCpAsyncWaitGroupFunction(
+    ast::Call *call_expr, GeneratorContext *ctx,
+    llvm::ArrayRef<mlir::Value> resolved_args) const {
+    auto &builder = ctx->GetCurrentFunctionGenerator()->GetBuilder();
+    auto location = builder.getUnknownLoc();
+
+    if (!CheckCpAsyncWaitGroupFunction(call_expr, ctx, resolved_args)) {
+        return nullptr;
+    }
+
+    auto group = static_cast<int32_t>(*getConstantIntValue(resolved_args[0]));
+    mlir::NVVM::CpAsyncWaitGroupOp::create(
+        builder, location, builder.getI32IntegerAttr(group));
+    return ctx->GetCurrentFunctionGenerator()
+        ->GetExprGenerator()
+        ->CreateVoidValue();
+}
+
+bool NVVMIntrinsic::CheckCpAsyncWaitGroupFunction(
+    ast::Call *call_expr, GeneratorContext *ctx,
+    llvm::ArrayRef<mlir::Value> resolved_args) const {
+    if (resolved_args.size() != 1 || !resolved_args[0]) {
+        ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
+                                        call_expr->GetSourceRange().getBegin())
+            << "cp_async_wait_group requires 1 argument: n";
+        return false;
+    }
+    if (!resolved_args[0].getType().isIntOrIndex()) {
+        ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
+                                        call_expr->GetSourceRange().getBegin())
+            << "cp_async_wait_group n operand must be integer/index";
+        return false;
+    }
+
+    auto group = getConstantIntValue(resolved_args[0]);
+    if (!group) {
+        ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
+                                        call_expr->GetSourceRange().getBegin())
+            << "cp_async_wait_group n must be a compile-time constant";
+        return false;
+    }
+    if (*group < 0 || *group > 8) {
+        ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
+                                        call_expr->GetSourceRange().getBegin())
+            << "cp_async_wait_group n must be in [0, 8]";
+        return false;
+    }
     return true;
 }
 
