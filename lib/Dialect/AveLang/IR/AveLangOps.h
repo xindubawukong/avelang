@@ -26,6 +26,7 @@ class NVVMLdMatrixOp;
 class NVVMStMatrixOp;
 class NVVMTMADescriptorOp;
 class NVVMTMAFenceOp;
+class NVVMTMALoadOp;
 class AMDGPUMfmaOp;
 class AMDGPURawBufferLoadOp;
 class AMDGPURawBufferStoreOp;

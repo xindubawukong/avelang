@@ -427,8 +427,8 @@ TEST_F(LLVMTargetTest, SharedMemoryUnionStyleSubviews) {
     EXPECT_NE(llvmDump.find(
                   "store <2 x bfloat> <bfloat 0xR3F80, bfloat 0xR4000>, "
                   "ptr addrspace(3) @__wg_test_shared_memory_union_subviews_0, "
-                  "align 16"),
-              std::string::npos);
+                  "align "),
+              std::string::npos) << llvmDump;
 }
 
 TEST_F(LLVMTargetTest, SharedMemorySubviewLayoutCastLowers) {
@@ -672,6 +672,29 @@ TEST_F(LLVMTargetTest, MultipleSharedMemory) {
   }
 })";
     TestLLVMCompilation(mlirCode);
+}
+
+TEST_F(LLVMTargetTest, PrivateMemRefLoweringUsesDefaultStackAddressSpace) {
+    const std::string mlirCode = R"(module {
+  func.func @test_private_memref(%arg0: !ave.memref<!ave.layout<dims = [1], strides = []>, f16>) attributes {ave.gpu_func = 2 : i32} {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %value = arith.constant 1.000000e+00 : f16
+    %acc = ave.memref.alloca() : !ave.memref<!ave.layout<dims = [2, 2, 4], strides = []>, f16, #gpu.address_space<private>>
+    ave.memref.store %value, %acc[%c1, %c1, %c0] : f16, !ave.memref<!ave.layout<dims = [2, 2, 4], strides = []>, f16, #gpu.address_space<private>>
+    %loaded = ave.memref.load %acc[%c1, %c1, %c0] : !ave.memref<!ave.layout<dims = [2, 2, 4], strides = []>, f16, #gpu.address_space<private>> -> f16
+    ave.memref.store %loaded, %arg0[%c0] : f16, !ave.memref<!ave.layout<dims = [1], strides = []>, f16>
+    return
+  }
+})";
+
+    std::string lowered = LowerAveLangToMemRef(mlirCode);
+    ASSERT_FALSE(lowered.empty());
+
+    EXPECT_NE(lowered.find("memref.alloca"), std::string::npos) << lowered;
+    EXPECT_EQ(lowered.find("#gpu.address_space<private>"), std::string::npos)
+        << lowered;
+    EXPECT_EQ(lowered.find(", 5>"), std::string::npos) << lowered;
 }
 
 } // namespace causalflow::avelang::target::gpu

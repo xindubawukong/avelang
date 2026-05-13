@@ -146,6 +146,10 @@ class NVVMIntrinsic : public NamedModule {
         ast::Call *call_expr, GeneratorContext *ctx,
         llvm::ArrayRef<mlir::Value> resolved_args) const;
 
+    mlir::Value CreateTMALoadFunction(
+        ast::Call *call_expr, GeneratorContext *ctx,
+        llvm::ArrayRef<mlir::Value> resolved_args) const;
+
   private:
     void AddLdMatrixFactory(const std::string &name, const std::string &shape,
                             int num, int bit_width, bool transpose);
@@ -187,6 +191,9 @@ class NVVMIntrinsic : public NamedModule {
                                      llvm::ArrayRef<mlir::Value> resolved_args) const;
 
     bool CheckTMAFenceFunction(ast::Call *call_expr, GeneratorContext *ctx,
+                                     llvm::ArrayRef<mlir::Value> resolved_args) const;
+
+    bool CheckTMALoadFunction(ast::Call *call_expr, GeneratorContext *ctx,
                                      llvm::ArrayRef<mlir::Value> resolved_args) const;
 
 };
@@ -258,6 +265,17 @@ void NVVMIntrinsic::Initialize() {
         [this](ast::Call *call_expr, GeneratorContext *gen_ctx,
                llvm::ArrayRef<mlir::Value> resolved_args) -> bool {
             return CheckTMAFenceFunction(call_expr, gen_ctx, resolved_args);
+        });
+
+    AddFunction(
+        "tma_load",
+        [this](ast::Call *call_expr, GeneratorContext *gen_ctx,
+               llvm::ArrayRef<mlir::Value> resolved_args) -> mlir::Value {
+            return CreateTMALoadFunction(call_expr, gen_ctx, resolved_args);
+        },
+        [this](ast::Call *call_expr, GeneratorContext *gen_ctx,
+               llvm::ArrayRef<mlir::Value> resolved_args) -> bool {
+            return CheckTMALoadFunction(call_expr, gen_ctx, resolved_args);
         });
 
 }
@@ -846,6 +864,153 @@ bool NVVMIntrinsic::CheckTMAFenceFunction(
                                         call_expr->GetSourceRange().getBegin())
             << "tma_fence desc operand must be a TMA descriptor";
         return false;
+    }
+
+    return true;
+}
+
+mlir::Value NVVMIntrinsic::CreateTMALoadFunction(
+    ast::Call *call_expr, GeneratorContext *ctx,
+    llvm::ArrayRef<mlir::Value> resolved_args) const {
+    auto &builder = ctx->GetCurrentFunctionGenerator()->GetBuilder();
+    auto location = builder.getUnknownLoc();
+
+    if (!CheckTMALoadFunction(call_expr, ctx, resolved_args)) {
+        return nullptr;
+    }
+
+    const auto &keywords = call_expr->GetKeywords();
+    size_t keywordCount = keywords.size();
+    size_t positionalCount = resolved_args.size() - keywordCount;
+
+    mlir::Value mbarId =
+        positionalCount > 4
+            ? resolved_args[4]
+            : mlir::arith::ConstantIndexOp::create(builder, location, 0).getResult();
+    mlir::Value predicate =
+        positionalCount > 5
+            ? resolved_args[5]
+            : mlir::arith::ConstantIntOp::create(builder, location, 1, 1).getResult();
+    mlir::Value multicastMask =
+        positionalCount > 6
+            ? resolved_args[6]
+            : mlir::arith::ConstantIntOp::create(builder, location, -1, 32).getResult();
+
+    for (size_t i = 0; i < keywordCount; ++i) {
+        mlir::Value value = resolved_args[positionalCount + i];
+        llvm::StringRef name = keywords[i];
+        if (name == "mbar_id") {
+            mbarId = value;
+        } else if (name == "predicate") {
+            predicate = value;
+        } else if (name == "multicast_mask") {
+            if (value) {
+                multicastMask = value;
+            }
+        }
+    }
+
+    cf::NVVMTMALoadOp::create(builder, location, mlir::ValueRange{resolved_args[0], resolved_args[1], resolved_args[2],
+                         resolved_args[3], mbarId, predicate, multicastMask},
+        mlir::ArrayRef<mlir::NamedAttribute>{});
+    return ctx->GetCurrentFunctionGenerator()->GetExprGenerator()->CreateVoidValue();
+}
+
+bool NVVMIntrinsic::CheckTMALoadFunction(
+    ast::Call *call_expr, GeneratorContext *ctx,
+    llvm::ArrayRef<mlir::Value> resolved_args) const {
+    const auto &keywords = call_expr->GetKeywords();
+    if (resolved_args.size() < keywords.size()) {
+        ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
+                                        call_expr->GetSourceRange().getBegin())
+            << "tma_load internal argument mismatch";
+        return false;
+    }
+
+    size_t keywordCount = keywords.size();
+    size_t positionalCount = resolved_args.size() - keywordCount;
+    if (positionalCount < 4 || positionalCount > 7) {
+        ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
+                                        call_expr->GetSourceRange().getBegin())
+            << "tma_load requires dst, desc, coords, barrier and optional "
+               "mbar_id, predicate, multicast_mask";
+        return false;
+    }
+
+    for (auto name : keywords) {
+        if (name != "mbar_id" && name != "predicate" &&
+            name != "multicast_mask") {
+            ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
+                                            call_expr->GetSourceRange().getBegin())
+                << "tma_load got unsupported keyword argument '" << name << "'";
+            return false;
+        }
+    }
+
+    auto requireArg = [&](size_t index, llvm::StringRef name) -> bool {
+        if (index >= resolved_args.size() || !resolved_args[index]) {
+            ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
+                                            call_expr->GetSourceRange().getBegin())
+                << "Failed to generate " << name << " operand for tma_load";
+            return false;
+        }
+        return true;
+    };
+
+    if (!requireArg(0, "dst") || !requireArg(1, "desc") ||
+        !requireArg(2, "coords") || !requireArg(3, "barrier")) {
+        return false;
+    }
+
+    if (!mlir::isa<cf::MemRefType>(resolved_args[0].getType())) {
+        ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
+                                        call_expr->GetSourceRange().getBegin())
+            << "tma_load dst operand must be a memref";
+        return false;
+    }
+
+    if (!mlir::isa<mlir::nvgpu::TensorMapDescriptorType>(
+            resolved_args[1].getType())) {
+        ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
+                                        call_expr->GetSourceRange().getBegin())
+            << "tma_load desc operand must be a TMA descriptor";
+        return false;
+    }
+
+    if (!mlir::isa<mlir::nvgpu::MBarrierGroupType>(
+            resolved_args[3].getType())) {
+        ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
+                                        call_expr->GetSourceRange().getBegin())
+            << "tma_load barrier operand must be of type mbarrier_group_t";
+        return false;
+    }
+
+    auto checkIntArg = [&](mlir::Value value, llvm::StringRef name) -> bool {
+        if (value && !value.getType().isIntOrIndex()) {
+            ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
+                                            call_expr->GetSourceRange().getBegin())
+                << "tma_load " << name << " operand must be an integer type";
+            return false;
+        }
+        return true;
+    };
+
+    for (size_t i = 4; i < positionalCount; ++i) {
+        if (!checkIntArg(resolved_args[i], i == 4 ? "mbar_id" :
+                                           i == 5 ? "predicate" :
+                                                    "multicast_mask")) {
+            return false;
+        }
+    }
+    for (size_t i = 0; i < keywordCount; ++i) {
+        auto name = llvm::StringRef(keywords[i]);
+        auto value = resolved_args[positionalCount + i];
+        if (name == "mbar_id" || name == "predicate" ||
+            (name == "multicast_mask" && value)) {
+            if (!checkIntArg(value, name)) {
+                return false;
+            }
+        }
     }
 
     return true;

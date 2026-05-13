@@ -302,6 +302,31 @@ def NVVMTMAFenceOp : AveLang_GPU_Op<"nvvm_tma_fence", []> {
         OpBuilder<(ins "mlir::ValueRange":$operands, "mlir::ArrayRef<mlir::NamedAttribute>":$attributes)>
     ];
 }
+
+def NVVMTMALoadOp : AveLang_GPU_Op<"nvvm_tma_load", []> {
+    let summary = "NVVM TMA asynchronous load operation";
+    let description = [{
+        The `ave.gpu.nvvm_tma_load` operation loads a TMA tile from
+        global memory to shared memory using an NVGPU tensor-map descriptor.
+        The lowering also emits the mbarrier expect-tx operation using the
+        destination tile byte size.
+    }];
+
+    let arguments = (ins
+        AveLang_MemRef:$dst,
+        AnyType:$desc,
+        AnyType:$coords,
+        AnyType:$barrier,
+        AnyType:$mbarId,
+        AnyType:$predicate,
+        AnyType:$multicastMask
+    );
+    let results = (outs);
+
+    let builders = [
+        OpBuilder<(ins "mlir::ValueRange":$operands, "mlir::ArrayRef<mlir::NamedAttribute>":$attributes)>
+    ];
+}
 //===----------------------------------------------------------------------===//
 // AMDGPU Operations
 //===----------------------------------------------------------------------===//

@@ -1377,6 +1377,24 @@ def tma_fence_test(global_mem: S.Tensor((16, 16), S.f32)):
     RunMLIRGenerationTest(kSourceCode);
 }
 
+TEST_F(MLIRGeneratorTest, GenerateMLIRNVVMTmaLoad) {
+    static const std::string kSourceCode = R"""""(
+import avelang
+import avelang.language as S
+
+@avelang.jit
+def tma_load_test(global_mem: S.Tensor((16, 16), S.f32)):
+    smem = S.make_shared((16, 16), S.f32)
+    smem_layout = S.make_layout((16, 16), (16, 1))
+    desc = S.nvvm.make_tma_descriptor(global_mem, smem_layout)
+    S.nvvm.tma_load(smem, desc, (0, 0), smem, mbar_id=0, predicate=1)
+)""""";
+
+    RunMLIRGenerationErrorTest(kSourceCode,
+                               "tma_load barrier operand must be of type "
+                               "mbarrier_group_t");
+}
+
 TEST_F(MLIRGeneratorTest, GenerateMLIRAMDGPUMFMASync) {
     static const std::string kSourceCode = R"""""(
 import avelang

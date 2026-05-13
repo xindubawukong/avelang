@@ -70,6 +70,127 @@ static bool extractTupleValues(mlir::Value tupleValue,
     values.push_back(tupleValue);
     return true;
 }
+
+static mlir::MemRefType
+getBuiltinWorkgroupMemRefType(mlir::Type type, mlir::MLIRContext *context,
+                              mlir::Location loc) {
+    // Use integer shared-memory address space to match NVVM lowering
+    // expectations and avoid unresolved memory-space cast conversions.
+    auto workgroupMemorySpace =
+        mlir::IntegerAttr::get(mlir::IntegerType::get(context, 64), 3);
+    if (auto memrefType = mlir::dyn_cast<mlir::MemRefType>(type)) {
+        return mlir::MemRefType::getChecked(
+            [&]() { return mlir::emitError(loc); }, memrefType.getShape(),
+            memrefType.getElementType(), mlir::MemRefLayoutAttrInterface(),
+            workgroupMemorySpace);
+    }
+    if (auto substrateType = mlir::dyn_cast<MemRefType>(type)) {
+        return mlir::MemRefType::getChecked(
+            [&]() { return mlir::emitError(loc); }, substrateType.getShape(),
+            substrateType.getElementType(), mlir::MemRefLayoutAttrInterface(),
+            workgroupMemorySpace);
+    }
+    mlir::emitError(loc) << "expected memref-like operand";
+    return {};
+}
+static std::optional<int64_t> getElementByteSize(mlir::Type elementType) {
+    if (auto vectorType = mlir::dyn_cast<mlir::VectorType>(elementType)) {
+        auto elemBytes = getElementByteSize(vectorType.getElementType());
+        if (!elemBytes) {
+            return std::nullopt;
+        }
+        return (*elemBytes) * vectorType.getNumElements();
+    }
+    if (!elementType.isIntOrFloat()) {
+        return std::nullopt;
+    }
+    int64_t bitWidth = elementType.getIntOrFloatBitWidth();
+    if (bitWidth <= 0 || bitWidth % 8 != 0) {
+        return std::nullopt;
+    }
+    return bitWidth / 8;
+}
+
+static std::optional<int64_t> getStaticByteSize(mlir::MemRefType type) {
+    auto elemBytes = getElementByteSize(type.getElementType());
+    if (!elemBytes || !type.hasStaticShape()) {
+        return std::nullopt;
+    }
+    int64_t elemCount = 1;
+    for (auto dim : type.getShape()) {
+        if (dim == mlir::ShapedType::kDynamic) {
+            return std::nullopt;
+        }
+        elemCount *= dim;
+    }
+    return elemCount * (*elemBytes);
+}
+static std::optional<int64_t> getConstantIntValue(mlir::Value value) {
+    if (!value) {
+        return std::nullopt;
+    }
+    if (auto constOp = value.getDefiningOp<mlir::arith::ConstantOp>()) {
+        if (auto intAttr =
+                mlir::dyn_cast<mlir::IntegerAttr>(constOp.getValue())) {
+            return intAttr.getInt();
+        }
+    }
+    if (auto constOp = value.getDefiningOp<mlir::LLVM::ConstantOp>()) {
+        if (auto intAttr =
+                mlir::dyn_cast<mlir::IntegerAttr>(constOp.getValue())) {
+            return intAttr.getInt();
+        }
+    }
+    return std::nullopt;
+}
+
+static mlir::Value castToIndex(mlir::Value value, mlir::Location loc,
+                               mlir::PatternRewriter &rewriter) {
+    if (value.getType().isIndex()) {
+        return value;
+    }
+    return mlir::arith::IndexCastOp::create(rewriter, loc,
+                                            rewriter.getIndexType(), value);
+}
+
+static mlir::Value castIntegerTo(mlir::Value value, mlir::IntegerType targetType,
+                                 mlir::Location loc,
+                                 mlir::PatternRewriter &rewriter) {
+    if (value.getType() == targetType) {
+        return value;
+    }
+    if (value.getType().isIndex()) {
+        return mlir::arith::IndexCastOp::create(rewriter, loc, targetType,
+                                                value);
+    }
+    auto sourceType = mlir::dyn_cast<mlir::IntegerType>(value.getType());
+    if (!sourceType) {
+        return {};
+    }
+    unsigned sourceWidth = sourceType.getWidth();
+    unsigned targetWidth = targetType.getWidth();
+    if (sourceWidth == targetWidth) {
+        return value;
+    }
+    if (sourceWidth > targetWidth) {
+        return mlir::arith::TruncIOp::create(rewriter, loc, targetType, value);
+    }
+    return mlir::arith::ExtUIOp::create(rewriter, loc, targetType, value);
+}
+
+static mlir::Value castToBuiltinMemRef(mlir::Value value,
+                                       mlir::MemRefType targetType,
+                                       mlir::Location loc,
+                                       mlir::PatternRewriter &rewriter) {
+    if (!targetType) {
+        return {};
+    }
+    if (value.getType() == targetType) {
+        return value;
+    }
+    return AveLangMemRefCastOp::create(rewriter, loc, value, targetType)
+        .getResult();
+}
 /// Helper to convert a memref to an aligned pointer index with optional bounds
 /// checking. Returns a null Value on failure and emits a diagnostic.
 mlir::Value convertMemrefToPointerIndex(mlir::PatternRewriter &rewriter,
@@ -569,6 +690,80 @@ class NVVMTMAFenceLowering : public mlir::OpRewritePattern<NVVMTMAFenceOp> {
         return mlir::success();
     }
 };
+
+class NVVMTMALoadLowering : public mlir::OpRewritePattern<NVVMTMALoadOp> {
+  public:
+    using mlir::OpRewritePattern<NVVMTMALoadOp>::OpRewritePattern;
+
+    mlir::LogicalResult
+    matchAndRewrite(NVVMTMALoadOp op,
+                    mlir::PatternRewriter &rewriter) const override {
+        auto builtinDstType = getBuiltinWorkgroupMemRefType(
+            op.getDst().getType(), rewriter.getContext(), op.getLoc());
+        if (!builtinDstType) {
+            return mlir::failure();
+        }
+        auto builtinDst =
+            castToBuiltinMemRef(op.getDst(), builtinDstType, op.getLoc(),
+                                rewriter);
+        if (!builtinDst) {
+            return mlir::failure();
+        }
+
+        auto txCount = getStaticByteSize(builtinDstType);
+        if (!txCount) {
+            return mlir::failure();
+        }
+
+        llvm::SmallVector<mlir::Value> coordinates;
+        if (!extractTupleValues(op.getCoords(), coordinates) ||
+            coordinates.empty()) {
+            return mlir::failure();
+        }
+        for (auto &coord : coordinates) {
+            coord = castToIndex(coord, op.getLoc(), rewriter);
+        }
+
+        auto descType =
+            mlir::dyn_cast<mlir::nvgpu::TensorMapDescriptorType>(
+                op.getDesc().getType());
+        if (!descType ||
+            static_cast<int64_t>(coordinates.size()) !=
+                descType.getTensor().getRank()) {
+            return mlir::failure();
+        }
+
+        auto mbarId = castToIndex(op.getMbarId(), op.getLoc(), rewriter);
+        auto predicate = castIntegerTo(op.getPredicate(), rewriter.getI1Type(),
+                                      op.getLoc(), rewriter);
+        if (!mbarId || !predicate) {
+            return mlir::failure();
+        }
+
+        auto txCountValue = mlir::arith::ConstantIndexOp::create(
+            rewriter, op.getLoc(), *txCount);
+        mlir::nvgpu::MBarrierArriveExpectTxOp::create(
+            rewriter, op.getLoc(), op.getBarrier(), txCountValue, mbarId,
+            predicate);
+
+        mlir::Value multicastMask;
+        auto maskSentinel = getConstantIntValue(op.getMulticastMask());
+        if (!maskSentinel || *maskSentinel >= 0) {
+            multicastMask = castIntegerTo(op.getMulticastMask(),
+                                          rewriter.getI16Type(), op.getLoc(),
+                                          rewriter);
+            if (!multicastMask) {
+                return mlir::failure();
+            }
+        }
+
+        mlir::nvgpu::TmaAsyncLoadOp::create(
+            rewriter, op.getLoc(), builtinDst, op.getBarrier(), op.getDesc(),
+            coordinates, mbarId, multicastMask, predicate);
+        rewriter.eraseOp(op);
+        return mlir::success();
+    }
+};
 class AMDGPUMfmaLowering : public mlir::OpRewritePattern<AMDGPUMfmaOp> {
   public:
     using mlir::OpRewritePattern<AMDGPUMfmaOp>::OpRewritePattern;
@@ -702,7 +897,7 @@ class LowerAveLangGPUToIntrinsicsPass
     void runOnOperation() override {
         mlir::RewritePatternSet patterns(&getContext());
         patterns.add<NVVMMmaLowering, NVVMLdMatrixLowering,
-                     NVVMStMatrixLowering, NVVMTMADescriptorLowering, NVVMTMAFenceLowering, AMDGPUMfmaLowering,
+                     NVVMStMatrixLowering, NVVMTMADescriptorLowering, NVVMTMAFenceLowering, NVVMTMALoadLowering, AMDGPUMfmaLowering,
                      AMDGPURawBufferLoadLowering, AMDGPURawBufferStoreLowering>(
             &getContext());
 
