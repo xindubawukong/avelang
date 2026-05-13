@@ -668,6 +668,15 @@ void NVVMTMADescriptorOp::build(mlir::OpBuilder &builder,
     assert(resultTypes.size() == 1u && "mismatched number of return types");
     state.addTypes(resultTypes);
 }
+
+void NVVMTMAFenceOp::build(mlir::OpBuilder &builder,
+                           mlir::OperationState &state,
+                           mlir::ValueRange operands,
+                           mlir::ArrayRef<mlir::NamedAttribute> attributes) {
+    assert(operands.size() == 1u && "mismatched number of parameters");
+    state.addOperands(operands);
+    state.addAttributes(attributes);
+}
 // AMDGPURawBufferLoadOp build method
 void AMDGPURawBufferLoadOp::build(
     mlir::OpBuilder &builder, mlir::OperationState &state,

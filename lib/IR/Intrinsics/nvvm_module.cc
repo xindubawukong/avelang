@@ -142,6 +142,10 @@ class NVVMIntrinsic : public NamedModule {
         ast::Call *call_expr, GeneratorContext *ctx,
         llvm::ArrayRef<mlir::Value> resolved_args) const;
 
+    mlir::Value CreateTMAFenceFunction(
+        ast::Call *call_expr, GeneratorContext *ctx,
+        llvm::ArrayRef<mlir::Value> resolved_args) const;
+
   private:
     void AddLdMatrixFactory(const std::string &name, const std::string &shape,
                             int num, int bit_width, bool transpose);
@@ -180,6 +184,9 @@ class NVVMIntrinsic : public NamedModule {
                                 const std::string &shape, int num,
                                 int bit_width, bool transpose) const;
     bool CheckMakeTMADescriptorFunction(ast::Call *call_expr, GeneratorContext *ctx,
+                                     llvm::ArrayRef<mlir::Value> resolved_args) const;
+
+    bool CheckTMAFenceFunction(ast::Call *call_expr, GeneratorContext *ctx,
                                      llvm::ArrayRef<mlir::Value> resolved_args) const;
 
 };
@@ -240,6 +247,17 @@ void NVVMIntrinsic::Initialize() {
                llvm::ArrayRef<mlir::Value> resolved_args) -> bool {
             return CheckMakeTMADescriptorFunction(call_expr, gen_ctx,
                                                   resolved_args);
+        });
+
+    AddFunction(
+        "tma_fence",
+        [this](ast::Call *call_expr, GeneratorContext *gen_ctx,
+               llvm::ArrayRef<mlir::Value> resolved_args) -> mlir::Value {
+            return CreateTMAFenceFunction(call_expr, gen_ctx, resolved_args);
+        },
+        [this](ast::Call *call_expr, GeneratorContext *gen_ctx,
+               llvm::ArrayRef<mlir::Value> resolved_args) -> bool {
+            return CheckTMAFenceFunction(call_expr, gen_ctx, resolved_args);
         });
 
 }
@@ -785,6 +803,48 @@ bool NVVMIntrinsic::CheckMakeTMADescriptorFunction(
         ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
                                         call_expr->GetSourceRange().getBegin())
             << "make_tma_descriptor requires a static smem_layout";
+        return false;
+    }
+
+    return true;
+}
+
+mlir::Value NVVMIntrinsic::CreateTMAFenceFunction(
+    ast::Call *call_expr, GeneratorContext *ctx,
+    llvm::ArrayRef<mlir::Value> resolved_args) const {
+    auto &builder = ctx->GetCurrentFunctionGenerator()->GetBuilder();
+    auto location = builder.getUnknownLoc();
+
+    if (!CheckTMAFenceFunction(call_expr, ctx, resolved_args)) {
+        return nullptr;
+    }
+
+    cf::NVVMTMAFenceOp::create(builder, location, mlir::ValueRange{resolved_args[0]}, mlir::ArrayRef<mlir::NamedAttribute>{});
+    return ctx->GetCurrentFunctionGenerator()->GetExprGenerator()->CreateVoidValue();
+}
+
+bool NVVMIntrinsic::CheckTMAFenceFunction(
+    ast::Call *call_expr, GeneratorContext *ctx,
+    llvm::ArrayRef<mlir::Value> resolved_args) const {
+    if (resolved_args.size() != 1) {
+        ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
+                                        call_expr->GetSourceRange().getBegin())
+            << "tma_fence requires exactly 1 argument: desc";
+        return false;
+    }
+
+    if (!resolved_args[0]) {
+        ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
+                                        call_expr->GetSourceRange().getBegin())
+            << "Failed to generate desc operand for tma_fence";
+        return false;
+    }
+
+    if (!mlir::isa<mlir::nvgpu::TensorMapDescriptorType>(
+            resolved_args[0].getType())) {
+        ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
+                                        call_expr->GetSourceRange().getBegin())
+            << "tma_fence desc operand must be a TMA descriptor";
         return false;
     }
 

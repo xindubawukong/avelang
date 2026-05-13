@@ -281,6 +281,27 @@ def NVVMTMADescriptorOp : AveLang_GPU_Op<"nvvm_tma_descriptor", []> {
         OpBuilder<(ins "mlir::ValueRange":$operands, "mlir::TypeRange":$resultTypes, "mlir::ArrayRef<mlir::NamedAttribute>":$attributes)>
     ];
 }
+
+def NVVMTMAFenceOp : AveLang_GPU_Op<"nvvm_tma_fence", []> {
+    let summary = "NVVM TMA descriptor fence operation";
+    let description = [{
+        The `ave.gpu.nvvm_tma_fence` operation fences an NVGPU tensor-map
+        descriptor before it is used by TMA operations.
+    }];
+
+    let arguments = (ins
+        AnyType:$desc
+    );
+    let results = (outs);
+
+    let assemblyFormat = [{
+        $desc attr-dict `:` type($desc)
+    }];
+
+    let builders = [
+        OpBuilder<(ins "mlir::ValueRange":$operands, "mlir::ArrayRef<mlir::NamedAttribute>":$attributes)>
+    ];
+}
 //===----------------------------------------------------------------------===//
 // AMDGPU Operations
 //===----------------------------------------------------------------------===//
