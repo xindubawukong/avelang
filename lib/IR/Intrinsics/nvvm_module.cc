@@ -191,6 +191,30 @@ class NVVMIntrinsic : public NamedModule {
         ast::Call *call_expr, GeneratorContext *ctx,
         llvm::ArrayRef<mlir::Value> resolved_args) const;
 
+    mlir::Value CreateMBarrierCreateFunction(
+        ast::Call *call_expr, GeneratorContext *ctx,
+        llvm::ArrayRef<mlir::Value> resolved_args) const;
+
+    mlir::Value CreateMBarrierInitFunction(
+        ast::Call *call_expr, GeneratorContext *ctx,
+        llvm::ArrayRef<mlir::Value> resolved_args) const;
+
+    mlir::Value CreateMBarrierTryWaitParityFunction(
+        ast::Call *call_expr, GeneratorContext *ctx,
+        llvm::ArrayRef<mlir::Value> resolved_args) const;
+
+    mlir::Value CreateMBarrierArriveFunction(
+        ast::Call *call_expr, GeneratorContext *ctx,
+        llvm::ArrayRef<mlir::Value> resolved_args) const;
+
+    mlir::Value CreateMBarrierTestWaitFunction(
+        ast::Call *call_expr, GeneratorContext *ctx,
+        llvm::ArrayRef<mlir::Value> resolved_args) const;
+
+    mlir::Value CreateMBarrierArriveExpectTxFunction(
+        ast::Call *call_expr, GeneratorContext *ctx,
+        llvm::ArrayRef<mlir::Value> resolved_args) const;
+
   private:
     void AddLdMatrixFactory(const std::string &name, const std::string &shape,
                             int num, int bit_width, bool transpose);
@@ -253,6 +277,30 @@ class NVVMIntrinsic : public NamedModule {
         llvm::ArrayRef<mlir::Value> resolved_args) const;
 
     bool CheckWgmmaStoreFunction(
+        ast::Call *call_expr, GeneratorContext *ctx,
+        llvm::ArrayRef<mlir::Value> resolved_args) const;
+
+    bool CheckMBarrierCreateFunction(
+        ast::Call *call_expr, GeneratorContext *ctx,
+        llvm::ArrayRef<mlir::Value> resolved_args) const;
+
+    bool CheckMBarrierInitFunction(
+        ast::Call *call_expr, GeneratorContext *ctx,
+        llvm::ArrayRef<mlir::Value> resolved_args) const;
+
+    bool CheckMBarrierTryWaitParityFunction(
+        ast::Call *call_expr, GeneratorContext *ctx,
+        llvm::ArrayRef<mlir::Value> resolved_args) const;
+
+    bool CheckMBarrierArriveFunction(
+        ast::Call *call_expr, GeneratorContext *ctx,
+        llvm::ArrayRef<mlir::Value> resolved_args) const;
+
+    bool CheckMBarrierTestWaitFunction(
+        ast::Call *call_expr, GeneratorContext *ctx,
+        llvm::ArrayRef<mlir::Value> resolved_args) const;
+
+    bool CheckMBarrierArriveExpectTxFunction(
         ast::Call *call_expr, GeneratorContext *ctx,
         llvm::ArrayRef<mlir::Value> resolved_args) const;
 
@@ -401,6 +449,84 @@ void NVVMIntrinsic::Initialize() {
         [this](ast::Call *call_expr, GeneratorContext *gen_ctx,
                llvm::ArrayRef<mlir::Value> resolved_args) -> bool {
             return CheckWgmmaStoreFunction(call_expr, gen_ctx, resolved_args);
+        });
+
+    AddFunction(
+        "mbarrier_create",
+        [this](ast::Call *call_expr, GeneratorContext *gen_ctx,
+               llvm::ArrayRef<mlir::Value> resolved_args) -> mlir::Value {
+            return CreateMBarrierCreateFunction(call_expr, gen_ctx,
+                                                resolved_args);
+        },
+        [this](ast::Call *call_expr, GeneratorContext *gen_ctx,
+               llvm::ArrayRef<mlir::Value> resolved_args) -> bool {
+            return CheckMBarrierCreateFunction(call_expr, gen_ctx,
+                                               resolved_args);
+        });
+
+    AddFunction(
+        "mbarrier_init",
+        [this](ast::Call *call_expr, GeneratorContext *gen_ctx,
+               llvm::ArrayRef<mlir::Value> resolved_args) -> mlir::Value {
+            return CreateMBarrierInitFunction(call_expr, gen_ctx,
+                                              resolved_args);
+        },
+        [this](ast::Call *call_expr, GeneratorContext *gen_ctx,
+               llvm::ArrayRef<mlir::Value> resolved_args) -> bool {
+            return CheckMBarrierInitFunction(call_expr, gen_ctx,
+                                             resolved_args);
+        });
+
+    AddFunction(
+        "mbarrier_try_wait_parity",
+        [this](ast::Call *call_expr, GeneratorContext *gen_ctx,
+               llvm::ArrayRef<mlir::Value> resolved_args) -> mlir::Value {
+            return CreateMBarrierTryWaitParityFunction(call_expr, gen_ctx,
+                                                       resolved_args);
+        },
+        [this](ast::Call *call_expr, GeneratorContext *gen_ctx,
+               llvm::ArrayRef<mlir::Value> resolved_args) -> bool {
+            return CheckMBarrierTryWaitParityFunction(call_expr, gen_ctx,
+                                                      resolved_args);
+        });
+
+    AddFunction(
+        "mbarrier_arrive",
+        [this](ast::Call *call_expr, GeneratorContext *gen_ctx,
+               llvm::ArrayRef<mlir::Value> resolved_args) -> mlir::Value {
+            return CreateMBarrierArriveFunction(call_expr, gen_ctx,
+                                                resolved_args);
+        },
+        [this](ast::Call *call_expr, GeneratorContext *gen_ctx,
+               llvm::ArrayRef<mlir::Value> resolved_args) -> bool {
+            return CheckMBarrierArriveFunction(call_expr, gen_ctx,
+                                               resolved_args);
+        });
+
+    AddFunction(
+        "mbarrier_test_wait",
+        [this](ast::Call *call_expr, GeneratorContext *gen_ctx,
+               llvm::ArrayRef<mlir::Value> resolved_args) -> mlir::Value {
+            return CreateMBarrierTestWaitFunction(call_expr, gen_ctx,
+                                                  resolved_args);
+        },
+        [this](ast::Call *call_expr, GeneratorContext *gen_ctx,
+               llvm::ArrayRef<mlir::Value> resolved_args) -> bool {
+            return CheckMBarrierTestWaitFunction(call_expr, gen_ctx,
+                                                 resolved_args);
+        });
+
+    AddFunction(
+        "mbarrier_arrive_expect_tx",
+        [this](ast::Call *call_expr, GeneratorContext *gen_ctx,
+               llvm::ArrayRef<mlir::Value> resolved_args) -> mlir::Value {
+            return CreateMBarrierArriveExpectTxFunction(call_expr, gen_ctx,
+                                                        resolved_args);
+        },
+        [this](ast::Call *call_expr, GeneratorContext *gen_ctx,
+               llvm::ArrayRef<mlir::Value> resolved_args) -> bool {
+            return CheckMBarrierArriveExpectTxFunction(call_expr, gen_ctx,
+                                                       resolved_args);
         });
 
     AddFunction(
@@ -1267,6 +1393,456 @@ bool NVVMIntrinsic::CheckWgmmaStoreFunction(
                                         call_expr->GetSourceRange().getBegin())
             << "wgmma_store dst operand must be of memref type";
         return false;
+    }
+
+    return true;
+}
+
+mlir::Value NVVMIntrinsic::CreateMBarrierCreateFunction(
+    ast::Call *call_expr, GeneratorContext *ctx,
+    llvm::ArrayRef<mlir::Value> resolved_args) const {
+    auto &builder = ctx->GetCurrentFunctionGenerator()->GetBuilder();
+    auto location = builder.getUnknownLoc();
+
+    if (!CheckMBarrierCreateFunction(call_expr, ctx, resolved_args)) {
+        return nullptr;
+    }
+
+    auto workgroupSpace = mlir::gpu::AddressSpaceAttr::get(
+        builder.getContext(), mlir::gpu::AddressSpace::Workgroup);
+    auto barrierType =
+        mlir::nvgpu::MBarrierGroupType::get(builder.getContext(),
+                                            workgroupSpace);
+    auto barrier =
+        mlir::nvgpu::MBarrierCreateOp::create(builder, location, barrierType);
+    return barrier.getResult();
+}
+
+bool NVVMIntrinsic::CheckMBarrierCreateFunction(
+    ast::Call *call_expr, GeneratorContext *ctx,
+    llvm::ArrayRef<mlir::Value> resolved_args) const {
+    if (!resolved_args.empty()) {
+        ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
+                                        call_expr->GetSourceRange().getBegin())
+            << "mbarrier_create does not take any arguments";
+        return false;
+    }
+
+    return true;
+}
+
+mlir::Value NVVMIntrinsic::CreateMBarrierInitFunction(
+    ast::Call *call_expr, GeneratorContext *ctx,
+    llvm::ArrayRef<mlir::Value> resolved_args) const {
+    auto &builder = ctx->GetCurrentFunctionGenerator()->GetBuilder();
+    auto location = builder.getUnknownLoc();
+
+    if (!CheckMBarrierInitFunction(call_expr, ctx, resolved_args)) {
+        return nullptr;
+    }
+
+    const auto &keywords = call_expr->GetKeywords();
+    size_t keywordCount = keywords.size();
+    size_t positionalCount = resolved_args.size() - keywordCount;
+
+    mlir::Value mbarId = positionalCount > 1 ? resolved_args[1] : mlir::Value();
+    mlir::Value count =
+        positionalCount > 2
+            ? resolved_args[2]
+            : mlir::arith::ConstantIndexOp::create(builder, location, 0)
+                  .getResult();
+    mlir::Value predicate =
+        positionalCount > 3 ? resolved_args[3] : mlir::Value();
+
+    for (size_t i = 0; i < keywordCount; ++i) {
+        mlir::Value value = resolved_args[positionalCount + i];
+        llvm::StringRef name = keywords[i];
+        if (name == "mbar_id") {
+            mbarId = value;
+        } else if (name == "count") {
+            count = value;
+        } else if (name == "predicate") {
+            predicate = value;
+        }
+    }
+
+    auto mbarIdValue = getConstantIntValue(mbarId);
+    if (!mbarIdValue) {
+        return nullptr;
+    }
+
+    if (!count.getType().isIndex()) {
+        count = mlir::arith::IndexCastOp::create(
+            builder, location, builder.getIndexType(), count);
+    }
+    if (predicate) {
+        if (predicate.getType().isIndex()) {
+            predicate = mlir::arith::IndexCastOp::create(
+                builder, location, builder.getI1Type(), predicate);
+        } else if (auto intType =
+                       mlir::dyn_cast<mlir::IntegerType>(predicate.getType());
+                   intType && intType.getWidth() != 1) {
+            predicate = mlir::arith::TruncIOp::create(
+                builder, location, builder.getI1Type(), predicate);
+        }
+    }
+
+    auto mbarIdIndex = mlir::arith::ConstantIndexOp::create(
+        builder, location, *mbarIdValue);
+    mlir::nvgpu::MBarrierInitOp::create(
+        builder, location, resolved_args[0], count, mbarIdIndex, predicate);
+    mlir::gpu::BarrierOp::create(builder, location);
+
+    return ctx->GetCurrentFunctionGenerator()
+        ->GetExprGenerator()
+        ->CreateVoidValue();
+}
+
+bool NVVMIntrinsic::CheckMBarrierInitFunction(
+    ast::Call *call_expr, GeneratorContext *ctx,
+    llvm::ArrayRef<mlir::Value> resolved_args) const {
+    const auto &keywords = call_expr->GetKeywords();
+    if (resolved_args.size() < keywords.size()) {
+        ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
+                                        call_expr->GetSourceRange().getBegin())
+            << "mbarrier_init internal argument mismatch";
+        return false;
+    }
+
+    size_t keywordCount = keywords.size();
+    size_t positionalCount = resolved_args.size() - keywordCount;
+    if (positionalCount < 1 || positionalCount > 4) {
+        ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
+                                        call_expr->GetSourceRange().getBegin())
+            << "mbarrier_init requires barrier, mbar_id and optional count, predicate";
+        return false;
+    }
+
+    for (auto name : keywords) {
+        if (name != "mbar_id" && name != "count" && name != "predicate") {
+            ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
+                                            call_expr->GetSourceRange().getBegin())
+                << "mbarrier_init got unsupported keyword argument '" << name
+                << "'";
+            return false;
+        }
+    }
+
+    if (!resolved_args[0]) {
+        ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
+                                        call_expr->GetSourceRange().getBegin())
+            << "Failed to generate barrier operand for mbarrier_init";
+        return false;
+    }
+
+    if (!mlir::isa<mlir::nvgpu::MBarrierGroupType>(
+            resolved_args[0].getType())) {
+        ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
+                                        call_expr->GetSourceRange().getBegin())
+            << "mbarrier_init operand must be of type mbarrier_group_t";
+        return false;
+    }
+
+    auto keywordValue = [&](llvm::StringRef wanted) -> mlir::Value {
+        for (size_t i = 0; i < keywordCount; ++i) {
+            if (keywords[i] == wanted) {
+                return resolved_args[positionalCount + i];
+            }
+        }
+        return {};
+    };
+
+    mlir::Value mbarId =
+        positionalCount > 1 ? resolved_args[1] : keywordValue("mbar_id");
+    if (!mbarId) {
+        ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
+                                        call_expr->GetSourceRange().getBegin())
+            << "Failed to generate mbar_id operand for mbarrier_init";
+        return false;
+    }
+
+    auto checkIntArg = [&](mlir::Value value, llvm::StringRef name) -> bool {
+        if (value && !value.getType().isIntOrIndex()) {
+            ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
+                                            call_expr->GetSourceRange().getBegin())
+                << "mbarrier_init " << name
+                << " operand must be an integer type";
+            return false;
+        }
+        return true;
+    };
+
+    if (!checkIntArg(mbarId, "mbar_id") ||
+        !getConstantIntValue(mbarId)) {
+        ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
+                                        call_expr->GetSourceRange().getBegin())
+            << "mbarrier_init requires a constant integer value for mbar_id";
+        return false;
+    }
+    if (positionalCount > 2 && !checkIntArg(resolved_args[2], "count")) {
+        return false;
+    }
+    if (positionalCount > 3 && !checkIntArg(resolved_args[3], "predicate")) {
+        return false;
+    }
+    for (size_t i = 0; i < keywordCount; ++i) {
+        if (!checkIntArg(resolved_args[positionalCount + i], keywords[i])) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+mlir::Value NVVMIntrinsic::CreateMBarrierTryWaitParityFunction(
+    ast::Call *call_expr, GeneratorContext *ctx,
+    llvm::ArrayRef<mlir::Value> resolved_args) const {
+    auto &builder = ctx->GetCurrentFunctionGenerator()->GetBuilder();
+    auto location = builder.getUnknownLoc();
+
+    if (!CheckMBarrierTryWaitParityFunction(call_expr, ctx, resolved_args)) {
+        return nullptr;
+    }
+
+    auto parityValue = *getConstantIntValue(resolved_args[1]);
+    auto ticksValue = *getConstantIntValue(resolved_args[2]);
+    auto mbarIdValue = *getConstantIntValue(resolved_args[3]);
+
+    auto parity = mlir::LLVM::ConstantOp::create(
+        builder, location, builder.getI1Type(), parityValue);
+    auto ticks =
+        mlir::arith::ConstantIndexOp::create(builder, location, ticksValue);
+    auto mbarId =
+        mlir::arith::ConstantIndexOp::create(builder, location, mbarIdValue);
+    mlir::nvgpu::MBarrierTryWaitParityOp::create(
+        builder, location, resolved_args[0], parity, ticks, mbarId);
+
+    return ctx->GetCurrentFunctionGenerator()
+        ->GetExprGenerator()
+        ->CreateVoidValue();
+}
+
+bool NVVMIntrinsic::CheckMBarrierTryWaitParityFunction(
+    ast::Call *call_expr, GeneratorContext *ctx,
+    llvm::ArrayRef<mlir::Value> resolved_args) const {
+    if (resolved_args.size() != 4) {
+        ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
+                                        call_expr->GetSourceRange().getBegin())
+            << "mbarrier_try_wait_parity requires exactly 4 arguments: barrier, phaseParity, ticks, mbarId";
+        return false;
+    }
+
+    if (!resolved_args[0] || !resolved_args[1] || !resolved_args[2] ||
+        !resolved_args[3]) {
+        ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
+                                        call_expr->GetSourceRange().getBegin())
+            << "Failed to generate operands for mbarrier_try_wait_parity";
+        return false;
+    }
+
+    if (!mlir::isa<mlir::nvgpu::MBarrierGroupType>(
+            resolved_args[0].getType())) {
+        ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
+                                        call_expr->GetSourceRange().getBegin())
+            << "mbarrier_try_wait_parity operand must be of type mbarrier_group_t";
+        return false;
+    }
+
+    for (size_t i = 1; i < resolved_args.size(); ++i) {
+        if (!resolved_args[i].getType().isIntOrIndex() ||
+            !getConstantIntValue(resolved_args[i])) {
+            ctx->diagnostic_manager->Report(
+                basic::DiagnosticCode::kUnimplemented,
+                call_expr->GetSourceRange().getBegin())
+                << "mbarrier_try_wait_parity phaseParity, ticks, and mbarId "
+                   "operands must be constant integers";
+            return false;
+        }
+    }
+
+    return true;
+}
+
+mlir::Value NVVMIntrinsic::CreateMBarrierArriveFunction(
+    ast::Call *call_expr, GeneratorContext *ctx,
+    llvm::ArrayRef<mlir::Value> resolved_args) const {
+    auto &builder = ctx->GetCurrentFunctionGenerator()->GetBuilder();
+    auto location = builder.getUnknownLoc();
+
+    if (!CheckMBarrierArriveFunction(call_expr, ctx, resolved_args)) {
+        return nullptr;
+    }
+
+    auto mbarIdValue = *getConstantIntValue(resolved_args[1]);
+    auto mbarId =
+        mlir::arith::ConstantIndexOp::create(builder, location, mbarIdValue);
+    auto token = mlir::nvgpu::MBarrierArriveOp::create(
+        builder, location, resolved_args[0], mbarId);
+    return token.getResult();
+}
+
+bool NVVMIntrinsic::CheckMBarrierArriveFunction(
+    ast::Call *call_expr, GeneratorContext *ctx,
+    llvm::ArrayRef<mlir::Value> resolved_args) const {
+    if (resolved_args.size() != 2) {
+        ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
+                                        call_expr->GetSourceRange().getBegin())
+            << "mbarrier_arrive requires exactly 2 arguments: barrier, mbarId";
+        return false;
+    }
+
+    if (!resolved_args[0] || !resolved_args[1]) {
+        ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
+                                        call_expr->GetSourceRange().getBegin())
+            << "Failed to generate operands for mbarrier_arrive";
+        return false;
+    }
+
+    if (!mlir::isa<mlir::nvgpu::MBarrierGroupType>(
+            resolved_args[0].getType())) {
+        ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
+                                        call_expr->GetSourceRange().getBegin())
+            << "mbarrier_arrive operand must be of type mbarrier_group_t";
+        return false;
+    }
+
+    if (!resolved_args[1].getType().isIntOrIndex() ||
+        !getConstantIntValue(resolved_args[1])) {
+        ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
+                                        call_expr->GetSourceRange().getBegin())
+            << "mbarrier_arrive mbarId operand must be a constant integer";
+        return false;
+    }
+
+    return true;
+}
+
+mlir::Value NVVMIntrinsic::CreateMBarrierTestWaitFunction(
+    ast::Call *call_expr, GeneratorContext *ctx,
+    llvm::ArrayRef<mlir::Value> resolved_args) const {
+    auto &builder = ctx->GetCurrentFunctionGenerator()->GetBuilder();
+    auto location = builder.getUnknownLoc();
+
+    if (!CheckMBarrierTestWaitFunction(call_expr, ctx, resolved_args)) {
+        return nullptr;
+    }
+
+    auto mbarIdValue = *getConstantIntValue(resolved_args[2]);
+    auto mbarId =
+        mlir::arith::ConstantIndexOp::create(builder, location, mbarIdValue);
+    auto ready = mlir::nvgpu::MBarrierTestWaitOp::create(
+        builder, location, resolved_args[0], resolved_args[1], mbarId);
+    return ready.getResult();
+}
+
+bool NVVMIntrinsic::CheckMBarrierTestWaitFunction(
+    ast::Call *call_expr, GeneratorContext *ctx,
+    llvm::ArrayRef<mlir::Value> resolved_args) const {
+    if (resolved_args.size() != 3) {
+        ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
+                                        call_expr->GetSourceRange().getBegin())
+            << "mbarrier_test_wait requires exactly 3 arguments: barrier, token, mbarId";
+        return false;
+    }
+
+    if (!resolved_args[0] || !resolved_args[1] || !resolved_args[2]) {
+        ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
+                                        call_expr->GetSourceRange().getBegin())
+            << "Failed to generate operands for mbarrier_test_wait";
+        return false;
+    }
+
+    if (!mlir::isa<mlir::nvgpu::MBarrierGroupType>(
+            resolved_args[0].getType())) {
+        ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
+                                        call_expr->GetSourceRange().getBegin())
+            << "mbarrier_test_wait operand must be of type mbarrier_group_t";
+        return false;
+    }
+
+    if (!mlir::isa<mlir::nvgpu::MBarrierTokenType>(
+            resolved_args[1].getType())) {
+        ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
+                                        call_expr->GetSourceRange().getBegin())
+            << "mbarrier_test_wait token operand must be of type mbarrier_token_t";
+        return false;
+    }
+
+    if (!resolved_args[2].getType().isIntOrIndex() ||
+        !getConstantIntValue(resolved_args[2])) {
+        ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
+                                        call_expr->GetSourceRange().getBegin())
+            << "mbarrier_test_wait mbarId operand must be a constant integer";
+        return false;
+    }
+
+    return true;
+}
+
+mlir::Value NVVMIntrinsic::CreateMBarrierArriveExpectTxFunction(
+    ast::Call *call_expr, GeneratorContext *ctx,
+    llvm::ArrayRef<mlir::Value> resolved_args) const {
+    auto &builder = ctx->GetCurrentFunctionGenerator()->GetBuilder();
+    auto location = builder.getUnknownLoc();
+
+    if (!CheckMBarrierArriveExpectTxFunction(call_expr, ctx, resolved_args)) {
+        return nullptr;
+    }
+
+    auto txCountValue = *getConstantIntValue(resolved_args[1]);
+    auto mbarIdValue = *getConstantIntValue(resolved_args[2]);
+    auto predicateValue = *getConstantIntValue(resolved_args[3]);
+
+    auto txCount =
+        mlir::arith::ConstantIndexOp::create(builder, location, txCountValue);
+    auto mbarId =
+        mlir::arith::ConstantIndexOp::create(builder, location, mbarIdValue);
+    auto predicate = mlir::LLVM::ConstantOp::create(
+        builder, location, builder.getI1Type(), predicateValue);
+    mlir::nvgpu::MBarrierArriveExpectTxOp::create(
+        builder, location, resolved_args[0], txCount, mbarId, predicate);
+
+    return ctx->GetCurrentFunctionGenerator()
+        ->GetExprGenerator()
+        ->CreateVoidValue();
+}
+
+bool NVVMIntrinsic::CheckMBarrierArriveExpectTxFunction(
+    ast::Call *call_expr, GeneratorContext *ctx,
+    llvm::ArrayRef<mlir::Value> resolved_args) const {
+    if (resolved_args.size() != 4) {
+        ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
+                                        call_expr->GetSourceRange().getBegin())
+            << "mbarrier_arrive_expect_tx requires exactly 4 arguments: barrier, txcount, mbarId, predicate";
+        return false;
+    }
+
+    if (!resolved_args[0] || !resolved_args[1] || !resolved_args[2] ||
+        !resolved_args[3]) {
+        ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
+                                        call_expr->GetSourceRange().getBegin())
+            << "Failed to generate operands for mbarrier_arrive_expect_tx";
+        return false;
+    }
+
+    if (!mlir::isa<mlir::nvgpu::MBarrierGroupType>(
+            resolved_args[0].getType())) {
+        ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
+                                        call_expr->GetSourceRange().getBegin())
+            << "mbarrier_arrive_expect_tx operand must be of type mbarrier_group_t";
+        return false;
+    }
+
+    for (size_t i = 1; i < resolved_args.size(); ++i) {
+        if (!resolved_args[i].getType().isIntOrIndex() ||
+            !getConstantIntValue(resolved_args[i])) {
+            ctx->diagnostic_manager->Report(
+                basic::DiagnosticCode::kUnimplemented,
+                call_expr->GetSourceRange().getBegin())
+                << "mbarrier_arrive_expect_tx txcount, mbarId, and predicate "
+                   "operands must be constant integers";
+            return false;
+        }
     }
 
     return true;

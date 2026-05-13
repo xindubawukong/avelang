@@ -1387,12 +1387,12 @@ def tma_load_test(global_mem: S.Tensor((16, 16), S.f32)):
     smem = S.make_shared((16, 16), S.f32)
     smem_layout = S.make_layout((16, 16), (16, 1))
     desc = S.nvvm.make_tma_descriptor(global_mem, smem_layout)
-    S.nvvm.tma_load(smem, desc, (0, 0), smem, mbar_id=0, predicate=1)
+    barrier = S.nvvm.mbarrier_create()
+    S.nvvm.mbarrier_init(barrier, 0, 1, 1)
+    S.nvvm.tma_load(smem, desc, (0, 0), barrier, mbar_id=0, predicate=1)
 )""""";
 
-    RunMLIRGenerationErrorTest(kSourceCode,
-                               "tma_load barrier operand must be of type "
-                               "mbarrier_group_t");
+    RunMLIRGenerationTest(kSourceCode);
 }
 
 TEST_F(MLIRGeneratorTest, GenerateMLIRNVVMTmaStore) {
@@ -1428,6 +1428,24 @@ def wgmma_test(dst: S.Tensor((64, 64), S.f32)):
     S.nvvm.wgmma_fence_aligned()
     S.nvvm.wgmma_group_sync_aligned()
     S.nvvm.wgmma_wait_group_sync(0)
+)""""";
+
+    RunMLIRGenerationTest(kSourceCode);
+}
+
+TEST_F(MLIRGeneratorTest, GenerateMLIRNVVMMBarrier) {
+    static const std::string kSourceCode = R"""""(
+import avelang
+import avelang.language as S
+
+@avelang.jit
+def mbarrier_test():
+    barrier = S.nvvm.mbarrier_create()
+    S.nvvm.mbarrier_init(barrier, 0, 1, 1)
+    S.nvvm.mbarrier_try_wait_parity(barrier, 0, 100, 0)
+    token = S.nvvm.mbarrier_arrive(barrier, 0)
+    ready = S.nvvm.mbarrier_test_wait(barrier, token, 0)
+    S.nvvm.mbarrier_arrive_expect_tx(barrier, 16, 0, 1)
 )""""";
 
     RunMLIRGenerationTest(kSourceCode);
