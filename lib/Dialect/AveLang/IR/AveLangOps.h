@@ -29,6 +29,7 @@ class NVVMTMADescriptorOp;
 class NVVMTMAFenceOp;
 class NVVMTMALoadOp;
 class NVVMTMAStoreOp;
+class NVVMWGMMAStoreOp;
 class AMDGPUMfmaOp;
 class AMDGPURawBufferLoadOp;
 class AMDGPURawBufferStoreOp;

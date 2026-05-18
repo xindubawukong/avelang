@@ -372,6 +372,29 @@ def NVVMTMAStoreOp : AveLang_GPU_Op<"nvvm_tma_store", []> {
         OpBuilder<(ins "mlir::ValueRange":$operands, "mlir::ArrayRef<mlir::NamedAttribute>":$attributes)>
     ];
 }
+
+def NVVMWGMMAStoreOp : AveLang_GPU_Op<"nvvm_wgmma_store", []> {
+    let summary = "NVVM WGMMA Store operation";
+    let description = [{
+        The `ave.gpu.nvvm_wgmma_store` operation stores a WGMMA accumulator
+        to shared memory using the NVVM WGMMA store intrinsic.
+    }];
+
+    let arguments = (ins
+        AnyType:$desc,
+        AnyType:$dstMemref
+    );
+    let results = (outs);
+
+    let assemblyFormat = [{
+        $desc `,` $dstMemref attr-dict `:`
+        type($desc) `,` type($dstMemref)
+    }];
+
+    let builders = [
+        OpBuilder<(ins "mlir::ValueRange":$operands, "mlir::ArrayRef<mlir::NamedAttribute>":$attributes)>
+    ];
+}
 //===----------------------------------------------------------------------===//
 // AMDGPU Operations
 //===----------------------------------------------------------------------===//

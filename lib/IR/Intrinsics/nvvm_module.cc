@@ -158,6 +158,10 @@ class NVVMIntrinsic : public NamedModule {
         ast::Call *call_expr, GeneratorContext *ctx,
         llvm::ArrayRef<mlir::Value> resolved_args) const;
 
+    mlir::Value CreateWgmmaStoreFunction(
+        ast::Call *call_expr, GeneratorContext *ctx,
+        llvm::ArrayRef<mlir::Value> resolved_args) const;
+
   private:
     void AddLdMatrixFactory(const std::string &name, const std::string &shape,
                             int num, int bit_width, bool transpose);
@@ -196,6 +200,10 @@ class NVVMIntrinsic : public NamedModule {
                                 const std::string &shape, int num,
                                 int bit_width, bool transpose) const;
     bool CheckMakeWGMMADescriptorFunction(
+        ast::Call *call_expr, GeneratorContext *ctx,
+        llvm::ArrayRef<mlir::Value> resolved_args) const;
+
+    bool CheckWgmmaStoreFunction(
         ast::Call *call_expr, GeneratorContext *ctx,
         llvm::ArrayRef<mlir::Value> resolved_args) const;
 
@@ -271,6 +279,18 @@ void NVVMIntrinsic::Initialize() {
             return CheckMakeWGMMADescriptorFunction(call_expr, gen_ctx,
                                                     resolved_args);
         });
+
+    AddFunction(
+        "wgmma_store",
+        [this](ast::Call *call_expr, GeneratorContext *gen_ctx,
+               llvm::ArrayRef<mlir::Value> resolved_args) -> mlir::Value {
+            return CreateWgmmaStoreFunction(call_expr, gen_ctx, resolved_args);
+        },
+        [this](ast::Call *call_expr, GeneratorContext *gen_ctx,
+               llvm::ArrayRef<mlir::Value> resolved_args) -> bool {
+            return CheckWgmmaStoreFunction(call_expr, gen_ctx, resolved_args);
+        });
+
     AddFunction(
         "make_tma_descriptor",
         [this](ast::Call *call_expr, GeneratorContext *gen_ctx,
@@ -862,6 +882,58 @@ bool NVVMIntrinsic::CheckMakeWGMMADescriptorFunction(
            checkKind(2, "l2promo_kind", 3) &&
            checkKind(3, "oob_kind", 1) &&
            checkKind(4, "interleave_kind", 2);
+}
+
+mlir::Value NVVMIntrinsic::CreateWgmmaStoreFunction(
+    ast::Call *call_expr, GeneratorContext *ctx,
+    llvm::ArrayRef<mlir::Value> resolved_args) const {
+    auto &builder = ctx->GetCurrentFunctionGenerator()->GetBuilder();
+    auto location = builder.getUnknownLoc();
+
+    if (!CheckWgmmaStoreFunction(call_expr, ctx, resolved_args)) {
+        return nullptr;
+    }
+
+    cf::NVVMWGMMAStoreOp::create(builder, location, resolved_args[0],
+                                 resolved_args[1]);
+    return ctx->GetCurrentFunctionGenerator()
+        ->GetExprGenerator()
+        ->CreateVoidValue();
+}
+
+bool NVVMIntrinsic::CheckWgmmaStoreFunction(
+    ast::Call *call_expr, GeneratorContext *ctx,
+    llvm::ArrayRef<mlir::Value> resolved_args) const {
+    if (resolved_args.size() != 2) {
+        ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
+                                        call_expr->GetSourceRange().getBegin())
+            << "wgmma_store requires exactly 2 arguments: acc, dst";
+        return false;
+    }
+
+    if (!resolved_args[0] || !resolved_args[1]) {
+        ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
+                                        call_expr->GetSourceRange().getBegin())
+            << "Failed to generate operands for wgmma_store";
+        return false;
+    }
+
+    if (!mlir::isa<mlir::nvgpu::WarpgroupAccumulatorType>(
+            resolved_args[0].getType())) {
+        ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
+                                        call_expr->GetSourceRange().getBegin())
+            << "wgmma_store acc operand must be of type warpgroup_accumulator";
+        return false;
+    }
+
+    if (!mlir::isa<cf::MemRefType>(resolved_args[1].getType())) {
+        ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
+                                        call_expr->GetSourceRange().getBegin())
+            << "wgmma_store dst operand must be of memref type";
+        return false;
+    }
+
+    return true;
 }
 
 mlir::Value NVVMIntrinsic::CreateMakeTMADescriptorFunction(
