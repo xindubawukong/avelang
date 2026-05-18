@@ -158,6 +158,10 @@ class NVVMIntrinsic : public NamedModule {
         ast::Call *call_expr, GeneratorContext *ctx,
         llvm::ArrayRef<mlir::Value> resolved_args) const;
 
+    mlir::Value CreateWgmmaAsyncFunction(
+        ast::Call *call_expr, GeneratorContext *ctx,
+        llvm::ArrayRef<mlir::Value> resolved_args) const;
+
     mlir::Value CreateWgmmaStoreFunction(
         ast::Call *call_expr, GeneratorContext *ctx,
         llvm::ArrayRef<mlir::Value> resolved_args) const;
@@ -200,6 +204,10 @@ class NVVMIntrinsic : public NamedModule {
                                 const std::string &shape, int num,
                                 int bit_width, bool transpose) const;
     bool CheckMakeWGMMADescriptorFunction(
+        ast::Call *call_expr, GeneratorContext *ctx,
+        llvm::ArrayRef<mlir::Value> resolved_args) const;
+
+    bool CheckWgmmaAsyncFunction(
         ast::Call *call_expr, GeneratorContext *ctx,
         llvm::ArrayRef<mlir::Value> resolved_args) const;
 
@@ -278,6 +286,17 @@ void NVVMIntrinsic::Initialize() {
                llvm::ArrayRef<mlir::Value> resolved_args) -> bool {
             return CheckMakeWGMMADescriptorFunction(call_expr, gen_ctx,
                                                     resolved_args);
+        });
+
+    AddFunction(
+        "wgmma_async",
+        [this](ast::Call *call_expr, GeneratorContext *gen_ctx,
+               llvm::ArrayRef<mlir::Value> resolved_args) -> mlir::Value {
+            return CreateWgmmaAsyncFunction(call_expr, gen_ctx, resolved_args);
+        },
+        [this](ast::Call *call_expr, GeneratorContext *gen_ctx,
+               llvm::ArrayRef<mlir::Value> resolved_args) -> bool {
+            return CheckWgmmaAsyncFunction(call_expr, gen_ctx, resolved_args);
         });
 
     AddFunction(
@@ -882,6 +901,60 @@ bool NVVMIntrinsic::CheckMakeWGMMADescriptorFunction(
            checkKind(2, "l2promo_kind", 3) &&
            checkKind(3, "oob_kind", 1) &&
            checkKind(4, "interleave_kind", 2);
+}
+
+mlir::Value NVVMIntrinsic::CreateWgmmaAsyncFunction(
+    ast::Call *call_expr, GeneratorContext *ctx,
+    llvm::ArrayRef<mlir::Value> resolved_args) const {
+    auto &builder = ctx->GetCurrentFunctionGenerator()->GetBuilder();
+    auto location = builder.getUnknownLoc();
+
+    if (!CheckWgmmaAsyncFunction(call_expr, ctx, resolved_args)) {
+        return nullptr;
+    }
+
+    auto async = cf::NVVMWGMMAAsyncOp::create(
+        builder, location, resolved_args[2].getType(), resolved_args[0],
+        resolved_args[1], resolved_args[2]);
+    return async.getResult();
+}
+
+bool NVVMIntrinsic::CheckWgmmaAsyncFunction(
+    ast::Call *call_expr, GeneratorContext *ctx,
+    llvm::ArrayRef<mlir::Value> resolved_args) const {
+    if (resolved_args.size() != 3) {
+        ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
+                                        call_expr->GetSourceRange().getBegin())
+            << "wgmma_async requires exactly 3 arguments: desc_a, desc_b, acc";
+        return false;
+    }
+
+    if (!resolved_args[0] || !resolved_args[1] || !resolved_args[2]) {
+        ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
+                                        call_expr->GetSourceRange().getBegin())
+            << "Failed to generate operands for wgmma_async";
+        return false;
+    }
+
+    if (!mlir::isa<mlir::nvgpu::WarpgroupMatrixDescriptorType>(
+            resolved_args[0].getType()) ||
+        !mlir::isa<mlir::nvgpu::WarpgroupMatrixDescriptorType>(
+            resolved_args[1].getType())) {
+        ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
+                                        call_expr->GetSourceRange().getBegin())
+            << "wgmma_async descriptor operands must be wgmma_descriptor";
+        return false;
+    }
+
+    if (!mlir::isa<mlir::nvgpu::WarpgroupAccumulatorType>(
+            resolved_args[2].getType())) {
+        ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
+                                        call_expr->GetSourceRange().getBegin())
+            << "wgmma_async acc operand must be of type warpgroup_accumulator";
+        return false;
+    }
+
+    return true;
 }
 
 mlir::Value NVVMIntrinsic::CreateWgmmaStoreFunction(

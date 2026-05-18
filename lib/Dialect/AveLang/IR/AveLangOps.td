@@ -395,6 +395,32 @@ def NVVMWGMMAStoreOp : AveLang_GPU_Op<"nvvm_wgmma_store", []> {
         OpBuilder<(ins "mlir::ValueRange":$operands, "mlir::ArrayRef<mlir::NamedAttribute>":$attributes)>
     ];
 }
+
+def NVVMWGMMAAsyncOp : AveLang_GPU_Op<"nvvm_wgmma_async", []> {
+    let summary = "NVVM WGMMA Async operation";
+    let description = [{
+        The `ave.gpu.nvvm_wgmma_async` operation performs a warpgroup matrix
+        multiply-accumulate using NVVM WGMMA descriptors and accumulator
+        values.
+    }];
+
+    let arguments = (ins
+        AnyType:$descA,
+        AnyType:$descB,
+        AnyType:$matrixC
+    );
+    let results = (outs AnyType:$result);
+
+    let assemblyFormat = [{
+        $descA `,` $descB `,` $matrixC attr-dict `:`
+        type($descA) `,` type($descB) `,` type($matrixC) `->` type($result)
+    }];
+
+    let builders = [
+        OpBuilder<(ins "mlir::ValueRange":$operands, "mlir::TypeRange":$resultTypes, "mlir::ArrayRef<mlir::NamedAttribute>":$attributes)>
+    ];
+}
+
 //===----------------------------------------------------------------------===//
 // AMDGPU Operations
 //===----------------------------------------------------------------------===//

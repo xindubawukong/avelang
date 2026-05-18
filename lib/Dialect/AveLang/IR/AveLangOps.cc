@@ -707,6 +707,17 @@ void NVVMTMAStoreOp::build(mlir::OpBuilder &builder,
     state.addAttributes(attributes);
 }
 
+void NVVMWGMMAAsyncOp::build(
+    mlir::OpBuilder &builder, mlir::OperationState &state,
+    mlir::ValueRange operands, mlir::TypeRange resultTypes,
+    mlir::ArrayRef<mlir::NamedAttribute> attributes) {
+    assert(operands.size() == 3u && "mismatched number of parameters");
+    state.addOperands(operands);
+    state.addAttributes(attributes);
+    assert(resultTypes.size() == 1u && "mismatched number of return types");
+    state.addTypes(resultTypes);
+}
+
 void NVVMWGMMAStoreOp::build(
     mlir::OpBuilder &builder, mlir::OperationState &state,
     mlir::ValueRange operands,

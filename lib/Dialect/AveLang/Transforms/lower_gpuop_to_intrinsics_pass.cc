@@ -941,6 +941,22 @@ class NVVMTMAStoreLowering : public mlir::OpRewritePattern<NVVMTMAStoreOp> {
     }
 };
 
+class NVVMWGMMAAsyncLowering : public mlir::OpRewritePattern<NVVMWGMMAAsyncOp> {
+  public:
+    using mlir::OpRewritePattern<NVVMWGMMAAsyncOp>::OpRewritePattern;
+
+    mlir::LogicalResult
+    matchAndRewrite(NVVMWGMMAAsyncOp op,
+                    mlir::PatternRewriter &rewriter) const override {
+        auto wgmma = mlir::nvgpu::WarpgroupMmaOp::create(
+            rewriter, op.getLoc(), op.getResult().getType(), op.getDescA(),
+            op.getDescB(), rewriter.getI64IntegerAttr(0), mlir::UnitAttr(),
+            rewriter.getUnitAttr(), op.getMatrixC());
+        rewriter.replaceOp(op, wgmma.getResult());
+        return mlir::success();
+    }
+};
+
 class NVVMWGMMAStoreLowering : public mlir::OpRewritePattern<NVVMWGMMAStoreOp> {
   public:
     using mlir::OpRewritePattern<NVVMWGMMAStoreOp>::OpRewritePattern;
@@ -1100,8 +1116,10 @@ class LowerAveLangGPUToIntrinsicsPass
         mlir::RewritePatternSet patterns(&getContext());
         patterns.add<NVVMMmaLowering, NVVMLdMatrixLowering,
                      NVVMStMatrixLowering, NVVMWGMMADescriptorLowering,
-                     NVVMTMADescriptorLowering, NVVMTMAFenceLowering, NVVMTMALoadLowering, NVVMTMAStoreLowering,
-                     NVVMWGMMAStoreLowering, AMDGPUMfmaLowering,
+                     NVVMTMADescriptorLowering, NVVMTMAFenceLowering,
+                     NVVMTMALoadLowering, NVVMTMAStoreLowering,
+                     NVVMWGMMAAsyncLowering, NVVMWGMMAStoreLowering,
+                     AMDGPUMfmaLowering,
                      AMDGPURawBufferLoadLowering, AMDGPURawBufferStoreLowering>(
             &getContext());
 
