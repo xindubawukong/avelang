@@ -656,6 +656,17 @@ void NVVMStMatrixOp::build(mlir::OpBuilder &builder,
     // No result types to add (void operation)
 }
 
+void NVVMWGMMADescriptorOp::build(
+    mlir::OpBuilder &builder, mlir::OperationState &state,
+    mlir::ValueRange operands, mlir::TypeRange resultTypes,
+    mlir::ArrayRef<mlir::NamedAttribute> attributes) {
+    assert(operands.size() == 5u && "mismatched number of parameters");
+    state.addOperands(operands);
+    state.addAttributes(attributes);
+    assert(resultTypes.size() == 1u && "mismatched number of return types");
+    state.addTypes(resultTypes);
+}
+
 
 void NVVMTMADescriptorOp::build(mlir::OpBuilder &builder,
                                 mlir::OperationState &state,

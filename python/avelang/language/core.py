@@ -1,3 +1,6 @@
+from enum import IntEnum
+
+
 class dtype:
     SINT_TYPES = ["i8", "i16", "i32", "i64"]
     UINT_TYPES = ["u1", "u8", "u16", "u32", "u64"]
@@ -80,6 +83,19 @@ class constexpr:
 
     def __hash__(self):
         return hash((self.value, self.type))
+
+
+class WgmmaSwizzleKind(IntEnum):
+    NONE = 0
+    SWIZZLE_32B = 1
+    SWIZZLE_64B = 2
+    SWIZZLE_128B = 3
+
+
+WGMMA_SWIZZLE_NONE = WgmmaSwizzleKind.NONE
+WGMMA_SWIZZLE_32B = WgmmaSwizzleKind.SWIZZLE_32B
+WGMMA_SWIZZLE_64B = WgmmaSwizzleKind.SWIZZLE_64B
+WGMMA_SWIZZLE_128B = WgmmaSwizzleKind.SWIZZLE_128B
 
 
 # Built-in functions for GPU kernels
@@ -184,8 +200,8 @@ class _NVVMModule:
         pass
 
     def make_wgmma_descriptor(
-        self, tensor, swizzle_kind: int, l2promo_kind: int, oob_kind: int,
-        interleave_kind: int
+        self, tensor, swizzle_kind: WgmmaSwizzleKind | int,
+        l2promo_kind: int, oob_kind: int, interleave_kind: int
     ):
         pass
 

@@ -138,6 +138,10 @@ class NVVMIntrinsic : public NamedModule {
         ast::Call *call_expr, GeneratorContext *ctx,
         llvm::ArrayRef<mlir::Value> resolved_args) const;
 
+    mlir::Value CreateMakeWGMMADescriptorFunction(
+        ast::Call *call_expr, GeneratorContext *ctx,
+        llvm::ArrayRef<mlir::Value> resolved_args) const;
+
     mlir::Value CreateMakeTMADescriptorFunction(
         ast::Call *call_expr, GeneratorContext *ctx,
         llvm::ArrayRef<mlir::Value> resolved_args) const;
@@ -191,6 +195,10 @@ class NVVMIntrinsic : public NamedModule {
                                 llvm::ArrayRef<mlir::Value> resolved_args,
                                 const std::string &shape, int num,
                                 int bit_width, bool transpose) const;
+    bool CheckMakeWGMMADescriptorFunction(
+        ast::Call *call_expr, GeneratorContext *ctx,
+        llvm::ArrayRef<mlir::Value> resolved_args) const;
+
     bool CheckMakeTMADescriptorFunction(ast::Call *call_expr, GeneratorContext *ctx,
                                      llvm::ArrayRef<mlir::Value> resolved_args) const;
 
@@ -250,6 +258,19 @@ void NVVMIntrinsic::Initialize() {
         AddStMatrixFactory(base_name, "m8n8", num, 16, false);
         AddStMatrixFactory(base_name + "_trans", "m8n8", num, 16, true);
     }
+
+    AddFunction(
+        "make_wgmma_descriptor",
+        [this](ast::Call *call_expr, GeneratorContext *gen_ctx,
+               llvm::ArrayRef<mlir::Value> resolved_args) -> mlir::Value {
+            return CreateMakeWGMMADescriptorFunction(call_expr, gen_ctx,
+                                                     resolved_args);
+        },
+        [this](ast::Call *call_expr, GeneratorContext *gen_ctx,
+               llvm::ArrayRef<mlir::Value> resolved_args) -> bool {
+            return CheckMakeWGMMADescriptorFunction(call_expr, gen_ctx,
+                                                    resolved_args);
+        });
     AddFunction(
         "make_tma_descriptor",
         [this](ast::Call *call_expr, GeneratorContext *gen_ctx,
@@ -738,6 +759,109 @@ bool NVVMIntrinsic::CheckStMatrixWithShape(
     }
 
     return true;
+}
+
+mlir::Value NVVMIntrinsic::CreateMakeWGMMADescriptorFunction(
+    ast::Call *call_expr, GeneratorContext *ctx,
+    llvm::ArrayRef<mlir::Value> resolved_args) const {
+    auto &builder = ctx->GetCurrentFunctionGenerator()->GetBuilder();
+    auto location = builder.getUnknownLoc();
+
+    if (!CheckMakeWGMMADescriptorFunction(call_expr, ctx, resolved_args)) {
+        return nullptr;
+    }
+
+    auto substrateMemrefType =
+        mlir::dyn_cast<cf::MemRefType>(resolved_args[0].getType());
+    auto workgroupMemorySpace = mlir::IntegerAttr::get(
+        mlir::IntegerType::get(builder.getContext(), 64), 3);
+    auto memrefType = mlir::MemRefType::getChecked(
+        [&]() { return mlir::emitError(location); },
+        substrateMemrefType.getShape(), substrateMemrefType.getElementType(),
+        mlir::MemRefLayoutAttrInterface(), workgroupMemorySpace);
+    if (!memrefType) {
+        return nullptr;
+    }
+
+    auto resultType = mlir::nvgpu::WarpgroupMatrixDescriptorType::get(
+        builder.getContext(), memrefType);
+    auto getI32Attr = [&](mlir::Value value) {
+        return mlir::IntegerAttr::get(builder.getI32Type(),
+                                      *getConstantIntValue(value));
+    };
+
+    auto descriptor = cf::NVVMWGMMADescriptorOp::create(
+        builder, location, resultType, resolved_args[0],
+        getI32Attr(resolved_args[1]), getI32Attr(resolved_args[2]),
+        getI32Attr(resolved_args[3]), getI32Attr(resolved_args[4]));
+    return descriptor.getResult();
+}
+
+bool NVVMIntrinsic::CheckMakeWGMMADescriptorFunction(
+    ast::Call *call_expr, GeneratorContext *ctx,
+    llvm::ArrayRef<mlir::Value> resolved_args) const {
+    if (resolved_args.size() != 5) {
+        ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
+                                        call_expr->GetSourceRange().getBegin())
+            << "make_wgmma_descriptor requires exactly 5 arguments: tensor, swizzle_kind, l2promo_kind, oob_kind, interleave_kind";
+        return false;
+    }
+
+    if (!resolved_args[0]) {
+        ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
+                                        call_expr->GetSourceRange().getBegin())
+            << "Failed to generate tensor operand for make_wgmma_descriptor";
+        return false;
+    }
+
+    if (!mlir::isa<cf::MemRefType>(resolved_args[0].getType())) {
+        ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
+                                        call_expr->GetSourceRange().getBegin())
+            << "make_wgmma_descriptor expects memref pointer operand for tensor";
+        return false;
+    }
+
+    auto checkKind = [&](size_t index, llvm::StringRef name, int64_t maxValue) {
+        if (!resolved_args[index]) {
+            ctx->diagnostic_manager->Report(
+                basic::DiagnosticCode::kUnimplemented,
+                call_expr->GetSourceRange().getBegin())
+                << "Failed to generate " << name
+                << " operand for make_wgmma_descriptor";
+            return false;
+        }
+        if (!resolved_args[index].getType().isIntOrIndex()) {
+            ctx->diagnostic_manager->Report(
+                basic::DiagnosticCode::kUnimplemented,
+                call_expr->GetSourceRange().getBegin())
+                << "make_wgmma_descriptor " << name
+                << " operand must be an integer type";
+            return false;
+        }
+        auto value = getConstantIntValue(resolved_args[index]);
+        if (!value) {
+            ctx->diagnostic_manager->Report(
+                basic::DiagnosticCode::kUnimplemented,
+                call_expr->GetSourceRange().getBegin())
+                << "make_wgmma_descriptor requires a constant integer value for "
+                << name;
+            return false;
+        }
+        if (*value < 0 || *value > maxValue) {
+            ctx->diagnostic_manager->Report(
+                basic::DiagnosticCode::kUnimplemented,
+                call_expr->GetSourceRange().getBegin())
+                << "make_wgmma_descriptor " << name
+                << " operand has invalid value " << *value;
+            return false;
+        }
+        return true;
+    };
+
+    return checkKind(1, "swizzle_kind", 3) &&
+           checkKind(2, "l2promo_kind", 3) &&
+           checkKind(3, "oob_kind", 1) &&
+           checkKind(4, "interleave_kind", 2);
 }
 
 mlir::Value NVVMIntrinsic::CreateMakeTMADescriptorFunction(

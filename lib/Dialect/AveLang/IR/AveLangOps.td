@@ -257,6 +257,31 @@ def NVVMStMatrixOp : AveLang_GPU_Op<"nvvm_stmatrix", []> {
     let hasVerifier = 1;
 }
 
+def NVVMWGMMADescriptorOp : AveLang_GPU_Op<"nvvm_wgmma_descriptor", []> {
+    let summary = "NVVM WGMMA Descriptor operation";
+    let description = [{
+        The `ave.gpu.nvvm_wgmma_descriptor` operation creates a descriptor
+        for an NVVM WGMMA intrinsic.
+    }];
+
+    let arguments = (ins
+        AveLang_MemRef:$memref,
+        I32Attr:$swizzle,
+        I32Attr:$l2promo,
+        I32Attr:$oob,
+        I32Attr:$interleave
+    );
+    let results = (outs AnyType:$result);
+
+    let assemblyFormat = [{
+        $memref attr-dict `:` type($memref) `->` type($result)
+    }];
+
+    let builders = [
+        OpBuilder<(ins "mlir::ValueRange":$operands, "mlir::TypeRange":$resultTypes, "mlir::ArrayRef<mlir::NamedAttribute>":$attributes)>
+    ];
+}
+
 
 def NVVMTMADescriptorOp : AveLang_GPU_Op<"nvvm_tma_descriptor", []> {
     let summary = "NVVM TMA Descriptor operation";

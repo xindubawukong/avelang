@@ -8,6 +8,7 @@
 #include <mlir/Dialect/Func/IR/FuncOps.h>
 #include <mlir/Dialect/GPU/IR/GPUDialect.h>
 #include <mlir/Dialect/NVGPU/IR/NVGPUDialect.h>
+#include <mlir/Dialect/UB/IR/UBOps.h>
 #include <mlir/Dialect/LLVMIR/LLVMDialect.h>
 #include <mlir/Dialect/LLVMIR/NVVMDialect.h>
 #include <mlir/Dialect/LLVMIR/ROCDLDialect.h>
@@ -93,6 +94,28 @@ getBuiltinWorkgroupMemRefType(mlir::Type type, mlir::MLIRContext *context,
     mlir::emitError(loc) << "expected memref-like operand";
     return {};
 }
+
+static mlir::MemRefType
+getWgmmaWorkgroupMemRefType(mlir::Type type, mlir::MLIRContext *context,
+                            mlir::Location loc) {
+    auto workgroupMemorySpace = mlir::IntegerAttr::get(
+        mlir::IntegerType::get(context, 64), 3);
+    if (auto memrefType = mlir::dyn_cast<mlir::MemRefType>(type)) {
+        return mlir::MemRefType::getChecked(
+            [&]() { return mlir::emitError(loc); }, memrefType.getShape(),
+            memrefType.getElementType(), mlir::MemRefLayoutAttrInterface(),
+            workgroupMemorySpace);
+    }
+    if (auto substrateType = mlir::dyn_cast<MemRefType>(type)) {
+        return mlir::MemRefType::getChecked(
+            [&]() { return mlir::emitError(loc); }, substrateType.getShape(),
+            substrateType.getElementType(), mlir::MemRefLayoutAttrInterface(),
+            workgroupMemorySpace);
+    }
+    mlir::emitError(loc) << "expected memref-like operand";
+    return {};
+}
+
 static std::optional<int64_t> getElementByteSize(mlir::Type elementType) {
     if (auto vectorType = mlir::dyn_cast<mlir::VectorType>(elementType)) {
         auto elemBytes = getElementByteSize(vectorType.getElementType());
@@ -144,6 +167,22 @@ static std::optional<int64_t> getConstantIntValue(mlir::Value value) {
     return std::nullopt;
 }
 
+static std::optional<std::pair<int64_t, int64_t>>
+getWgmmaSwizzleDescriptorEncoding(
+    mlir::nvgpu::TensorMapSwizzleKind swizzleKind) {
+    switch (swizzleKind) {
+    case mlir::nvgpu::TensorMapSwizzleKind::SWIZZLE_NONE:
+        return std::pair<int64_t, int64_t>{1, 0};
+    case mlir::nvgpu::TensorMapSwizzleKind::SWIZZLE_32B:
+        return std::pair<int64_t, int64_t>{32, 3};
+    case mlir::nvgpu::TensorMapSwizzleKind::SWIZZLE_64B:
+        return std::pair<int64_t, int64_t>{64, 2};
+    case mlir::nvgpu::TensorMapSwizzleKind::SWIZZLE_128B:
+        return std::pair<int64_t, int64_t>{128, 1};
+    }
+    return std::nullopt;
+}
+
 static mlir::Value castToIndex(mlir::Value value, mlir::Location loc,
                                mlir::PatternRewriter &rewriter) {
     if (value.getType().isIndex()) {
@@ -191,6 +230,7 @@ static mlir::Value castToBuiltinMemRef(mlir::Value value,
     return AveLangMemRefCastOp::create(rewriter, loc, value, targetType)
         .getResult();
 }
+
 /// Helper to convert a memref to an aligned pointer index with optional bounds
 /// checking. Returns a null Value on failure and emits a diagnostic.
 mlir::Value convertMemrefToPointerIndex(mlir::PatternRewriter &rewriter,
@@ -623,6 +663,91 @@ class NVVMStMatrixLowering : public mlir::OpRewritePattern<NVVMStMatrixOp> {
     }
 };
 
+class NVVMWGMMADescriptorLowering
+    : public mlir::OpRewritePattern<NVVMWGMMADescriptorOp> {
+  public:
+    using mlir::OpRewritePattern<NVVMWGMMADescriptorOp>::OpRewritePattern;
+
+    mlir::LogicalResult
+    matchAndRewrite(NVVMWGMMADescriptorOp op,
+                    mlir::PatternRewriter &rewriter) const override {
+        auto memref = op.getMemref();
+        auto normalizedMemrefType = getWgmmaWorkgroupMemRefType(
+            memref.getType(), rewriter.getContext(), op.getLoc());
+        if (!normalizedMemrefType) {
+            return mlir::failure();
+        }
+
+        auto swizzle = op.getSwizzle();
+        auto swizzleKind =
+            swizzle == 0
+                ? mlir::nvgpu::TensorMapSwizzleKind::SWIZZLE_NONE
+            : swizzle == 1
+                ? mlir::nvgpu::TensorMapSwizzleKind::SWIZZLE_32B
+            : swizzle == 2
+                ? mlir::nvgpu::TensorMapSwizzleKind::SWIZZLE_64B
+            : swizzle == 3
+                ? mlir::nvgpu::TensorMapSwizzleKind::SWIZZLE_128B
+                : static_cast<mlir::nvgpu::TensorMapSwizzleKind>(swizzle);
+
+        auto encoding = getWgmmaSwizzleDescriptorEncoding(swizzleKind);
+        if (!encoding || normalizedMemrefType.getRank() == 0 ||
+            !normalizedMemrefType.hasStaticShape()) {
+            return mlir::failure();
+        }
+
+        auto baseAddress = convertMemrefToPointerIndex(
+            rewriter, op.getLoc(), memref, "nvvm_wgmma_descriptor");
+        if (!baseAddress) {
+            return mlir::failure();
+        }
+
+        auto i64Type = rewriter.getI64Type();
+        auto makeConstant = [&](int64_t value) -> mlir::Value {
+            return mlir::arith::ConstantIntOp::create(rewriter, op.getLoc(),
+                                                      value, 64);
+        };
+        auto shiftLeft = [&](mlir::Value value, int64_t amount) -> mlir::Value {
+            return mlir::arith::ShLIOp::create(rewriter, op.getLoc(), value,
+                                               makeConstant(amount));
+        };
+        auto insertField = [&](mlir::Value descriptor, mlir::Value value,
+                               int64_t bit) -> mlir::Value {
+            return mlir::arith::OrIOp::create(
+                rewriter, op.getLoc(), descriptor, shiftLeft(value, bit));
+        };
+
+        auto baseAddressI64 =
+            castIntegerTo(baseAddress, i64Type, op.getLoc(), rewriter);
+        if (!baseAddressI64) {
+            return mlir::failure();
+        }
+        auto baseAddressField = mlir::arith::ShRUIOp::create(
+            rewriter, op.getLoc(), shiftLeft(baseAddressI64, 46),
+            makeConstant(50));
+
+        constexpr int64_t kExcludeLowAddressBits = 4;
+        auto [layoutBytes, swizzleField] = *encoding;
+        int64_t strideField = (layoutBytes << 3) >> kExcludeLowAddressBits;
+        int64_t leadingDimensionField =
+            (normalizedMemrefType.getDimSize(0) * layoutBytes) >>
+            kExcludeLowAddressBits;
+
+        mlir::Value descriptor = makeConstant(0);
+        descriptor =
+            insertField(descriptor, makeConstant(swizzleField), 62);
+        descriptor = insertField(descriptor, makeConstant(strideField), 32);
+        descriptor =
+            insertField(descriptor, makeConstant(leadingDimensionField), 16);
+        descriptor = insertField(descriptor, baseAddressField, 0);
+
+        auto typedDescriptor = mlir::UnrealizedConversionCastOp::create(
+            rewriter, op.getLoc(), op.getResult().getType(), descriptor);
+        rewriter.replaceOp(op, typedDescriptor.getResult(0));
+        return mlir::success();
+    }
+};
+
 
 class NVVMTMADescriptorLowering
     : public mlir::OpRewritePattern<NVVMTMADescriptorOp> {
@@ -948,7 +1073,8 @@ class LowerAveLangGPUToIntrinsicsPass
     void runOnOperation() override {
         mlir::RewritePatternSet patterns(&getContext());
         patterns.add<NVVMMmaLowering, NVVMLdMatrixLowering,
-                     NVVMStMatrixLowering, NVVMTMADescriptorLowering, NVVMTMAFenceLowering, NVVMTMALoadLowering, NVVMTMAStoreLowering, AMDGPUMfmaLowering,
+                     NVVMStMatrixLowering, NVVMWGMMADescriptorLowering,
+                     NVVMTMADescriptorLowering, NVVMTMAFenceLowering, NVVMTMALoadLowering, NVVMTMAStoreLowering, AMDGPUMfmaLowering,
                      AMDGPURawBufferLoadLowering, AMDGPURawBufferStoreLowering>(
             &getContext());
 

@@ -59,7 +59,10 @@ mlir::Attribute normalizeBuiltinMemorySpace(mlir::MLIRContext *context,
         case mlir::gpu::AddressSpace::Global:
             return memorySpace;
         case mlir::gpu::AddressSpace::Workgroup:
-            return mlir::IntegerAttr::get(mlir::IntegerType::get(context, 64), 3);
+            // Keep workgroup memory space in integer form to satisfy NVVM
+            // memref-to-LLVM conversions and avoid mixed-address-space views.
+            return mlir::IntegerAttr::get(mlir::IntegerType::get(context, 64),
+                                          3);
         }
     }
     return memorySpace;
@@ -73,6 +76,11 @@ mlir::Attribute resolveMemorySpace(mlir::MLIRContext *context,
         return normalizedPreferred;
     }
     return normalizeBuiltinMemorySpace(context, fallback);
+}
+
+bool isWorkgroupMemorySpaceAttr(mlir::Attribute memorySpace) {
+    auto intSpace = mlir::dyn_cast_or_null<mlir::IntegerAttr>(memorySpace);
+    return intSpace && intSpace.getInt() == 3;
 }
 
 mlir::MemRefType withResolvedMemorySpace(mlir::MLIRContext *context,
@@ -160,6 +168,19 @@ std::optional<int64_t> getPreferredAlignment(mlir::Type elementType) {
 
     return static_cast<int64_t>(
         llvm::PowerOf2Ceil(static_cast<uint64_t>(*elementBytes)));
+}
+
+std::optional<int64_t> getPreferredAllocaAlignment(mlir::MemRefType type) {
+    auto preferred = getPreferredAlignment(type.getElementType());
+    if (!isWorkgroupMemorySpaceAttr(type.getMemorySpace())) {
+        return preferred;
+    }
+
+    int64_t minWorkgroupAlignment = 128;
+    if (!preferred || *preferred < minWorkgroupAlignment) {
+        return minWorkgroupAlignment;
+    }
+    return preferred;
 }
 
 std::optional<int64_t> getStaticElementCount(mlir::MemRefType type) {
@@ -1159,7 +1180,7 @@ mlir::LogicalResult AveLangMemRefAllocaLoweringPattern::matchAndRewrite(
 
     mlir::IntegerAttr alignmentAttr = op.getAlignmentAttr();
     if (!alignmentAttr) {
-        if (auto alignment = getPreferredAlignment(resultType.getElementType())) {
+        if (auto alignment = getPreferredAllocaAlignment(resultType)) {
             alignmentAttr = rewriter.getI64IntegerAttr(*alignment);
         }
     }
@@ -1206,6 +1227,15 @@ mlir::LogicalResult AveLangMemRefAllocaLoweringPattern::matchAndRewrite(
     // promotion passes can still recognize them as booleans instead of raw
     // byte buffers.
     if (resultType.getElementType().isInteger(1)) {
+        auto typedResult = buildResultWithTypedAlloca();
+        if (!typedResult) {
+            return mlir::failure();
+        }
+        rewriter.replaceOp(op, typedResult);
+        return mlir::success();
+    }
+
+    if (isWorkgroupMemorySpaceAttr(normalizedMemorySpace)) {
         auto typedResult = buildResultWithTypedAlloca();
         if (!typedResult) {
             return mlir::failure();

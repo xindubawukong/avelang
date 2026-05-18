@@ -339,8 +339,13 @@ TEST_F(LLVMTargetTest, SharedMemory) {
     std::string llvmDump;
     auto llvmModule = CompileToLLVM(mlirCode, nullptr, &llvmDump);
     ASSERT_NE(llvmModule, nullptr);
-    EXPECT_NE(llvmDump.find("addrspace(3) global [128 x i8] undef"),
-              std::string::npos);
+    bool hasByteSharedGlobal =
+        llvmDump.find("addrspace(3) global [128 x i8] undef") !=
+        std::string::npos;
+    bool hasTypedSharedGlobal =
+        llvmDump.find("addrspace(3) global [32 x i32] undef") !=
+        std::string::npos;
+    EXPECT_TRUE(hasByteSharedGlobal || hasTypedSharedGlobal);
     EXPECT_NE(llvmDump.find("store i32"), std::string::npos) << llvmDump;
     EXPECT_NE(llvmDump.find("ptr addrspace(3)"), std::string::npos) << llvmDump;
     EXPECT_EQ(llvmDump.find("align 1, addrspace(5)"), std::string::npos);

@@ -24,6 +24,7 @@ class FullOp;
 class NVVMMMAOp;
 class NVVMLdMatrixOp;
 class NVVMStMatrixOp;
+class NVVMWGMMADescriptorOp;
 class NVVMTMADescriptorOp;
 class NVVMTMAFenceOp;
 class NVVMTMALoadOp;
