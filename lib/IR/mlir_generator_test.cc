@@ -1411,6 +1411,28 @@ def tma_store_test(global_mem: S.Tensor((16, 16), S.f32)):
     RunMLIRGenerationTest(kSourceCode);
 }
 
+TEST_F(MLIRGeneratorTest, GenerateMLIRNVVMWgmma) {
+    static const std::string kSourceCode = R"""""(
+import avelang
+import avelang.language as S
+
+@avelang.jit
+def wgmma_test(dst: S.Tensor((64, 64), S.f32)):
+    smem_a = S.make_shared((64, 64), S.f16)
+    smem_b = S.make_shared((64, 64), S.f16)
+    desc_a = S.nvvm.make_wgmma_descriptor(smem_a, 0, 0, 0, 0)
+    desc_b = S.nvvm.make_wgmma_descriptor(smem_b, 0, 0, 0, 0)
+    acc = S.nvvm.wgmma_init_accumulator(64, 64)
+    acc = S.nvvm.wgmma_async(desc_a, desc_b, acc)
+    S.nvvm.wgmma_store(acc, dst)
+    S.nvvm.wgmma_fence_aligned()
+    S.nvvm.wgmma_group_sync_aligned()
+    S.nvvm.wgmma_wait_group_sync(0)
+)""""";
+
+    RunMLIRGenerationTest(kSourceCode);
+}
+
 TEST_F(MLIRGeneratorTest, GenerateMLIRAMDGPUMFMASync) {
     static const std::string kSourceCode = R"""""(
 import avelang

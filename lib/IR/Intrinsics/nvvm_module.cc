@@ -183,6 +183,10 @@ class NVVMIntrinsic : public NamedModule {
         ast::Call *call_expr, GeneratorContext *ctx,
         llvm::ArrayRef<mlir::Value> resolved_args) const;
 
+    mlir::Value CreateWgmmaInitAccumulatorFunction(
+        ast::Call *call_expr, GeneratorContext *ctx,
+        llvm::ArrayRef<mlir::Value> resolved_args) const;
+
     mlir::Value CreateWgmmaStoreFunction(
         ast::Call *call_expr, GeneratorContext *ctx,
         llvm::ArrayRef<mlir::Value> resolved_args) const;
@@ -241,6 +245,10 @@ class NVVMIntrinsic : public NamedModule {
         llvm::ArrayRef<mlir::Value> resolved_args) const;
 
     bool CheckWgmmaAsyncFunction(
+        ast::Call *call_expr, GeneratorContext *ctx,
+        llvm::ArrayRef<mlir::Value> resolved_args) const;
+
+    bool CheckWgmmaInitAccumulatorFunction(
         ast::Call *call_expr, GeneratorContext *ctx,
         llvm::ArrayRef<mlir::Value> resolved_args) const;
 
@@ -369,6 +377,19 @@ void NVVMIntrinsic::Initialize() {
         [this](ast::Call *call_expr, GeneratorContext *gen_ctx,
                llvm::ArrayRef<mlir::Value> resolved_args) -> bool {
             return CheckWgmmaAsyncFunction(call_expr, gen_ctx, resolved_args);
+        });
+
+    AddFunction(
+        "wgmma_init_accumulator",
+        [this](ast::Call *call_expr, GeneratorContext *gen_ctx,
+               llvm::ArrayRef<mlir::Value> resolved_args) -> mlir::Value {
+            return CreateWgmmaInitAccumulatorFunction(call_expr, gen_ctx,
+                                                      resolved_args);
+        },
+        [this](ast::Call *call_expr, GeneratorContext *gen_ctx,
+               llvm::ArrayRef<mlir::Value> resolved_args) -> bool {
+            return CheckWgmmaInitAccumulatorFunction(call_expr, gen_ctx,
+                                                     resolved_args);
         });
 
     AddFunction(
@@ -1131,6 +1152,69 @@ bool NVVMIntrinsic::CheckWgmmaAsyncFunction(
                                         call_expr->GetSourceRange().getBegin())
             << "wgmma_async acc operand must be of type warpgroup_accumulator";
         return false;
+    }
+
+    return true;
+}
+
+mlir::Value NVVMIntrinsic::CreateWgmmaInitAccumulatorFunction(
+    ast::Call *call_expr, GeneratorContext *ctx,
+    llvm::ArrayRef<mlir::Value> resolved_args) const {
+    auto &builder = ctx->GetCurrentFunctionGenerator()->GetBuilder();
+    auto location = builder.getUnknownLoc();
+
+    if (!CheckWgmmaInitAccumulatorFunction(call_expr, ctx, resolved_args)) {
+        return nullptr;
+    }
+
+    auto mSize = *getConstantIntValue(resolved_args[0]);
+    auto nSize = *getConstantIntValue(resolved_args[1]);
+    auto vecType = mlir::VectorType::get({mSize, nSize}, builder.getF32Type());
+    auto accType =
+        mlir::nvgpu::WarpgroupAccumulatorType::get(builder.getContext(),
+                                                   vecType);
+
+    auto acc = mlir::nvgpu::WarpgroupMmaInitAccumulatorOp::create(
+        builder, location, accType);
+    return acc.getResult();
+}
+
+bool NVVMIntrinsic::CheckWgmmaInitAccumulatorFunction(
+    ast::Call *call_expr, GeneratorContext *ctx,
+    llvm::ArrayRef<mlir::Value> resolved_args) const {
+    if (resolved_args.size() != 2) {
+        ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
+                                        call_expr->GetSourceRange().getBegin())
+            << "wgmma_init_accumulator requires exactly 2 arguments: m, n";
+        return false;
+    }
+
+    for (size_t i = 0; i < resolved_args.size(); ++i) {
+        llvm::StringRef name = i == 0 ? "m" : "n";
+        if (!resolved_args[i]) {
+            ctx->diagnostic_manager->Report(
+                basic::DiagnosticCode::kUnimplemented,
+                call_expr->GetSourceRange().getBegin())
+                << "Failed to generate " << name
+                << " operand for wgmma_init_accumulator";
+            return false;
+        }
+        if (!resolved_args[i].getType().isIntOrIndex()) {
+            ctx->diagnostic_manager->Report(
+                basic::DiagnosticCode::kUnimplemented,
+                call_expr->GetSourceRange().getBegin())
+                << "wgmma_init_accumulator " << name
+                << " operand must be an integer type";
+            return false;
+        }
+        if (!getConstantIntValue(resolved_args[i])) {
+            ctx->diagnostic_manager->Report(
+                basic::DiagnosticCode::kUnimplemented,
+                call_expr->GetSourceRange().getBegin())
+                << "wgmma_init_accumulator " << name
+                << " operand must be a constant integer";
+            return false;
+        }
     }
 
     return true;

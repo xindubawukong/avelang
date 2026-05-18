@@ -999,6 +999,7 @@ bool FunctionGenerator::ResolveNameAssignmentTarget(
         mlir::isa<mlir::nvgpu::MBarrierGroupType>(value_type) ||
         mlir::isa<mlir::nvgpu::MBarrierTokenType>(value_type) ||
         mlir::isa<mlir::nvgpu::WarpgroupMatrixDescriptorType>(value_type) ||
+        mlir::isa<mlir::nvgpu::WarpgroupAccumulatorType>(value_type) ||
         mlir::isa<mlir::OpaqueType>(value_type) ||
         value.getDefiningOp<cf::MakeIntTupleOp>()) {
         ctx_->syms->DefineSymbol(target_name, value);
