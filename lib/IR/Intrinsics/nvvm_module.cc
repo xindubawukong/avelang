@@ -53,6 +53,15 @@ constexpr llvm::StringRef kNvvmIntrinsicLibraryName = "nvvm_intrinsics.mlirbc";
 constexpr llvm::StringRef kNvvmIntrinsicLibraryTag =
     "embedded:nvvm_intrinsics.mlirbc";
 
+static void emitInlinePtxVoid(mlir::OpBuilder &builder, mlir::Location loc,
+                              llvm::StringRef asmString) {
+    mlir::LLVM::InlineAsmOp::create(
+        builder, loc, mlir::TypeRange{}, mlir::ValueRange{}, asmString, "",
+        /*hasSideEffects=*/true, /*isAlignStack=*/false,
+        mlir::LLVM::tailcallkind::TailCallKind::None,
+        mlir::LLVM::AsmDialectAttr{}, mlir::ArrayAttr{});
+}
+
 static mlir::MemRefType getBuiltinTensorMapMemRefType(mlir::Type type) {
     if (auto builtinType = mlir::dyn_cast<mlir::MemRefType>(type)) {
         return builtinType;
@@ -138,6 +147,18 @@ class NVVMIntrinsic : public NamedModule {
         ast::Call *call_expr, GeneratorContext *ctx,
         llvm::ArrayRef<mlir::Value> resolved_args) const;
 
+    mlir::Value CreateWgmmaFenceAlignedFunction(
+        ast::Call *call_expr, GeneratorContext *ctx,
+        llvm::ArrayRef<mlir::Value> resolved_args) const;
+
+    mlir::Value CreateWgmmaGroupSyncAlignedFunction(
+        ast::Call *call_expr, GeneratorContext *ctx,
+        llvm::ArrayRef<mlir::Value> resolved_args) const;
+
+    mlir::Value CreateWgmmaWaitGroupSyncFunction(
+        ast::Call *call_expr, GeneratorContext *ctx,
+        llvm::ArrayRef<mlir::Value> resolved_args) const;
+
     mlir::Value CreateMakeWGMMADescriptorFunction(
         ast::Call *call_expr, GeneratorContext *ctx,
         llvm::ArrayRef<mlir::Value> resolved_args) const;
@@ -203,6 +224,18 @@ class NVVMIntrinsic : public NamedModule {
                                 llvm::ArrayRef<mlir::Value> resolved_args,
                                 const std::string &shape, int num,
                                 int bit_width, bool transpose) const;
+    bool CheckWgmmaFenceAlignedFunction(
+        ast::Call *call_expr, GeneratorContext *ctx,
+        llvm::ArrayRef<mlir::Value> resolved_args) const;
+
+    bool CheckWgmmaGroupSyncAlignedFunction(
+        ast::Call *call_expr, GeneratorContext *ctx,
+        llvm::ArrayRef<mlir::Value> resolved_args) const;
+
+    bool CheckWgmmaWaitGroupSyncFunction(
+        ast::Call *call_expr, GeneratorContext *ctx,
+        llvm::ArrayRef<mlir::Value> resolved_args) const;
+
     bool CheckMakeWGMMADescriptorFunction(
         ast::Call *call_expr, GeneratorContext *ctx,
         llvm::ArrayRef<mlir::Value> resolved_args) const;
@@ -274,6 +307,45 @@ void NVVMIntrinsic::Initialize() {
         AddStMatrixFactory(base_name, "m8n8", num, 16, false);
         AddStMatrixFactory(base_name + "_trans", "m8n8", num, 16, true);
     }
+
+    AddFunction(
+        "wgmma_fence_aligned",
+        [this](ast::Call *call_expr, GeneratorContext *gen_ctx,
+               llvm::ArrayRef<mlir::Value> resolved_args) -> mlir::Value {
+            return CreateWgmmaFenceAlignedFunction(call_expr, gen_ctx,
+                                                   resolved_args);
+        },
+        [this](ast::Call *call_expr, GeneratorContext *gen_ctx,
+               llvm::ArrayRef<mlir::Value> resolved_args) -> bool {
+            return CheckWgmmaFenceAlignedFunction(call_expr, gen_ctx,
+                                                  resolved_args);
+        });
+
+    AddFunction(
+        "wgmma_group_sync_aligned",
+        [this](ast::Call *call_expr, GeneratorContext *gen_ctx,
+               llvm::ArrayRef<mlir::Value> resolved_args) -> mlir::Value {
+            return CreateWgmmaGroupSyncAlignedFunction(call_expr, gen_ctx,
+                                                       resolved_args);
+        },
+        [this](ast::Call *call_expr, GeneratorContext *gen_ctx,
+               llvm::ArrayRef<mlir::Value> resolved_args) -> bool {
+            return CheckWgmmaGroupSyncAlignedFunction(call_expr, gen_ctx,
+                                                      resolved_args);
+        });
+
+    AddFunction(
+        "wgmma_wait_group_sync",
+        [this](ast::Call *call_expr, GeneratorContext *gen_ctx,
+               llvm::ArrayRef<mlir::Value> resolved_args) -> mlir::Value {
+            return CreateWgmmaWaitGroupSyncFunction(call_expr, gen_ctx,
+                                                    resolved_args);
+        },
+        [this](ast::Call *call_expr, GeneratorContext *gen_ctx,
+               llvm::ArrayRef<mlir::Value> resolved_args) -> bool {
+            return CheckWgmmaWaitGroupSyncFunction(call_expr, gen_ctx,
+                                                   resolved_args);
+        });
 
     AddFunction(
         "make_wgmma_descriptor",
@@ -795,6 +867,113 @@ bool NVVMIntrinsic::CheckStMatrixWithShape(
                 << " source operand must be i32x" << num << " vector type";
             return false;
         }
+    }
+
+    return true;
+}
+
+mlir::Value NVVMIntrinsic::CreateWgmmaFenceAlignedFunction(
+    ast::Call *call_expr, GeneratorContext *ctx,
+    llvm::ArrayRef<mlir::Value> resolved_args) const {
+    auto &builder = ctx->GetCurrentFunctionGenerator()->GetBuilder();
+    auto location = builder.getUnknownLoc();
+
+    emitInlinePtxVoid(builder, location, "wgmma.fence.sync.aligned;");
+    return ctx->GetCurrentFunctionGenerator()
+        ->GetExprGenerator()
+        ->CreateVoidValue();
+}
+
+bool NVVMIntrinsic::CheckWgmmaFenceAlignedFunction(
+    ast::Call *call_expr, GeneratorContext *ctx,
+    llvm::ArrayRef<mlir::Value> resolved_args) const {
+    if (!resolved_args.empty()) {
+        ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
+                                        call_expr->GetSourceRange().getBegin())
+            << "wgmma_fence_aligned requires no arguments";
+        return false;
+    }
+
+    return true;
+}
+
+mlir::Value NVVMIntrinsic::CreateWgmmaGroupSyncAlignedFunction(
+    ast::Call *call_expr, GeneratorContext *ctx,
+    llvm::ArrayRef<mlir::Value> resolved_args) const {
+    auto &builder = ctx->GetCurrentFunctionGenerator()->GetBuilder();
+    auto location = builder.getUnknownLoc();
+
+    emitInlinePtxVoid(builder, location, "wgmma.commit_group.sync.aligned;");
+    return ctx->GetCurrentFunctionGenerator()
+        ->GetExprGenerator()
+        ->CreateVoidValue();
+}
+
+bool NVVMIntrinsic::CheckWgmmaGroupSyncAlignedFunction(
+    ast::Call *call_expr, GeneratorContext *ctx,
+    llvm::ArrayRef<mlir::Value> resolved_args) const {
+    if (!resolved_args.empty()) {
+        ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
+                                        call_expr->GetSourceRange().getBegin())
+            << "wgmma_group_sync_aligned requires no arguments";
+        return false;
+    }
+
+    return true;
+}
+
+mlir::Value NVVMIntrinsic::CreateWgmmaWaitGroupSyncFunction(
+    ast::Call *call_expr, GeneratorContext *ctx,
+    llvm::ArrayRef<mlir::Value> resolved_args) const {
+    auto &builder = ctx->GetCurrentFunctionGenerator()->GetBuilder();
+    auto location = builder.getUnknownLoc();
+
+    if (!CheckWgmmaWaitGroupSyncFunction(call_expr, ctx, resolved_args)) {
+        return nullptr;
+    }
+
+    auto groupValue = getConstantIntValue(resolved_args[0]);
+    if (!groupValue) {
+        return nullptr;
+    }
+
+    std::string asmString =
+        "wgmma.wait_group.sync.aligned " + std::to_string(*groupValue) + ";";
+    emitInlinePtxVoid(builder, location, asmString);
+    return ctx->GetCurrentFunctionGenerator()
+        ->GetExprGenerator()
+        ->CreateVoidValue();
+}
+
+bool NVVMIntrinsic::CheckWgmmaWaitGroupSyncFunction(
+    ast::Call *call_expr, GeneratorContext *ctx,
+    llvm::ArrayRef<mlir::Value> resolved_args) const {
+    if (resolved_args.size() != 1) {
+        ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
+                                        call_expr->GetSourceRange().getBegin())
+            << "wgmma_wait_group_sync requires exactly 1 argument: group";
+        return false;
+    }
+
+    if (!resolved_args[0]) {
+        ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
+                                        call_expr->GetSourceRange().getBegin())
+            << "Failed to generate group operand for wgmma_wait_group_sync";
+        return false;
+    }
+
+    if (!resolved_args[0].getType().isIntOrIndex()) {
+        ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
+                                        call_expr->GetSourceRange().getBegin())
+            << "wgmma_wait_group_sync group operand must be integer type";
+        return false;
+    }
+
+    if (!getConstantIntValue(resolved_args[0])) {
+        ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
+                                        call_expr->GetSourceRange().getBegin())
+            << "wgmma_wait_group_sync requires a constant integer value for group";
+        return false;
     }
 
     return true;
