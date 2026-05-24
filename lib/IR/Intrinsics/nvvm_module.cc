@@ -62,28 +62,6 @@ static void emitInlinePtxVoid(mlir::OpBuilder &builder, mlir::Location loc,
         mlir::LLVM::AsmDialectAttr{}, mlir::ArrayAttr{});
 }
 
-static mlir::MemRefType getBuiltinTensorMapMemRefType(mlir::Type type) {
-    if (auto builtinType = mlir::dyn_cast<mlir::MemRefType>(type)) {
-        return builtinType;
-    }
-
-    auto substrateType = mlir::dyn_cast<cf::MemRefType>(type);
-    if (!substrateType) {
-        return {};
-    }
-
-    mlir::MemRefLayoutAttrInterface layout;
-    auto strides = substrateType.getStrides();
-    if (!strides.empty()) {
-        layout = mlir::StridedLayoutAttr::get(type.getContext(),
-                                              /*offset=*/0, strides);
-    }
-
-    return mlir::MemRefType::get(substrateType.getShape(),
-                                 substrateType.getElementType(), layout,
-                                 substrateType.getMemorySpace());
-}
-
 static std::optional<int64_t> getConstantIntValue(mlir::Value value) {
     if (!value) {
         return std::nullopt;
@@ -2121,7 +2099,7 @@ mlir::Value NVVMIntrinsic::CreateMakeTMADescriptorFunction(
         return nullptr;
     }
 
-    auto tensorType = getBuiltinTensorMapMemRefType(resolved_args[0].getType());
+    auto tensorType = mlir::dyn_cast<cf::MemRefType>(resolved_args[0].getType());
     if (!tensorType) {
         return nullptr;
     }
@@ -2178,7 +2156,7 @@ bool NVVMIntrinsic::CheckMakeTMADescriptorFunction(
         return false;
     }
 
-    auto tensorType = getBuiltinTensorMapMemRefType(resolved_args[0].getType());
+    auto tensorType = mlir::dyn_cast<cf::MemRefType>(resolved_args[0].getType());
     if (!tensorType) {
         ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
                                         call_expr->GetSourceRange().getBegin())
