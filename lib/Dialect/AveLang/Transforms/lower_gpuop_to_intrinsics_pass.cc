@@ -217,6 +217,21 @@ static mlir::Value castIntegerTo(mlir::Value value, mlir::IntegerType targetType
     return mlir::arith::ExtUIOp::create(rewriter, loc, targetType, value);
 }
 
+static mlir::Value castAddressIndexToI64(mlir::Value value, mlir::Location loc,
+                                         mlir::PatternRewriter &rewriter) {
+    auto i64Type = rewriter.getI64Type();
+    if (value.getType() == i64Type) {
+        return value;
+    }
+    if (value.getType().isIndex()) {
+        auto i32Value = mlir::arith::IndexCastOp::create(
+            rewriter, loc, rewriter.getI32Type(), value);
+        return mlir::arith::ExtUIOp::create(rewriter, loc, i64Type,
+                                            i32Value);
+    }
+    return castIntegerTo(value, i64Type, loc, rewriter);
+}
+
 static mlir::Value castToBuiltinMemRef(mlir::Value value,
                                        mlir::MemRefType targetType,
                                        mlir::Location loc,
@@ -702,7 +717,6 @@ class NVVMWGMMADescriptorLowering
             return mlir::failure();
         }
 
-        auto i64Type = rewriter.getI64Type();
         auto makeConstant = [&](int64_t value) -> mlir::Value {
             return mlir::arith::ConstantIntOp::create(rewriter, op.getLoc(),
                                                       value, 64);
@@ -718,7 +732,7 @@ class NVVMWGMMADescriptorLowering
         };
 
         auto baseAddressI64 =
-            castIntegerTo(baseAddress, i64Type, op.getLoc(), rewriter);
+            castAddressIndexToI64(baseAddress, op.getLoc(), rewriter);
         if (!baseAddressI64) {
             return mlir::failure();
         }

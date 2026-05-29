@@ -1918,10 +1918,14 @@ mlir::Value NVVMIntrinsic::CreateCpAsyncCaSharedGlobalFunction(
     auto srcAddr = mlir::arith::AddIOp::create(builder, location,
                                                srcBase.getResult(), srcOffset);
 
-    auto dstAddrI64 = mlir::arith::IndexCastOp::create(
-        builder, location, builder.getI64Type(), dstAddr.getResult());
-    auto srcAddrI64 = mlir::arith::IndexCastOp::create(
-        builder, location, builder.getI64Type(), srcAddr.getResult());
+    auto dstAddrI32 = mlir::arith::IndexCastOp::create(
+        builder, location, builder.getI32Type(), dstAddr.getResult());
+    auto srcAddrI32 = mlir::arith::IndexCastOp::create(
+        builder, location, builder.getI32Type(), srcAddr.getResult());
+    auto dstAddrI64 = mlir::arith::ExtUIOp::create(
+        builder, location, builder.getI64Type(), dstAddrI32.getResult());
+    auto srcAddrI64 = mlir::arith::ExtUIOp::create(
+        builder, location, builder.getI64Type(), srcAddrI32.getResult());
 
     auto dstPtrType = mlir::LLVM::LLVMPointerType::get(
         builder.getContext(),
