@@ -1241,6 +1241,19 @@ def alloc_shared_aligned_test(output: S.Tensor((1,), S.i32)):
     pm.addPass(cf::createLowerAveLangToMemRefPass());
     ASSERT_TRUE(mlir::succeeded(pm.run(mlir))) << "Pass pipeline failed";
 
+    auto isLoweredWorkgroupMemorySpace = [](mlir::Attribute memorySpace) {
+        if (auto addrSpace =
+                mlir::dyn_cast_or_null<mlir::gpu::AddressSpaceAttr>(
+                    memorySpace)) {
+            return addrSpace.getValue() == mlir::gpu::AddressSpace::Workgroup;
+        }
+        if (auto intSpace =
+                mlir::dyn_cast_or_null<mlir::IntegerAttr>(memorySpace)) {
+            return intSpace.getInt() == 3;
+        }
+        return false;
+    };
+
     bool foundLoweredAlignedAlloca = false;
     mlir->walk([&](mlir::memref::AllocaOp op) {
         auto memrefType = op.getType();
@@ -1249,10 +1262,7 @@ def alloc_shared_aligned_test(output: S.Tensor((1,), S.i32)):
             shape.size() != 1 || shape[0] != 32) {
             return;
         }
-        auto addrSpace = mlir::dyn_cast_or_null<mlir::gpu::AddressSpaceAttr>(
-            memrefType.getMemorySpace());
-        if (!addrSpace ||
-            addrSpace.getValue() != mlir::gpu::AddressSpace::Workgroup) {
+        if (!isLoweredWorkgroupMemorySpace(memrefType.getMemorySpace())) {
             return;
         }
 

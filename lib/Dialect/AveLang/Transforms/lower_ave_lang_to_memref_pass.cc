@@ -1235,15 +1235,6 @@ mlir::LogicalResult AveLangMemRefAllocaLoweringPattern::matchAndRewrite(
         return mlir::success();
     }
 
-    if (isWorkgroupMemorySpaceAttr(normalizedMemorySpace)) {
-        auto typedResult = buildResultWithTypedAlloca();
-        if (!typedResult) {
-            return mlir::failure();
-        }
-        rewriter.replaceOp(op, typedResult);
-        return mlir::success();
-    }
-
     auto i8Type = rewriter.getIntegerType(8);
     auto byteMemRefType = mlir::MemRefType::get(
         {static_cast<int64_t>(*totalBytes)}, i8Type,
