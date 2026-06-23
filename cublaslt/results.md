@@ -65,3 +65,7 @@ M,N,K,repeats,avg_ms,tflops,algo_workspace_bytes
 8192,8192,8192,20,1.5882,692.32,4
 16384,16384,16384,5,16.0167,549.18,4
 ```
+
+## Avelang Results
+
+// TODO
