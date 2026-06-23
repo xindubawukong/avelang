@@ -1,0 +1,12 @@
+# cuBLASLt BF16 square GEMM benchmark
+selected_cuda_device,2
+device,NVIDIA H100 PCIe
+compute_capability,9.0
+cuda_runtime_version,13000
+cublas_version,13.0.2
+M,N,K,repeats,avg_ms,tflops,algo_workspace_bytes
+1024,1024,1024,200,0.0087,247.19,0
+2048,2048,2048,100,0.0331,519.17,0
+4096,4096,4096,50,0.2336,588.45,4
+8192,8192,8192,20,1.5882,692.32,4
+16384,16384,16384,5,16.0167,549.18,4
