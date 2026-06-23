@@ -71,6 +71,9 @@ find_package(LLVM CONFIG REQUIRED)
 find_package(MLIR CONFIG REQUIRED)
 find_package(Clang REQUIRED CONFIG)
 
+include_directories(/data/home/xiangyun/llvm-project/mlir/include)
+include_directories(/data/home/xiangyun/llvm-project/build/tools/mlir/include)
+
 # Locate build tool executables using paths exported by LLVM/MLIR packages.
 if(NOT MLIR_OPT_EXECUTABLE)
     set(_mlir_opt_hints)

@@ -1,0 +1,3 @@
+
+symbols:
+STT_FUNC         STB_GLOBAL STO_ENTRY      nvjet_tst_128x64_64x8_1x2_h_bz_NNT

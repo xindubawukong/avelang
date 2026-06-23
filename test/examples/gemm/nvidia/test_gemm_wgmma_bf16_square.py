@@ -134,10 +134,31 @@ class TestWgmmaBf16SquareGemm(unittest.TestCase):
         gemm_wgmma_bf16_square_kernel[lambda: (grid, block)](a, b, c, size)
         torch.cuda.synchronize(self.device)
 
-        expected = torch.full_like(c, float(size))
-        max_diff = torch.max(torch.abs(c.float() - expected.float()))
-        self.assertTrue(
-            torch.equal(c, expected),
+        del a, b
+        torch.cuda.empty_cache()
+
+        expected_value = torch.tensor(
+            float(size), dtype=c.dtype, device=self.device
+        )
+        max_temp_elements = 16 * 1024 * 1024
+        rows_per_chunk = max(1, min(size, max_temp_elements // size))
+        mismatch_found = False
+        max_diff = 0.0
+
+        for row_start in range(0, size, rows_per_chunk):
+            chunk = c[row_start : row_start + rows_per_chunk]
+            if torch.all(chunk == expected_value).item():
+                continue
+            mismatch_found = True
+            chunk_diff = torch.max(torch.abs(chunk.float() - float(size))).item()
+            max_diff = (
+                chunk_diff
+                if chunk_diff != chunk_diff
+                else max(max_diff, chunk_diff)
+            )
+
+        self.assertFalse(
+            mismatch_found,
             msg=(
                 f"WGMMA BF16 square GEMM mismatch for size {size}. "
                 f"Max absolute difference: {max_diff}"
