@@ -1286,8 +1286,8 @@ def alloc_shared_aligned_test(output: S.Tensor((1,), S.i32)):
     mlir->walk([&](mlir::memref::AllocaOp op) {
         auto memrefType = op.getType();
         auto shape = memrefType.getShape();
-        if (!memrefType.getElementType().isInteger(8) ||
-            shape.size() != 1 || shape[0] != 32) {
+        if (!memrefType.getElementType().isInteger(8) || shape.size() != 1 ||
+            shape[0] != 32) {
             return;
         }
         if (!isLoweredWorkgroupMemorySpace(memrefType.getMemorySpace())) {
@@ -1500,6 +1500,34 @@ def cp_async_test(global_mem: S.Tensor((16,), S.i32)):
     S.nvvm.cp_async_ca_shared_global(smem, global_mem, 0, 0, 16)
     S.nvvm.cp_async_commit_group()
     S.nvvm.cp_async_wait_group(0)
+)""""";
+
+    RunMLIRGenerationTest(kSourceCode);
+}
+
+TEST_F(MLIRGeneratorTest, GenerateMLIRNVVMCpAsyncBulk) {
+    static const std::string kSourceCode = R"""""(
+import avelang
+import avelang.language as S
+
+@avelang.jit
+def cp_async_bulk_test(global_mem: S.Tensor((16, 16), S.i32)):
+    smem = S.make_shared((16, 16), S.i32)
+    smem_other = S.make_shared((16, 16), S.i32)
+    smem_layout = S.make_layout((16, 16), (16, 1))
+    desc = S.nvvm.make_tma_descriptor(global_mem, smem_layout)
+    barrier = S.nvvm.mbarrier_create()
+
+    S.nvvm.cp_async_bulk_prefetch(global_mem, 64)
+    S.nvvm.cp_async_bulk_shared_cluster_global(smem, global_mem, barrier, 64)
+    S.nvvm.cp_async_bulk_shared_cluster_shared_cta(smem_other, smem, barrier, 64)
+    S.nvvm.cp_async_bulk_global_shared_cta(global_mem, smem, 64)
+    S.nvvm.cp_async_bulk_tensor_prefetch(desc, (0, 0))
+    S.nvvm.cp_async_bulk_tensor_shared_cluster_global(smem, desc, (0, 0), barrier)
+    S.nvvm.cp_async_bulk_tensor_global_shared_cta(desc, smem, (0, 0))
+    S.nvvm.cp_async_bulk_tensor_reduce(desc, smem, (0, 0), 0)
+    S.nvvm.cp_async_bulk_commit_group()
+    S.nvvm.cp_async_bulk_wait_group(0)
 )""""";
 
     RunMLIRGenerationTest(kSourceCode);

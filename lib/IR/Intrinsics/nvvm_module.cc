@@ -11,10 +11,10 @@
 #include <mlir/Dialect/Arith/IR/Arith.h>
 #include <mlir/Dialect/Func/IR/FuncOps.h>
 #include <mlir/Dialect/GPU/IR/GPUDialect.h>
-#include <mlir/Dialect/NVGPU/IR/NVGPUDialect.h>
 #include <mlir/Dialect/LLVMIR/LLVMDialect.h>
 #include <mlir/Dialect/LLVMIR/NVVMDialect.h>
 #include <mlir/Dialect/MemRef/IR/MemRef.h>
+#include <mlir/Dialect/NVGPU/IR/NVGPUDialect.h>
 #include <mlir/Dialect/Vector/IR/VectorOps.h>
 #include <mlir/IR/Builders.h>
 #include <mlir/IR/BuiltinOps.h>
@@ -40,6 +40,19 @@ using namespace causalflow::avelang::dialect;
 namespace cf = causalflow::avelang::dialect;
 
 namespace {
+
+enum class CpAsyncBulkIntrinsicKind {
+    CommitGroup,
+    GlobalSharedCTA,
+    Prefetch,
+    SharedClusterGlobal,
+    SharedClusterSharedCTA,
+    TensorGlobalSharedCTA,
+    TensorPrefetch,
+    TensorReduce,
+    TensorSharedClusterGlobal,
+    WaitGroup,
+};
 
 static llvm::StringRef GetNvvmIntrinsicLibrary() {
     auto *start =
@@ -81,8 +94,8 @@ static std::optional<int64_t> getConstantIntValue(mlir::Value value) {
     return std::nullopt;
 }
 
-static bool extractConstantTupleValues(
-    mlir::Value tupleValue, llvm::SmallVectorImpl<int64_t> &values) {
+static bool extractConstantTupleValues(mlir::Value tupleValue,
+                                       llvm::SmallVectorImpl<int64_t> &values) {
     if (auto tupleOp = tupleValue.getDefiningOp<cf::MakeIntTupleOp>()) {
         for (auto elem : tupleOp.getElements()) {
             if (!extractConstantTupleValues(elem, values)) {
@@ -98,6 +111,158 @@ static bool extractConstantTupleValues(
     }
     values.push_back(*value);
     return true;
+}
+
+static bool extractTupleValues(mlir::Value tupleValue,
+                               llvm::SmallVectorImpl<mlir::Value> &values) {
+    if (auto tupleOp = tupleValue.getDefiningOp<cf::MakeIntTupleOp>()) {
+        for (auto elem : tupleOp.getElements()) {
+            if (!extractTupleValues(elem, values)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    if (!tupleValue) {
+        return false;
+    }
+    values.push_back(tupleValue);
+    return true;
+}
+
+static bool isMemRefLike(mlir::Type type) {
+    return mlir::isa<cf::MemRefType, mlir::MemRefType>(type);
+}
+
+static mlir::Value createDefaultIndex(mlir::OpBuilder &builder,
+                                      mlir::Location location) {
+    return mlir::arith::ConstantIndexOp::create(builder, location, 0)
+        .getResult();
+}
+
+static mlir::Value castIntegerTo(mlir::OpBuilder &builder,
+                                 mlir::Location location, mlir::Value value,
+                                 mlir::IntegerType targetType) {
+    if (!value) {
+        return {};
+    }
+    if (value.getType() == targetType) {
+        return value;
+    }
+    if (value.getType().isIndex()) {
+        return mlir::arith::IndexCastOp::create(builder, location, targetType,
+                                                value)
+            .getResult();
+    }
+    auto intType = mlir::dyn_cast<mlir::IntegerType>(value.getType());
+    if (!intType) {
+        return {};
+    }
+    if (intType.getWidth() == targetType.getWidth()) {
+        return value;
+    }
+    if (intType.getWidth() < targetType.getWidth()) {
+        return mlir::arith::ExtUIOp::create(builder, location, targetType,
+                                            value)
+            .getResult();
+    }
+    return mlir::arith::TruncIOp::create(builder, location, targetType, value)
+        .getResult();
+}
+
+static mlir::Value castToIndex(mlir::OpBuilder &builder,
+                               mlir::Location location, mlir::Value value) {
+    if (!value) {
+        return {};
+    }
+    if (value.getType().isIndex()) {
+        return value;
+    }
+    if (!value.getType().isIntOrIndex()) {
+        return {};
+    }
+    return mlir::arith::IndexCastOp::create(builder, location,
+                                            builder.getIndexType(), value)
+        .getResult();
+}
+
+static mlir::LLVM::LLVMPointerType
+getNvvmPointerType(mlir::OpBuilder &builder,
+                   mlir::NVVM::NVVMMemorySpace memorySpace) {
+    return mlir::LLVM::LLVMPointerType::get(builder.getContext(),
+                                            static_cast<unsigned>(memorySpace));
+}
+
+static mlir::Value castToPointer(mlir::OpBuilder &builder,
+                                 mlir::Location location, mlir::Value value,
+                                 mlir::LLVM::LLVMPointerType pointerType) {
+    if (!value) {
+        return {};
+    }
+    if (value.getType() == pointerType) {
+        return value;
+    }
+    auto cast = mlir::UnrealizedConversionCastOp::create(builder, location,
+                                                         pointerType, value);
+    return cast.getResult(0);
+}
+
+static mlir::Value
+createPointerFromMemRef(mlir::OpBuilder &builder, mlir::Location location,
+                        mlir::Value memref, mlir::Value offsetBytes,
+                        mlir::NVVM::NVVMMemorySpace memorySpace) {
+    if (!memref) {
+        return {};
+    }
+    auto pointerType = getNvvmPointerType(builder, memorySpace);
+    if (mlir::isa<mlir::LLVM::LLVMPointerType>(memref.getType())) {
+        return castToPointer(builder, location, memref, pointerType);
+    }
+    if (!isMemRefLike(memref.getType())) {
+        return {};
+    }
+
+    auto base = cf::AveLangMemRefExtractAlignedPointerAsIndexOp::create(
+        builder, location, builder.getIndexType(), memref);
+    mlir::Value addr = base.getResult();
+    if (offsetBytes) {
+        auto offset = castToIndex(builder, location, offsetBytes);
+        if (!offset) {
+            return {};
+        }
+        addr = mlir::arith::AddIOp::create(builder, location, addr, offset);
+    }
+    auto addrI64 = mlir::arith::IndexCastOp::create(builder, location,
+                                                    builder.getI64Type(), addr);
+    return mlir::LLVM::IntToPtrOp::create(builder, location, pointerType,
+                                          addrI64.getResult())
+        .getResult();
+}
+
+static mlir::Value createSharedBarrierPointer(mlir::OpBuilder &builder,
+                                              mlir::Location location,
+                                              mlir::Value value,
+                                              mlir::Value offsetBytes) {
+    if (!value) {
+        return {};
+    }
+    auto pointerType =
+        getNvvmPointerType(builder, mlir::NVVM::NVVMMemorySpace::Shared);
+    if (isMemRefLike(value.getType()) ||
+        mlir::isa<mlir::LLVM::LLVMPointerType>(value.getType())) {
+        return createPointerFromMemRef(builder, location, value, offsetBytes,
+                                       mlir::NVVM::NVVMMemorySpace::Shared);
+    }
+    return castToPointer(builder, location, value, pointerType);
+}
+
+static mlir::Value createDescriptorPointer(mlir::OpBuilder &builder,
+                                           mlir::Location location,
+                                           mlir::Value descriptor) {
+    return castToPointer(
+        builder, location, descriptor,
+        mlir::LLVM::LLVMPointerType::get(builder.getContext()));
 }
 
 } // namespace
@@ -145,37 +310,37 @@ class NVVMIntrinsic : public NamedModule {
         ast::Call *call_expr, GeneratorContext *ctx,
         llvm::ArrayRef<mlir::Value> resolved_args) const;
 
-    mlir::Value CreateTMAFenceFunction(
-        ast::Call *call_expr, GeneratorContext *ctx,
-        llvm::ArrayRef<mlir::Value> resolved_args) const;
+    mlir::Value
+    CreateTMAFenceFunction(ast::Call *call_expr, GeneratorContext *ctx,
+                           llvm::ArrayRef<mlir::Value> resolved_args) const;
 
-    mlir::Value CreateTMALoadFunction(
-        ast::Call *call_expr, GeneratorContext *ctx,
-        llvm::ArrayRef<mlir::Value> resolved_args) const;
+    mlir::Value
+    CreateTMALoadFunction(ast::Call *call_expr, GeneratorContext *ctx,
+                          llvm::ArrayRef<mlir::Value> resolved_args) const;
 
-    mlir::Value CreateTMAStoreFunction(
-        ast::Call *call_expr, GeneratorContext *ctx,
-        llvm::ArrayRef<mlir::Value> resolved_args) const;
+    mlir::Value
+    CreateTMAStoreFunction(ast::Call *call_expr, GeneratorContext *ctx,
+                           llvm::ArrayRef<mlir::Value> resolved_args) const;
 
-    mlir::Value CreateWgmmaAsyncFunction(
-        ast::Call *call_expr, GeneratorContext *ctx,
-        llvm::ArrayRef<mlir::Value> resolved_args) const;
+    mlir::Value
+    CreateWgmmaAsyncFunction(ast::Call *call_expr, GeneratorContext *ctx,
+                             llvm::ArrayRef<mlir::Value> resolved_args) const;
 
     mlir::Value CreateWgmmaInitAccumulatorFunction(
         ast::Call *call_expr, GeneratorContext *ctx,
         llvm::ArrayRef<mlir::Value> resolved_args) const;
 
-    mlir::Value CreateWgmmaStoreFunction(
-        ast::Call *call_expr, GeneratorContext *ctx,
-        llvm::ArrayRef<mlir::Value> resolved_args) const;
+    mlir::Value
+    CreateWgmmaStoreFunction(ast::Call *call_expr, GeneratorContext *ctx,
+                             llvm::ArrayRef<mlir::Value> resolved_args) const;
 
     mlir::Value CreateMBarrierCreateFunction(
         ast::Call *call_expr, GeneratorContext *ctx,
         llvm::ArrayRef<mlir::Value> resolved_args) const;
 
-    mlir::Value CreateMBarrierInitFunction(
-        ast::Call *call_expr, GeneratorContext *ctx,
-        llvm::ArrayRef<mlir::Value> resolved_args) const;
+    mlir::Value
+    CreateMBarrierInitFunction(ast::Call *call_expr, GeneratorContext *ctx,
+                               llvm::ArrayRef<mlir::Value> resolved_args) const;
 
     mlir::Value CreateMBarrierTryWaitParityFunction(
         ast::Call *call_expr, GeneratorContext *ctx,
@@ -204,6 +369,11 @@ class NVVMIntrinsic : public NamedModule {
     mlir::Value CreateCpAsyncWaitGroupFunction(
         ast::Call *call_expr, GeneratorContext *ctx,
         llvm::ArrayRef<mlir::Value> resolved_args) const;
+
+    mlir::Value
+    CreateCpAsyncBulkFunction(ast::Call *call_expr, GeneratorContext *ctx,
+                              llvm::ArrayRef<mlir::Value> resolved_args,
+                              CpAsyncBulkIntrinsicKind kind) const;
 
   private:
     void AddLdMatrixFactory(const std::string &name, const std::string &shape,
@@ -258,25 +428,25 @@ class NVVMIntrinsic : public NamedModule {
         ast::Call *call_expr, GeneratorContext *ctx,
         llvm::ArrayRef<mlir::Value> resolved_args) const;
 
-    bool CheckWgmmaAsyncFunction(
-        ast::Call *call_expr, GeneratorContext *ctx,
-        llvm::ArrayRef<mlir::Value> resolved_args) const;
+    bool
+    CheckWgmmaAsyncFunction(ast::Call *call_expr, GeneratorContext *ctx,
+                            llvm::ArrayRef<mlir::Value> resolved_args) const;
 
     bool CheckWgmmaInitAccumulatorFunction(
         ast::Call *call_expr, GeneratorContext *ctx,
         llvm::ArrayRef<mlir::Value> resolved_args) const;
 
-    bool CheckWgmmaStoreFunction(
-        ast::Call *call_expr, GeneratorContext *ctx,
-        llvm::ArrayRef<mlir::Value> resolved_args) const;
+    bool
+    CheckWgmmaStoreFunction(ast::Call *call_expr, GeneratorContext *ctx,
+                            llvm::ArrayRef<mlir::Value> resolved_args) const;
 
     bool CheckMBarrierCreateFunction(
         ast::Call *call_expr, GeneratorContext *ctx,
         llvm::ArrayRef<mlir::Value> resolved_args) const;
 
-    bool CheckMBarrierInitFunction(
-        ast::Call *call_expr, GeneratorContext *ctx,
-        llvm::ArrayRef<mlir::Value> resolved_args) const;
+    bool
+    CheckMBarrierInitFunction(ast::Call *call_expr, GeneratorContext *ctx,
+                              llvm::ArrayRef<mlir::Value> resolved_args) const;
 
     bool CheckMBarrierTryWaitParityFunction(
         ast::Call *call_expr, GeneratorContext *ctx,
@@ -306,18 +476,22 @@ class NVVMIntrinsic : public NamedModule {
         ast::Call *call_expr, GeneratorContext *ctx,
         llvm::ArrayRef<mlir::Value> resolved_args) const;
 
-    bool CheckMakeTMADescriptorFunction(ast::Call *call_expr, GeneratorContext *ctx,
-                                     llvm::ArrayRef<mlir::Value> resolved_args) const;
+    bool CheckCpAsyncBulkFunction(ast::Call *call_expr, GeneratorContext *ctx,
+                                  llvm::ArrayRef<mlir::Value> resolved_args,
+                                  CpAsyncBulkIntrinsicKind kind) const;
+
+    bool CheckMakeTMADescriptorFunction(
+        ast::Call *call_expr, GeneratorContext *ctx,
+        llvm::ArrayRef<mlir::Value> resolved_args) const;
 
     bool CheckTMAFenceFunction(ast::Call *call_expr, GeneratorContext *ctx,
-                                     llvm::ArrayRef<mlir::Value> resolved_args) const;
+                               llvm::ArrayRef<mlir::Value> resolved_args) const;
 
     bool CheckTMALoadFunction(ast::Call *call_expr, GeneratorContext *ctx,
-                                     llvm::ArrayRef<mlir::Value> resolved_args) const;
+                              llvm::ArrayRef<mlir::Value> resolved_args) const;
 
     bool CheckTMAStoreFunction(ast::Call *call_expr, GeneratorContext *ctx,
-                                     llvm::ArrayRef<mlir::Value> resolved_args) const;
-
+                               llvm::ArrayRef<mlir::Value> resolved_args) const;
 };
 
 NVVMIntrinsic::NVVMIntrinsic() : NamedModule("nvvm") {}
@@ -475,8 +649,7 @@ void NVVMIntrinsic::Initialize() {
         },
         [this](ast::Call *call_expr, GeneratorContext *gen_ctx,
                llvm::ArrayRef<mlir::Value> resolved_args) -> bool {
-            return CheckMBarrierInitFunction(call_expr, gen_ctx,
-                                             resolved_args);
+            return CheckMBarrierInitFunction(call_expr, gen_ctx, resolved_args);
         });
 
     AddFunction(
@@ -570,6 +743,44 @@ void NVVMIntrinsic::Initialize() {
                                                  resolved_args);
         });
 
+    auto addCpAsyncBulkFunction = [this](llvm::StringRef name,
+                                         CpAsyncBulkIntrinsicKind kind) {
+        AddFunction(
+            name.str(),
+            [this,
+             kind](ast::Call *call_expr, GeneratorContext *gen_ctx,
+                   llvm::ArrayRef<mlir::Value> resolved_args) -> mlir::Value {
+                return CreateCpAsyncBulkFunction(call_expr, gen_ctx,
+                                                 resolved_args, kind);
+            },
+            [this, kind](ast::Call *call_expr, GeneratorContext *gen_ctx,
+                         llvm::ArrayRef<mlir::Value> resolved_args) -> bool {
+                return CheckCpAsyncBulkFunction(call_expr, gen_ctx,
+                                                resolved_args, kind);
+            });
+    };
+
+    addCpAsyncBulkFunction("cp_async_bulk_commit_group",
+                           CpAsyncBulkIntrinsicKind::CommitGroup);
+    addCpAsyncBulkFunction("cp_async_bulk_global_shared_cta",
+                           CpAsyncBulkIntrinsicKind::GlobalSharedCTA);
+    addCpAsyncBulkFunction("cp_async_bulk_prefetch",
+                           CpAsyncBulkIntrinsicKind::Prefetch);
+    addCpAsyncBulkFunction("cp_async_bulk_shared_cluster_global",
+                           CpAsyncBulkIntrinsicKind::SharedClusterGlobal);
+    addCpAsyncBulkFunction("cp_async_bulk_shared_cluster_shared_cta",
+                           CpAsyncBulkIntrinsicKind::SharedClusterSharedCTA);
+    addCpAsyncBulkFunction("cp_async_bulk_tensor_global_shared_cta",
+                           CpAsyncBulkIntrinsicKind::TensorGlobalSharedCTA);
+    addCpAsyncBulkFunction("cp_async_bulk_tensor_prefetch",
+                           CpAsyncBulkIntrinsicKind::TensorPrefetch);
+    addCpAsyncBulkFunction("cp_async_bulk_tensor_reduce",
+                           CpAsyncBulkIntrinsicKind::TensorReduce);
+    addCpAsyncBulkFunction("cp_async_bulk_tensor_shared_cluster_global",
+                           CpAsyncBulkIntrinsicKind::TensorSharedClusterGlobal);
+    addCpAsyncBulkFunction("cp_async_bulk_wait_group",
+                           CpAsyncBulkIntrinsicKind::WaitGroup);
+
     AddFunction(
         "make_tma_descriptor",
         [this](ast::Call *call_expr, GeneratorContext *gen_ctx,
@@ -615,7 +826,6 @@ void NVVMIntrinsic::Initialize() {
                llvm::ArrayRef<mlir::Value> resolved_args) -> bool {
             return CheckTMAStoreFunction(call_expr, gen_ctx, resolved_args);
         });
-
 }
 
 void NVVMIntrinsic::DeclareModules(mlir::ModuleOp module) {
@@ -1160,7 +1370,8 @@ bool NVVMIntrinsic::CheckWgmmaWaitGroupSyncFunction(
     if (!getConstantIntValue(resolved_args[0])) {
         ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
                                         call_expr->GetSourceRange().getBegin())
-            << "wgmma_wait_group_sync requires a constant integer value for group";
+            << "wgmma_wait_group_sync requires a constant integer value for "
+               "group";
         return false;
     }
 
@@ -1209,7 +1420,8 @@ bool NVVMIntrinsic::CheckMakeWGMMADescriptorFunction(
     if (resolved_args.size() != 5) {
         ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
                                         call_expr->GetSourceRange().getBegin())
-            << "make_wgmma_descriptor requires exactly 5 arguments: tensor, swizzle_kind, l2promo_kind, oob_kind, interleave_kind";
+            << "make_wgmma_descriptor requires exactly 5 arguments: tensor, "
+               "swizzle_kind, l2promo_kind, oob_kind, interleave_kind";
         return false;
     }
 
@@ -1223,7 +1435,8 @@ bool NVVMIntrinsic::CheckMakeWGMMADescriptorFunction(
     if (!mlir::isa<cf::MemRefType>(resolved_args[0].getType())) {
         ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
                                         call_expr->GetSourceRange().getBegin())
-            << "make_wgmma_descriptor expects memref pointer operand for tensor";
+            << "make_wgmma_descriptor expects memref pointer operand for "
+               "tensor";
         return false;
     }
 
@@ -1249,7 +1462,8 @@ bool NVVMIntrinsic::CheckMakeWGMMADescriptorFunction(
             ctx->diagnostic_manager->Report(
                 basic::DiagnosticCode::kUnimplemented,
                 call_expr->GetSourceRange().getBegin())
-                << "make_wgmma_descriptor requires a constant integer value for "
+                << "make_wgmma_descriptor requires a constant integer value "
+                   "for "
                 << name;
             return false;
         }
@@ -1264,10 +1478,8 @@ bool NVVMIntrinsic::CheckMakeWGMMADescriptorFunction(
         return true;
     };
 
-    return checkKind(1, "swizzle_kind", 3) &&
-           checkKind(2, "l2promo_kind", 3) &&
-           checkKind(3, "oob_kind", 1) &&
-           checkKind(4, "interleave_kind", 2);
+    return checkKind(1, "swizzle_kind", 3) && checkKind(2, "l2promo_kind", 3) &&
+           checkKind(3, "oob_kind", 1) && checkKind(4, "interleave_kind", 2);
 }
 
 mlir::Value NVVMIntrinsic::CreateWgmmaAsyncFunction(
@@ -1337,9 +1549,8 @@ mlir::Value NVVMIntrinsic::CreateWgmmaInitAccumulatorFunction(
     auto mSize = *getConstantIntValue(resolved_args[0]);
     auto nSize = *getConstantIntValue(resolved_args[1]);
     auto vecType = mlir::VectorType::get({mSize, nSize}, builder.getF32Type());
-    auto accType =
-        mlir::nvgpu::WarpgroupAccumulatorType::get(builder.getContext(),
-                                                   vecType);
+    auto accType = mlir::nvgpu::WarpgroupAccumulatorType::get(
+        builder.getContext(), vecType);
 
     auto acc = mlir::nvgpu::WarpgroupMmaInitAccumulatorOp::create(
         builder, location, accType);
@@ -1451,9 +1662,8 @@ mlir::Value NVVMIntrinsic::CreateMBarrierCreateFunction(
 
     auto workgroupSpace = mlir::gpu::AddressSpaceAttr::get(
         builder.getContext(), mlir::gpu::AddressSpace::Workgroup);
-    auto barrierType =
-        mlir::nvgpu::MBarrierGroupType::get(builder.getContext(),
-                                            workgroupSpace);
+    auto barrierType = mlir::nvgpu::MBarrierGroupType::get(builder.getContext(),
+                                                           workgroupSpace);
     auto barrier =
         mlir::nvgpu::MBarrierCreateOp::create(builder, location, barrierType);
     return barrier.getResult();
@@ -1513,8 +1723,8 @@ mlir::Value NVVMIntrinsic::CreateMBarrierInitFunction(
     }
 
     if (!count.getType().isIndex()) {
-        count = mlir::arith::IndexCastOp::create(
-            builder, location, builder.getIndexType(), count);
+        count = mlir::arith::IndexCastOp::create(builder, location,
+                                                 builder.getIndexType(), count);
     }
     if (predicate) {
         if (predicate.getType().isIndex()) {
@@ -1528,10 +1738,10 @@ mlir::Value NVVMIntrinsic::CreateMBarrierInitFunction(
         }
     }
 
-    auto mbarIdIndex = mlir::arith::ConstantIndexOp::create(
-        builder, location, *mbarIdValue);
-    mlir::nvgpu::MBarrierInitOp::create(
-        builder, location, resolved_args[0], count, mbarIdIndex, predicate);
+    auto mbarIdIndex =
+        mlir::arith::ConstantIndexOp::create(builder, location, *mbarIdValue);
+    mlir::nvgpu::MBarrierInitOp::create(builder, location, resolved_args[0],
+                                        count, mbarIdIndex, predicate);
     mlir::gpu::BarrierOp::create(builder, location);
 
     return ctx->GetCurrentFunctionGenerator()
@@ -1555,14 +1765,16 @@ bool NVVMIntrinsic::CheckMBarrierInitFunction(
     if (positionalCount < 1 || positionalCount > 4) {
         ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
                                         call_expr->GetSourceRange().getBegin())
-            << "mbarrier_init requires barrier, mbar_id and optional count, predicate";
+            << "mbarrier_init requires barrier, mbar_id and optional count, "
+               "predicate";
         return false;
     }
 
     for (auto name : keywords) {
         if (name != "mbar_id" && name != "count" && name != "predicate") {
-            ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
-                                            call_expr->GetSourceRange().getBegin())
+            ctx->diagnostic_manager->Report(
+                basic::DiagnosticCode::kUnimplemented,
+                call_expr->GetSourceRange().getBegin())
                 << "mbarrier_init got unsupported keyword argument '" << name
                 << "'";
             return false;
@@ -1604,8 +1816,9 @@ bool NVVMIntrinsic::CheckMBarrierInitFunction(
 
     auto checkIntArg = [&](mlir::Value value, llvm::StringRef name) -> bool {
         if (value && !value.getType().isIntOrIndex()) {
-            ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
-                                            call_expr->GetSourceRange().getBegin())
+            ctx->diagnostic_manager->Report(
+                basic::DiagnosticCode::kUnimplemented,
+                call_expr->GetSourceRange().getBegin())
                 << "mbarrier_init " << name
                 << " operand must be an integer type";
             return false;
@@ -1613,8 +1826,7 @@ bool NVVMIntrinsic::CheckMBarrierInitFunction(
         return true;
     };
 
-    if (!checkIntArg(mbarId, "mbar_id") ||
-        !getConstantIntValue(mbarId)) {
+    if (!checkIntArg(mbarId, "mbar_id") || !getConstantIntValue(mbarId)) {
         ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
                                         call_expr->GetSourceRange().getBegin())
             << "mbarrier_init requires a constant integer value for mbar_id";
@@ -1669,7 +1881,8 @@ bool NVVMIntrinsic::CheckMBarrierTryWaitParityFunction(
     if (resolved_args.size() != 4) {
         ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
                                         call_expr->GetSourceRange().getBegin())
-            << "mbarrier_try_wait_parity requires exactly 4 arguments: barrier, phaseParity, ticks, mbarId";
+            << "mbarrier_try_wait_parity requires exactly 4 arguments: "
+               "barrier, phaseParity, ticks, mbarId";
         return false;
     }
 
@@ -1685,7 +1898,8 @@ bool NVVMIntrinsic::CheckMBarrierTryWaitParityFunction(
             resolved_args[0].getType())) {
         ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
                                         call_expr->GetSourceRange().getBegin())
-            << "mbarrier_try_wait_parity operand must be of type mbarrier_group_t";
+            << "mbarrier_try_wait_parity operand must be of type "
+               "mbarrier_group_t";
         return false;
     }
 
@@ -1782,7 +1996,8 @@ bool NVVMIntrinsic::CheckMBarrierTestWaitFunction(
     if (resolved_args.size() != 3) {
         ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
                                         call_expr->GetSourceRange().getBegin())
-            << "mbarrier_test_wait requires exactly 3 arguments: barrier, token, mbarId";
+            << "mbarrier_test_wait requires exactly 3 arguments: barrier, "
+               "token, mbarId";
         return false;
     }
 
@@ -1805,7 +2020,8 @@ bool NVVMIntrinsic::CheckMBarrierTestWaitFunction(
             resolved_args[1].getType())) {
         ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
                                         call_expr->GetSourceRange().getBegin())
-            << "mbarrier_test_wait token operand must be of type mbarrier_token_t";
+            << "mbarrier_test_wait token operand must be of type "
+               "mbarrier_token_t";
         return false;
     }
 
@@ -1854,7 +2070,8 @@ bool NVVMIntrinsic::CheckMBarrierArriveExpectTxFunction(
     if (resolved_args.size() != 4) {
         ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
                                         call_expr->GetSourceRange().getBegin())
-            << "mbarrier_arrive_expect_tx requires exactly 4 arguments: barrier, txcount, mbarId, predicate";
+            << "mbarrier_arrive_expect_tx requires exactly 4 arguments: "
+               "barrier, txcount, mbarId, predicate";
         return false;
     }
 
@@ -1870,7 +2087,8 @@ bool NVVMIntrinsic::CheckMBarrierArriveExpectTxFunction(
             resolved_args[0].getType())) {
         ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
                                         call_expr->GetSourceRange().getBegin())
-            << "mbarrier_arrive_expect_tx operand must be of type mbarrier_group_t";
+            << "mbarrier_arrive_expect_tx operand must be of type "
+               "mbarrier_group_t";
         return false;
     }
 
@@ -1903,8 +2121,8 @@ mlir::Value NVVMIntrinsic::CreateCpAsyncCaSharedGlobalFunction(
         if (value.getType().isIndex()) {
             return value;
         }
-        return mlir::arith::IndexCastOp::create(
-            builder, location, builder.getIndexType(), value);
+        return mlir::arith::IndexCastOp::create(builder, location,
+                                                builder.getIndexType(), value);
     };
 
     auto dstBase = cf::AveLangMemRefExtractAlignedPointerAsIndexOp::create(
@@ -1934,11 +2152,12 @@ mlir::Value NVVMIntrinsic::CreateCpAsyncCaSharedGlobalFunction(
         builder.getContext(),
         static_cast<unsigned>(mlir::NVVM::NVVMMemorySpace::Global));
 
-    auto dstPtr = mlir::LLVM::IntToPtrOp::create(
-        builder, location, dstPtrType, dstAddrI64.getResult());
-    auto srcPtr = mlir::LLVM::IntToPtrOp::create(
-        builder, location, srcPtrType, srcAddrI64.getResult());
-    auto sizeBytes = static_cast<int64_t>(*getConstantIntValue(resolved_args[4]));
+    auto dstPtr = mlir::LLVM::IntToPtrOp::create(builder, location, dstPtrType,
+                                                 dstAddrI64.getResult());
+    auto srcPtr = mlir::LLVM::IntToPtrOp::create(builder, location, srcPtrType,
+                                                 srcAddrI64.getResult());
+    auto sizeBytes =
+        static_cast<int64_t>(*getConstantIntValue(resolved_args[4]));
 
     mlir::NVVM::CpAsyncOp::create(
         builder, location, dstPtr.getResult(), srcPtr.getResult(),
@@ -1958,14 +2177,16 @@ bool NVVMIntrinsic::CheckCpAsyncCaSharedGlobalFunction(
     if (resolved_args.size() != 5) {
         ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
                                         call_expr->GetSourceRange().getBegin())
-            << "cp_async_ca_shared_global requires 5 arguments: dst, src, dst_offset_bytes, src_offset_bytes, size_bytes";
+            << "cp_async_ca_shared_global requires 5 arguments: dst, src, "
+               "dst_offset_bytes, src_offset_bytes, size_bytes";
         return false;
     }
     if (!resolved_args[0] || !resolved_args[1] || !resolved_args[2] ||
         !resolved_args[3] || !resolved_args[4]) {
         ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
                                         call_expr->GetSourceRange().getBegin())
-            << "failed to generate one or more operands for cp_async_ca_shared_global";
+            << "failed to generate one or more operands for "
+               "cp_async_ca_shared_global";
         return false;
     }
 
@@ -1984,7 +2205,8 @@ bool NVVMIntrinsic::CheckCpAsyncCaSharedGlobalFunction(
     if (dstType.getMemorySpace() != gpuSpace) {
         ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
                                         call_expr->GetSourceRange().getBegin())
-            << "cp_async_ca_shared_global dst operand must be in workgroup memory";
+            << "cp_async_ca_shared_global dst operand must be in workgroup "
+               "memory";
         return false;
     }
 
@@ -1993,7 +2215,8 @@ bool NVVMIntrinsic::CheckCpAsyncCaSharedGlobalFunction(
         !resolved_args[4].getType().isIntOrIndex()) {
         ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
                                         call_expr->GetSourceRange().getBegin())
-            << "cp_async_ca_shared_global offset/size operands must be integer/index";
+            << "cp_async_ca_shared_global offset/size operands must be "
+               "integer/index";
         return false;
     }
 
@@ -2001,14 +2224,16 @@ bool NVVMIntrinsic::CheckCpAsyncCaSharedGlobalFunction(
     if (!sizeBytes) {
         ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
                                         call_expr->GetSourceRange().getBegin())
-            << "cp_async_ca_shared_global size_bytes must be a compile-time constant";
+            << "cp_async_ca_shared_global size_bytes must be a compile-time "
+               "constant";
         return false;
     }
 
     if (*sizeBytes != 4 && *sizeBytes != 8 && *sizeBytes != 16) {
         ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
                                         call_expr->GetSourceRange().getBegin())
-            << "cp_async_ca_shared_global size_bytes must be one of 4, 8, or 16";
+            << "cp_async_ca_shared_global size_bytes must be one of 4, 8, or "
+               "16";
         return false;
     }
 
@@ -2054,8 +2279,8 @@ mlir::Value NVVMIntrinsic::CreateCpAsyncWaitGroupFunction(
     }
 
     auto group = static_cast<int32_t>(*getConstantIntValue(resolved_args[0]));
-    mlir::NVVM::CpAsyncWaitGroupOp::create(
-        builder, location, builder.getI32IntegerAttr(group));
+    mlir::NVVM::CpAsyncWaitGroupOp::create(builder, location,
+                                           builder.getI32IntegerAttr(group));
     return ctx->GetCurrentFunctionGenerator()
         ->GetExprGenerator()
         ->CreateVoidValue();
@@ -2093,6 +2318,543 @@ bool NVVMIntrinsic::CheckCpAsyncWaitGroupFunction(
     return true;
 }
 
+mlir::Value NVVMIntrinsic::CreateCpAsyncBulkFunction(
+    ast::Call *call_expr, GeneratorContext *ctx,
+    llvm::ArrayRef<mlir::Value> resolved_args,
+    CpAsyncBulkIntrinsicKind kind) const {
+    auto &builder = ctx->GetCurrentFunctionGenerator()->GetBuilder();
+    auto location = builder.getUnknownLoc();
+
+    if (!CheckCpAsyncBulkFunction(call_expr, ctx, resolved_args, kind)) {
+        return nullptr;
+    }
+
+    const auto &keywords = call_expr->GetKeywords();
+    size_t keywordCount = keywords.size();
+    size_t positionalCount = resolved_args.size() - keywordCount;
+
+    auto keywordValue = [&](llvm::StringRef key) -> mlir::Value {
+        for (size_t i = 0; i < keywordCount; ++i) {
+            if (llvm::StringRef(keywords[i]) == key) {
+                return resolved_args[positionalCount + i];
+            }
+        }
+        return {};
+    };
+    auto optionalValue = [&](size_t positionalIndex,
+                             llvm::StringRef key) -> mlir::Value {
+        if (positionalCount > positionalIndex) {
+            return resolved_args[positionalIndex];
+        }
+        return keywordValue(key);
+    };
+    auto offsetValue = [&](size_t positionalIndex,
+                           llvm::StringRef key) -> mlir::Value {
+        if (auto value = optionalValue(positionalIndex, key)) {
+            return value;
+        }
+        return createDefaultIndex(builder, location);
+    };
+    auto i32 = [&](mlir::Value value) {
+        return castIntegerTo(builder, location, value, builder.getI32Type());
+    };
+    auto i16 = [&](mlir::Value value) {
+        return castIntegerTo(builder, location, value, builder.getI16Type());
+    };
+    auto i64 = [&](mlir::Value value) {
+        return castIntegerTo(builder, location, value, builder.getI64Type());
+    };
+    auto i1 = [&](mlir::Value value) {
+        return castIntegerTo(builder, location, value, builder.getI1Type());
+    };
+    auto coordinates = [&](mlir::Value tuple) {
+        llvm::SmallVector<mlir::Value> values;
+        extractTupleValues(tuple, values);
+        for (auto &value : values) {
+            value = i32(value);
+        }
+        return values;
+    };
+    auto im2colOffsets = [&](mlir::Value tuple) {
+        llvm::SmallVector<mlir::Value> values;
+        if (tuple) {
+            extractTupleValues(tuple, values);
+        }
+        for (auto &value : values) {
+            value = i16(value);
+        }
+        return values;
+    };
+
+    switch (kind) {
+    case CpAsyncBulkIntrinsicKind::CommitGroup:
+        mlir::NVVM::CpAsyncBulkCommitGroupOp::create(builder, location);
+        break;
+    case CpAsyncBulkIntrinsicKind::WaitGroup: {
+        auto group =
+            static_cast<uint32_t>(*getConstantIntValue(resolved_args[0]));
+        bool read = false;
+        if (auto readValue = optionalValue(1, "read")) {
+            read = *getConstantIntValue(readValue) != 0;
+        }
+        mlir::NVVM::CpAsyncBulkWaitGroupOp::create(builder, location, group,
+                                                   read ? builder.getUnitAttr()
+                                                        : mlir::UnitAttr{});
+        break;
+    }
+    case CpAsyncBulkIntrinsicKind::Prefetch: {
+        auto src = createPointerFromMemRef(builder, location, resolved_args[0],
+                                           offsetValue(2, "src_offset_bytes"),
+                                           mlir::NVVM::NVVMMemorySpace::Global);
+        mlir::NVVM::CpAsyncBulkPrefetchOp::create(
+            builder, location, src, i32(resolved_args[1]),
+            i64(keywordValue("l2_cache_hint")));
+        break;
+    }
+    case CpAsyncBulkIntrinsicKind::GlobalSharedCTA: {
+        auto dst = createPointerFromMemRef(builder, location, resolved_args[0],
+                                           offsetValue(3, "dst_offset_bytes"),
+                                           mlir::NVVM::NVVMMemorySpace::Global);
+        auto src = createPointerFromMemRef(builder, location, resolved_args[1],
+                                           offsetValue(4, "src_offset_bytes"),
+                                           mlir::NVVM::NVVMMemorySpace::Shared);
+        mlir::NVVM::CpAsyncBulkSharedCTAToGlobalOp::create(
+            builder, location, dst, src, i32(resolved_args[2]),
+            i64(keywordValue("l2_cache_hint")), i16(keywordValue("byte_mask")));
+        break;
+    }
+    case CpAsyncBulkIntrinsicKind::SharedClusterGlobal: {
+        auto dst =
+            createPointerFromMemRef(builder, location, resolved_args[0],
+                                    offsetValue(4, "dst_offset_bytes"),
+                                    mlir::NVVM::NVVMMemorySpace::SharedCluster);
+        auto src = createPointerFromMemRef(builder, location, resolved_args[1],
+                                           offsetValue(5, "src_offset_bytes"),
+                                           mlir::NVVM::NVVMMemorySpace::Global);
+        auto mbar =
+            createSharedBarrierPointer(builder, location, resolved_args[2],
+                                       offsetValue(6, "mbar_offset_bytes"));
+        mlir::NVVM::CpAsyncBulkGlobalToSharedClusterOp::create(
+            builder, location, dst, src, mbar, i32(resolved_args[3]),
+            i16(keywordValue("multicast_mask")),
+            i64(keywordValue("l2_cache_hint")));
+        break;
+    }
+    case CpAsyncBulkIntrinsicKind::SharedClusterSharedCTA: {
+        auto dst =
+            createPointerFromMemRef(builder, location, resolved_args[0],
+                                    offsetValue(4, "dst_offset_bytes"),
+                                    mlir::NVVM::NVVMMemorySpace::SharedCluster);
+        auto src = createPointerFromMemRef(builder, location, resolved_args[1],
+                                           offsetValue(5, "src_offset_bytes"),
+                                           mlir::NVVM::NVVMMemorySpace::Shared);
+        auto mbar =
+            createSharedBarrierPointer(builder, location, resolved_args[2],
+                                       offsetValue(6, "mbar_offset_bytes"));
+        mlir::NVVM::CpAsyncBulkSharedCTAToSharedClusterOp::create(
+            builder, location, dst, src, mbar, i32(resolved_args[3]));
+        break;
+    }
+    case CpAsyncBulkIntrinsicKind::TensorGlobalSharedCTA: {
+        auto desc =
+            createDescriptorPointer(builder, location, resolved_args[0]);
+        auto src = createPointerFromMemRef(builder, location, resolved_args[1],
+                                           offsetValue(3, "src_offset_bytes"),
+                                           mlir::NVVM::NVVMMemorySpace::Shared);
+        auto coords = coordinates(resolved_args[2]);
+        mlir::Value predicate;
+        if (auto value = keywordValue("predicate")) {
+            predicate = i1(value);
+        }
+        mlir::NVVM::CpAsyncBulkTensorSharedCTAToGlobalOp::create(
+            builder, location, desc, src, coords,
+            i64(keywordValue("l2_cache_hint")), mlir::NVVM::TMAStoreMode::TILE,
+            predicate);
+        break;
+    }
+    case CpAsyncBulkIntrinsicKind::TensorPrefetch: {
+        auto desc =
+            createDescriptorPointer(builder, location, resolved_args[0]);
+        auto coords = coordinates(resolved_args[1]);
+        auto im2col = im2colOffsets(keywordValue("im2col_offsets"));
+        auto mode = im2col.empty() ? mlir::NVVM::TMALoadMode::TILE
+                                   : mlir::NVVM::TMALoadMode::IM2COL;
+        mlir::NVVM::CpAsyncBulkTensorPrefetchOp::create(
+            builder, location, desc, coords, im2col, mode,
+            i64(keywordValue("l2_cache_hint")));
+        break;
+    }
+    case CpAsyncBulkIntrinsicKind::TensorReduce: {
+        auto desc =
+            createDescriptorPointer(builder, location, resolved_args[0]);
+        auto src = createPointerFromMemRef(builder, location, resolved_args[1],
+                                           offsetValue(4, "src_offset_bytes"),
+                                           mlir::NVVM::NVVMMemorySpace::Shared);
+        auto coords = coordinates(resolved_args[2]);
+        auto redKindValue =
+            static_cast<uint32_t>(*getConstantIntValue(resolved_args[3]));
+        auto redKind = *mlir::NVVM::symbolizeTMAReduxKind(redKindValue);
+        mlir::NVVM::CpAsyncBulkTensorReduceOp::create(
+            builder, location, desc, src, redKind,
+            mlir::NVVM::TMAStoreMode::TILE, coords,
+            i64(keywordValue("l2_cache_hint")));
+        break;
+    }
+    case CpAsyncBulkIntrinsicKind::TensorSharedClusterGlobal: {
+        auto dst =
+            createPointerFromMemRef(builder, location, resolved_args[0],
+                                    offsetValue(4, "dst_offset_bytes"),
+                                    mlir::NVVM::NVVMMemorySpace::SharedCluster);
+        auto desc =
+            createDescriptorPointer(builder, location, resolved_args[1]);
+        auto coords = coordinates(resolved_args[2]);
+        auto mbar =
+            createSharedBarrierPointer(builder, location, resolved_args[3],
+                                       offsetValue(5, "mbar_offset_bytes"));
+        auto im2col = im2colOffsets(keywordValue("im2col_offsets"));
+        auto mode = im2col.empty() ? mlir::NVVM::TMALoadMode::TILE
+                                   : mlir::NVVM::TMALoadMode::IM2COL;
+        mlir::Value predicate;
+        if (auto value = keywordValue("predicate")) {
+            predicate = i1(value);
+        }
+        mlir::NVVM::CpAsyncBulkTensorGlobalToSharedClusterOp::create(
+            builder, location, dst, desc, coords, mbar, im2col,
+            i16(keywordValue("multicast_mask")),
+            i64(keywordValue("l2_cache_hint")), mode,
+            /*isCTAOnly=*/false, mlir::NVVM::CTAGroupKindAttr{}, predicate);
+        break;
+    }
+    }
+
+    return ctx->GetCurrentFunctionGenerator()
+        ->GetExprGenerator()
+        ->CreateVoidValue();
+}
+
+bool NVVMIntrinsic::CheckCpAsyncBulkFunction(
+    ast::Call *call_expr, GeneratorContext *ctx,
+    llvm::ArrayRef<mlir::Value> resolved_args,
+    CpAsyncBulkIntrinsicKind kind) const {
+    const auto &keywords = call_expr->GetKeywords();
+    if (resolved_args.size() < keywords.size()) {
+        ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
+                                        call_expr->GetSourceRange().getBegin())
+            << "cp_async_bulk internal argument mismatch";
+        return false;
+    }
+
+    size_t keywordCount = keywords.size();
+    size_t positionalCount = resolved_args.size() - keywordCount;
+
+    auto fail = [&](llvm::StringRef message) {
+        ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
+                                        call_expr->GetSourceRange().getBegin())
+            << message;
+        return false;
+    };
+    auto checkPositionalCount = [&](size_t min, size_t max,
+                                    llvm::StringRef message) {
+        if (positionalCount < min || positionalCount > max) {
+            return fail(message);
+        }
+        return true;
+    };
+    auto keywordAllowed = [&](llvm::StringRef keyword,
+                              std::initializer_list<llvm::StringRef> allowed) {
+        for (auto candidate : allowed) {
+            if (keyword == candidate) {
+                return true;
+            }
+        }
+        return false;
+    };
+    auto checkKeywords =
+        [&](std::initializer_list<llvm::StringRef> allowed) -> bool {
+        for (auto name : keywords) {
+            if (!keywordAllowed(name, allowed)) {
+                std::string message =
+                    "unsupported cp_async_bulk keyword argument '";
+                message += llvm::StringRef(name).str();
+                message += "'";
+                return fail(message);
+            }
+        }
+        return true;
+    };
+    auto checkPresent = [&](size_t index, llvm::StringRef name) {
+        if (index >= resolved_args.size() || !resolved_args[index]) {
+            std::string message = "failed to generate cp_async_bulk operand '";
+            message += name.str();
+            message += "'";
+            return fail(message);
+        }
+        return true;
+    };
+    auto checkInt = [&](mlir::Value value, llvm::StringRef name) {
+        if (value && !value.getType().isIntOrIndex()) {
+            std::string message = "cp_async_bulk operand '";
+            message += name.str();
+            message += "' must be an integer/index";
+            return fail(message);
+        }
+        return true;
+    };
+    auto checkMemRef = [&](mlir::Value value, llvm::StringRef name) {
+        if (!value ||
+            (!isMemRefLike(value.getType()) &&
+             !mlir::isa<mlir::LLVM::LLVMPointerType>(value.getType()))) {
+            std::string message = "cp_async_bulk operand '";
+            message += name.str();
+            message += "' must be a memref-like value";
+            return fail(message);
+        }
+        return true;
+    };
+    auto checkDescriptor = [&](mlir::Value value, llvm::StringRef name) {
+        if (!value ||
+            (!mlir::isa<mlir::nvgpu::TensorMapDescriptorType>(
+                 value.getType()) &&
+             !mlir::isa<mlir::LLVM::LLVMPointerType>(value.getType()))) {
+            std::string message = "cp_async_bulk operand '";
+            message += name.str();
+            message += "' must be a TMA descriptor";
+            return fail(message);
+        }
+        return true;
+    };
+    auto checkBarrier = [&](mlir::Value value, llvm::StringRef name) {
+        if (!value ||
+            (!mlir::isa<mlir::nvgpu::MBarrierGroupType>(value.getType()) &&
+             !isMemRefLike(value.getType()) &&
+             !mlir::isa<mlir::LLVM::LLVMPointerType>(value.getType()))) {
+            std::string message = "cp_async_bulk operand '";
+            message += name.str();
+            message += "' must be an mbarrier or shared pointer";
+            return fail(message);
+        }
+        return true;
+    };
+    auto checkTuple = [&](mlir::Value value, llvm::StringRef name) {
+        llvm::SmallVector<mlir::Value> values;
+        if (!value || !extractTupleValues(value, values) || values.empty()) {
+            std::string message = "cp_async_bulk operand '";
+            message += name.str();
+            message += "' must be a non-empty coordinate tuple";
+            return fail(message);
+        }
+        for (auto elem : values) {
+            if (!checkInt(elem, name)) {
+                return false;
+            }
+        }
+        return true;
+    };
+    auto checkOptionalKeywordInts =
+        [&](std::initializer_list<llvm::StringRef> intNames) -> bool {
+        for (size_t i = 0; i < keywordCount; ++i) {
+            llvm::StringRef name = keywords[i];
+            for (auto intName : intNames) {
+                if (name == intName &&
+                    !checkInt(resolved_args[positionalCount + i], name)) {
+                    return false;
+                }
+            }
+        }
+        return true;
+    };
+
+    switch (kind) {
+    case CpAsyncBulkIntrinsicKind::CommitGroup:
+        return checkPositionalCount(
+                   0, 0, "cp_async_bulk_commit_group takes no arguments") &&
+               checkKeywords({});
+    case CpAsyncBulkIntrinsicKind::WaitGroup: {
+        if (!checkPositionalCount(
+                1, 2,
+                "cp_async_bulk_wait_group requires group and optional read") ||
+            !checkKeywords({"read"}) || !checkPresent(0, "group") ||
+            !checkInt(resolved_args[0], "group")) {
+            return false;
+        }
+        auto group = getConstantIntValue(resolved_args[0]);
+        if (!group || *group < 0) {
+            return fail("cp_async_bulk_wait_group group must be a non-negative "
+                        "compile-time constant");
+        }
+        if (positionalCount > 1 && (!checkInt(resolved_args[1], "read") ||
+                                    !getConstantIntValue(resolved_args[1]))) {
+            return fail("cp_async_bulk_wait_group read must be a compile-time "
+                        "constant");
+        }
+        return checkOptionalKeywordInts({"read"});
+    }
+    case CpAsyncBulkIntrinsicKind::Prefetch:
+        if (!checkPositionalCount(2, 3,
+                                  "cp_async_bulk_prefetch requires src, size "
+                                  "and optional src_offset_bytes") ||
+            !checkKeywords({"src_offset_bytes", "l2_cache_hint"}) ||
+            !checkMemRef(resolved_args[0], "src") ||
+            !checkInt(resolved_args[1], "size")) {
+            return false;
+        }
+        if (positionalCount > 2 &&
+            !checkInt(resolved_args[2], "src_offset_bytes")) {
+            return false;
+        }
+        return checkOptionalKeywordInts({"src_offset_bytes", "l2_cache_hint"});
+    case CpAsyncBulkIntrinsicKind::GlobalSharedCTA:
+        if (!checkPositionalCount(3, 5,
+                                  "cp_async_bulk_global_shared_cta requires "
+                                  "dst, src, size and optional offsets") ||
+            !checkKeywords({"dst_offset_bytes", "src_offset_bytes",
+                            "l2_cache_hint", "byte_mask"}) ||
+            !checkMemRef(resolved_args[0], "dst") ||
+            !checkMemRef(resolved_args[1], "src") ||
+            !checkInt(resolved_args[2], "size")) {
+            return false;
+        }
+        for (size_t i = 3; i < positionalCount; ++i) {
+            if (!checkInt(resolved_args[i],
+                          i == 3 ? "dst_offset_bytes" : "src_offset_bytes")) {
+                return false;
+            }
+        }
+        return checkOptionalKeywordInts({"dst_offset_bytes", "src_offset_bytes",
+                                         "l2_cache_hint", "byte_mask"});
+    case CpAsyncBulkIntrinsicKind::SharedClusterGlobal:
+    case CpAsyncBulkIntrinsicKind::SharedClusterSharedCTA: {
+        bool isClusterGlobal =
+            kind == CpAsyncBulkIntrinsicKind::SharedClusterGlobal;
+        if (!checkPositionalCount(
+                4, 7,
+                isClusterGlobal
+                    ? "cp_async_bulk_shared_cluster_global requires dst, src, "
+                      "mbar, size and optional offsets"
+                    : "cp_async_bulk_shared_cluster_shared_cta requires dst, "
+                      "src, mbar, size and optional offsets") ||
+            !checkKeywords(isClusterGlobal
+                               ? std::initializer_list<
+                                     llvm::StringRef>{"dst_offset_bytes",
+                                                      "src_offset_bytes",
+                                                      "mbar_offset_bytes",
+                                                      "multicast_mask",
+                                                      "l2_cache_hint"}
+                               : std::initializer_list<
+                                     llvm::StringRef>{"dst_offset_bytes",
+                                                      "src_offset_bytes",
+                                                      "mbar_offset_bytes"}) ||
+            !checkMemRef(resolved_args[0], "dst") ||
+            !checkMemRef(resolved_args[1], "src") ||
+            !checkBarrier(resolved_args[2], "mbar") ||
+            !checkInt(resolved_args[3], "size")) {
+            return false;
+        }
+        for (size_t i = 4; i < positionalCount; ++i) {
+            if (!checkInt(resolved_args[i], "offset")) {
+                return false;
+            }
+        }
+        return checkOptionalKeywordInts({"dst_offset_bytes", "src_offset_bytes",
+                                         "mbar_offset_bytes", "multicast_mask",
+                                         "l2_cache_hint"});
+    }
+    case CpAsyncBulkIntrinsicKind::TensorGlobalSharedCTA:
+        if (!checkPositionalCount(
+                3, 4,
+                "cp_async_bulk_tensor_global_shared_cta requires desc, src, "
+                "coords and optional src_offset_bytes") ||
+            !checkKeywords(
+                {"src_offset_bytes", "l2_cache_hint", "predicate"}) ||
+            !checkDescriptor(resolved_args[0], "desc") ||
+            !checkMemRef(resolved_args[1], "src") ||
+            !checkTuple(resolved_args[2], "coords")) {
+            return false;
+        }
+        if (positionalCount > 3 &&
+            !checkInt(resolved_args[3], "src_offset_bytes")) {
+            return false;
+        }
+        return checkOptionalKeywordInts(
+            {"src_offset_bytes", "l2_cache_hint", "predicate"});
+    case CpAsyncBulkIntrinsicKind::TensorPrefetch:
+        if (!checkPositionalCount(
+                2, 2,
+                "cp_async_bulk_tensor_prefetch requires desc and coords") ||
+            !checkKeywords({"im2col_offsets", "l2_cache_hint"}) ||
+            !checkDescriptor(resolved_args[0], "desc") ||
+            !checkTuple(resolved_args[1], "coords")) {
+            return false;
+        }
+        for (size_t i = 0; i < keywordCount; ++i) {
+            if (llvm::StringRef(keywords[i]) == "im2col_offsets" &&
+                resolved_args[positionalCount + i] &&
+                !checkTuple(resolved_args[positionalCount + i],
+                            "im2col_offsets")) {
+                return false;
+            }
+        }
+        return checkOptionalKeywordInts({"l2_cache_hint"});
+    case CpAsyncBulkIntrinsicKind::TensorReduce: {
+        if (!checkPositionalCount(
+                4, 5,
+                "cp_async_bulk_tensor_reduce requires desc, src, coords, "
+                "red_kind and optional src_offset_bytes") ||
+            !checkKeywords({"src_offset_bytes", "l2_cache_hint"}) ||
+            !checkDescriptor(resolved_args[0], "desc") ||
+            !checkMemRef(resolved_args[1], "src") ||
+            !checkTuple(resolved_args[2], "coords") ||
+            !checkInt(resolved_args[3], "red_kind")) {
+            return false;
+        }
+        auto redKind = getConstantIntValue(resolved_args[3]);
+        if (!redKind || *redKind < 0 ||
+            !mlir::NVVM::symbolizeTMAReduxKind(
+                static_cast<uint32_t>(*redKind))) {
+            return fail(
+                "cp_async_bulk_tensor_reduce red_kind must be one of 0..7");
+        }
+        if (positionalCount > 4 &&
+            !checkInt(resolved_args[4], "src_offset_bytes")) {
+            return false;
+        }
+        return checkOptionalKeywordInts({"src_offset_bytes", "l2_cache_hint"});
+    }
+    case CpAsyncBulkIntrinsicKind::TensorSharedClusterGlobal:
+        if (!checkPositionalCount(
+                4, 6,
+                "cp_async_bulk_tensor_shared_cluster_global requires dst, "
+                "desc, coords, mbar and optional offsets") ||
+            !checkKeywords({"dst_offset_bytes", "mbar_offset_bytes",
+                            "im2col_offsets", "multicast_mask", "l2_cache_hint",
+                            "predicate"}) ||
+            !checkMemRef(resolved_args[0], "dst") ||
+            !checkDescriptor(resolved_args[1], "desc") ||
+            !checkTuple(resolved_args[2], "coords") ||
+            !checkBarrier(resolved_args[3], "mbar")) {
+            return false;
+        }
+        for (size_t i = 4; i < positionalCount; ++i) {
+            if (!checkInt(resolved_args[i], "offset")) {
+                return false;
+            }
+        }
+        for (size_t i = 0; i < keywordCount; ++i) {
+            if (llvm::StringRef(keywords[i]) == "im2col_offsets" &&
+                resolved_args[positionalCount + i] &&
+                !checkTuple(resolved_args[positionalCount + i],
+                            "im2col_offsets")) {
+                return false;
+            }
+        }
+        return checkOptionalKeywordInts({"dst_offset_bytes",
+                                         "mbar_offset_bytes", "multicast_mask",
+                                         "l2_cache_hint", "predicate"});
+    }
+
+    llvm_unreachable("unknown cp.async.bulk intrinsic kind");
+}
+
 mlir::Value NVVMIntrinsic::CreateMakeTMADescriptorFunction(
     ast::Call *call_expr, GeneratorContext *ctx,
     llvm::ArrayRef<mlir::Value> resolved_args) const {
@@ -2103,7 +2865,8 @@ mlir::Value NVVMIntrinsic::CreateMakeTMADescriptorFunction(
         return nullptr;
     }
 
-    auto tensorType = mlir::dyn_cast<cf::MemRefType>(resolved_args[0].getType());
+    auto tensorType =
+        mlir::dyn_cast<cf::MemRefType>(resolved_args[0].getType());
     if (!tensorType) {
         return nullptr;
     }
@@ -2132,7 +2895,8 @@ mlir::Value NVVMIntrinsic::CreateMakeTMADescriptorFunction(
         mlir::nvgpu::TensorMapOOBKind::OOB_ZERO,
         mlir::nvgpu::TensorMapInterleaveKind::INTERLEAVE_NONE);
 
-    auto descriptor = cf::NVVMTMADescriptorOp::create(builder, location, resultType, resolved_args[0], resolved_args[1]);
+    auto descriptor = cf::NVVMTMADescriptorOp::create(
+        builder, location, resultType, resolved_args[0], resolved_args[1]);
     return descriptor.getResult();
 }
 
@@ -2142,7 +2906,8 @@ bool NVVMIntrinsic::CheckMakeTMADescriptorFunction(
     if (resolved_args.size() != 2) {
         ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
                                         call_expr->GetSourceRange().getBegin())
-            << "make_tma_descriptor requires exactly 2 arguments: tensor, smem_layout";
+            << "make_tma_descriptor requires exactly 2 arguments: tensor, "
+               "smem_layout";
         return false;
     }
 
@@ -2160,7 +2925,8 @@ bool NVVMIntrinsic::CheckMakeTMADescriptorFunction(
         return false;
     }
 
-    auto tensorType = mlir::dyn_cast<cf::MemRefType>(resolved_args[0].getType());
+    auto tensorType =
+        mlir::dyn_cast<cf::MemRefType>(resolved_args[0].getType());
     if (!tensorType) {
         ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
                                         call_expr->GetSourceRange().getBegin())
@@ -2208,8 +2974,12 @@ mlir::Value NVVMIntrinsic::CreateTMAFenceFunction(
         return nullptr;
     }
 
-    cf::NVVMTMAFenceOp::create(builder, location, mlir::ValueRange{resolved_args[0]}, mlir::ArrayRef<mlir::NamedAttribute>{});
-    return ctx->GetCurrentFunctionGenerator()->GetExprGenerator()->CreateVoidValue();
+    cf::NVVMTMAFenceOp::create(builder, location,
+                               mlir::ValueRange{resolved_args[0]},
+                               mlir::ArrayRef<mlir::NamedAttribute>{});
+    return ctx->GetCurrentFunctionGenerator()
+        ->GetExprGenerator()
+        ->CreateVoidValue();
 }
 
 bool NVVMIntrinsic::CheckTMAFenceFunction(
@@ -2257,15 +3027,18 @@ mlir::Value NVVMIntrinsic::CreateTMALoadFunction(
     mlir::Value mbarId =
         positionalCount > 4
             ? resolved_args[4]
-            : mlir::arith::ConstantIndexOp::create(builder, location, 0).getResult();
+            : mlir::arith::ConstantIndexOp::create(builder, location, 0)
+                  .getResult();
     mlir::Value predicate =
         positionalCount > 5
             ? resolved_args[5]
-            : mlir::arith::ConstantIntOp::create(builder, location, 1, 1).getResult();
+            : mlir::arith::ConstantIntOp::create(builder, location, 1, 1)
+                  .getResult();
     mlir::Value multicastMask =
         positionalCount > 6
             ? resolved_args[6]
-            : mlir::arith::ConstantIntOp::create(builder, location, -1, 32).getResult();
+            : mlir::arith::ConstantIntOp::create(builder, location, -1, 32)
+                  .getResult();
 
     for (size_t i = 0; i < keywordCount; ++i) {
         mlir::Value value = resolved_args[positionalCount + i];
@@ -2281,10 +3054,14 @@ mlir::Value NVVMIntrinsic::CreateTMALoadFunction(
         }
     }
 
-    cf::NVVMTMALoadOp::create(builder, location, mlir::ValueRange{resolved_args[0], resolved_args[1], resolved_args[2],
+    cf::NVVMTMALoadOp::create(
+        builder, location,
+        mlir::ValueRange{resolved_args[0], resolved_args[1], resolved_args[2],
                          resolved_args[3], mbarId, predicate, multicastMask},
         mlir::ArrayRef<mlir::NamedAttribute>{});
-    return ctx->GetCurrentFunctionGenerator()->GetExprGenerator()->CreateVoidValue();
+    return ctx->GetCurrentFunctionGenerator()
+        ->GetExprGenerator()
+        ->CreateVoidValue();
 }
 
 bool NVVMIntrinsic::CheckTMALoadFunction(
@@ -2311,8 +3088,9 @@ bool NVVMIntrinsic::CheckTMALoadFunction(
     for (auto name : keywords) {
         if (name != "mbar_id" && name != "predicate" &&
             name != "multicast_mask") {
-            ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
-                                            call_expr->GetSourceRange().getBegin())
+            ctx->diagnostic_manager->Report(
+                basic::DiagnosticCode::kUnimplemented,
+                call_expr->GetSourceRange().getBegin())
                 << "tma_load got unsupported keyword argument '" << name << "'";
             return false;
         }
@@ -2320,8 +3098,9 @@ bool NVVMIntrinsic::CheckTMALoadFunction(
 
     auto requireArg = [&](size_t index, llvm::StringRef name) -> bool {
         if (index >= resolved_args.size() || !resolved_args[index]) {
-            ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
-                                            call_expr->GetSourceRange().getBegin())
+            ctx->diagnostic_manager->Report(
+                basic::DiagnosticCode::kUnimplemented,
+                call_expr->GetSourceRange().getBegin())
                 << "Failed to generate " << name << " operand for tma_load";
             return false;
         }
@@ -2358,8 +3137,9 @@ bool NVVMIntrinsic::CheckTMALoadFunction(
 
     auto checkIntArg = [&](mlir::Value value, llvm::StringRef name) -> bool {
         if (value && !value.getType().isIntOrIndex()) {
-            ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
-                                            call_expr->GetSourceRange().getBegin())
+            ctx->diagnostic_manager->Report(
+                basic::DiagnosticCode::kUnimplemented,
+                call_expr->GetSourceRange().getBegin())
                 << "tma_load " << name << " operand must be an integer type";
             return false;
         }
@@ -2367,9 +3147,9 @@ bool NVVMIntrinsic::CheckTMALoadFunction(
     };
 
     for (size_t i = 4; i < positionalCount; ++i) {
-        if (!checkIntArg(resolved_args[i], i == 4 ? "mbar_id" :
-                                           i == 5 ? "predicate" :
-                                                    "multicast_mask")) {
+        if (!checkIntArg(resolved_args[i], i == 4   ? "mbar_id"
+                                           : i == 5 ? "predicate"
+                                                    : "multicast_mask")) {
             return false;
         }
     }
@@ -2404,7 +3184,8 @@ mlir::Value NVVMIntrinsic::CreateTMAStoreFunction(
     mlir::Value predicate =
         positionalCount > 3
             ? resolved_args[3]
-            : mlir::arith::ConstantIntOp::create(builder, location, 1, 1).getResult();
+            : mlir::arith::ConstantIntOp::create(builder, location, 1, 1)
+                  .getResult();
 
     for (size_t i = 0; i < keywordCount; ++i) {
         mlir::Value value = resolved_args[positionalCount + i];
@@ -2414,8 +3195,14 @@ mlir::Value NVVMIntrinsic::CreateTMAStoreFunction(
         }
     }
 
-    cf::NVVMTMAStoreOp::create(builder, location, mlir::ValueRange{resolved_args[0], resolved_args[1], resolved_args[2], predicate}, mlir::ArrayRef<mlir::NamedAttribute>{});
-    return ctx->GetCurrentFunctionGenerator()->GetExprGenerator()->CreateVoidValue();
+    cf::NVVMTMAStoreOp::create(builder, location,
+                               mlir::ValueRange{resolved_args[0],
+                                                resolved_args[1],
+                                                resolved_args[2], predicate},
+                               mlir::ArrayRef<mlir::NamedAttribute>{});
+    return ctx->GetCurrentFunctionGenerator()
+        ->GetExprGenerator()
+        ->CreateVoidValue();
 }
 
 bool NVVMIntrinsic::CheckTMAStoreFunction(
@@ -2440,17 +3227,20 @@ bool NVVMIntrinsic::CheckTMAStoreFunction(
 
     for (auto name : keywords) {
         if (name != "predicate") {
-            ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
-                                            call_expr->GetSourceRange().getBegin())
-                << "tma_store got unsupported keyword argument '" << name << "'";
+            ctx->diagnostic_manager->Report(
+                basic::DiagnosticCode::kUnimplemented,
+                call_expr->GetSourceRange().getBegin())
+                << "tma_store got unsupported keyword argument '" << name
+                << "'";
             return false;
         }
     }
 
     auto requireArg = [&](size_t index, llvm::StringRef name) -> bool {
         if (index >= resolved_args.size() || !resolved_args[index]) {
-            ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
-                                            call_expr->GetSourceRange().getBegin())
+            ctx->diagnostic_manager->Report(
+                basic::DiagnosticCode::kUnimplemented,
+                call_expr->GetSourceRange().getBegin())
                 << "Failed to generate " << name << " operand for tma_store";
             return false;
         }
@@ -2479,16 +3269,16 @@ bool NVVMIntrinsic::CheckTMAStoreFunction(
 
     auto checkIntArg = [&](mlir::Value value, llvm::StringRef name) -> bool {
         if (value && !value.getType().isIntOrIndex()) {
-            ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
-                                            call_expr->GetSourceRange().getBegin())
+            ctx->diagnostic_manager->Report(
+                basic::DiagnosticCode::kUnimplemented,
+                call_expr->GetSourceRange().getBegin())
                 << "tma_store " << name << " operand must be an integer type";
             return false;
         }
         return true;
     };
 
-    if (positionalCount > 3 &&
-        !checkIntArg(resolved_args[3], "predicate")) {
+    if (positionalCount > 3 && !checkIntArg(resolved_args[3], "predicate")) {
         return false;
     }
     for (size_t i = 0; i < keywordCount; ++i) {

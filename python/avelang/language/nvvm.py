@@ -128,6 +128,67 @@ def cp_async_wait_group(n: int):
     pass
 
 
+def cp_async_bulk_commit_group():
+    pass
+
+
+def cp_async_bulk_global_shared_cta(
+    dst, src, size, dst_offset_bytes=0, src_offset_bytes=0,
+    l2_cache_hint=None, byte_mask=None
+):
+    pass
+
+
+def cp_async_bulk_prefetch(src, size, src_offset_bytes=0,
+                           l2_cache_hint=None):
+    pass
+
+
+def cp_async_bulk_shared_cluster_global(
+    dst, src, mbar, size, dst_offset_bytes=0, src_offset_bytes=0,
+    mbar_offset_bytes=0, multicast_mask=None, l2_cache_hint=None
+):
+    pass
+
+
+def cp_async_bulk_shared_cluster_shared_cta(
+    dst, src, mbar, size, dst_offset_bytes=0, src_offset_bytes=0,
+    mbar_offset_bytes=0
+):
+    pass
+
+
+def cp_async_bulk_tensor_global_shared_cta(
+    desc, src, coords, src_offset_bytes=0, l2_cache_hint=None,
+    predicate=None
+):
+    pass
+
+
+def cp_async_bulk_tensor_prefetch(
+    desc, coords, im2col_offsets=None, l2_cache_hint=None
+):
+    pass
+
+
+def cp_async_bulk_tensor_reduce(
+    desc, src, coords, red_kind: int, src_offset_bytes=0, l2_cache_hint=None
+):
+    pass
+
+
+def cp_async_bulk_tensor_shared_cluster_global(
+    dst, desc, coords, mbar, dst_offset_bytes=0, mbar_offset_bytes=0,
+    im2col_offsets=None, multicast_mask=None, l2_cache_hint=None,
+    predicate=None
+):
+    pass
+
+
+def cp_async_bulk_wait_group(group: int, read: bool = False):
+    pass
+
+
 def make_tma_descriptor(tensor, smem_layout):
     pass
 
