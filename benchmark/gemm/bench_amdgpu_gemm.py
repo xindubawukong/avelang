@@ -20,7 +20,7 @@ def _validate_shape(m, n, k):
         raise ValueError(f"K must be a multiple of {amdgpu_gemm.GROUP_K}, got {k}.")
 
 
-def run_gemm_pipeline_benchmark(m, n, k, warmup, repeat, iters, validate):
+def run_gemm_pipeline_benchmark(m, n, k, warmup, repeat, validate):
     _ensure_rocm_available("gemm_pipeline_transposed_b")
     _validate_shape(m, n, k)
 
@@ -44,12 +44,11 @@ def run_gemm_pipeline_benchmark(m, n, k, warmup, repeat, iters, validate):
     end_evt = torch.cuda.Event(enable_timing=True)
     start_evt.record()
     for _ in range(repeat):
-        for _ in range(iters):
-            graph.replay()
+        graph.replay()
     end_evt.record()
     torch.cuda.synchronize()
     elapsed_ms = start_evt.elapsed_time(end_evt)
-    elapsed = (elapsed_ms * 1.0e-3) / (repeat * iters)
+    elapsed = (elapsed_ms * 1.0e-3) / repeat
 
     flops = 2.0 * m * n * k
     tflops = flops / elapsed / 1.0e12
@@ -77,11 +76,10 @@ def main():
     parser.add_argument("--k", type=int, default=1024)
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--repeat", type=int, default=100)
-    parser.add_argument("--iters", type=int, default=100, help="Graph replays per timing repeat")
     parser.add_argument("--validate", action="store_true", default=False)
     args = parser.parse_args()
 
-    run_gemm_pipeline_benchmark(args.m, args.n, args.k, args.warmup, args.repeat, args.iters, args.validate)
+    run_gemm_pipeline_benchmark(args.m, args.n, args.k, args.warmup, args.repeat, args.validate)
 
 
 if __name__ == "__main__":

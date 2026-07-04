@@ -10,6 +10,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 # Build options
 set(AVE_LANG_BACKEND "cuda" CACHE STRING "GPU backends to use: cuda, rocm, or both (semicolon-separated list)")
+set(AVE_LANG_AMDGPU_TOOL_PATHS "" CACHE STRING "Semicolon-separated AMDGPU tool paths to search before ROCm tools")
 
 # Parse the backend list and set appropriate flags
 set(WITH_CUDA OFF)
@@ -71,6 +72,13 @@ find_package(LLVM CONFIG REQUIRED)
 find_package(MLIR CONFIG REQUIRED)
 find_package(Clang REQUIRED CONFIG)
 
+include_directories(/data01/home/xiangyun/llvm-project/llvm/include)
+include_directories(/data01/home/xiangyun/llvm-project/mlir/include)
+include_directories(/data01/home/xiangyun/llvm-project/clang/include)
+include_directories(/data01/home/xiangyun/llvm-project/build/include)
+include_directories(/data01/home/xiangyun/llvm-project/build/tools/mlir/include)
+include_directories(/data01/home/xiangyun/llvm-project/build/tools/clang/include)
+
 # Locate build tool executables using paths exported by LLVM/MLIR packages.
 if(NOT MLIR_OPT_EXECUTABLE)
     set(_mlir_opt_hints)
@@ -129,6 +137,9 @@ if(WITH_AMDGPU)
   set(ROCM_ROOT_PATH "${HIP_PACKAGE_PREFIX_DIR}")
   set(ROCM_DEVICE_LIBRARY_PATH "${ROCM_ROOT_PATH}/amdgcn/bitcode")
   set(ROCM_TOOL_PATHS "${ROCM_ROOT_PATH}/bin;${ROCM_ROOT_PATH}/llvm/bin")
+  if(AVE_LANG_AMDGPU_TOOL_PATHS)
+    list(PREPEND ROCM_TOOL_PATHS ${AVE_LANG_AMDGPU_TOOL_PATHS})
+  endif()
 
   message(STATUS "ROCm root path: ${ROCM_ROOT_PATH}")
   message(STATUS "ROCm device library path: ${ROCM_DEVICE_LIBRARY_PATH}")
