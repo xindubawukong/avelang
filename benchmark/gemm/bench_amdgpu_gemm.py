@@ -1,7 +1,26 @@
 #!/usr/bin/env python3
 import argparse
 import torch
-from avelang_kernels import amdgpu_gemm
+from avelang_kernels import (
+    amdgpu_gemm,
+    amdgpu_gemm_1024,
+    amdgpu_gemm_2048,
+    amdgpu_gemm_4096,
+    amdgpu_gemm_8192,
+    amdgpu_gemm_16384,
+)
+
+
+_SHAPE_KERNELS = {
+    (1024, 1024, 1024): amdgpu_gemm_1024,
+    (2048, 2048, 2048): amdgpu_gemm_2048,
+    (4096, 4096, 4096): amdgpu_gemm_4096,
+    (8192, 8192, 8192): amdgpu_gemm_8192,
+    (16384, 16384, 16384): amdgpu_gemm_16384,
+}
+
+def _select_kernel(m, n, k):
+    return _SHAPE_KERNELS.get((m, n, k), amdgpu_gemm)
 
 
 def _ensure_rocm_available(label):
@@ -11,7 +30,7 @@ def _ensure_rocm_available(label):
         raise RuntimeError(f"HIP is not available; {label} benchmark requires ROCm.")
 
 
-def _validate_shape(m, n, k):
+def _validate_fallback_shape(m, n, k):
     if m % amdgpu_gemm.GROUP_M != 0:
         raise ValueError(f"M must be a multiple of {amdgpu_gemm.GROUP_M}, got {m}.")
     if n % amdgpu_gemm.GROUP_N != 0:
@@ -22,7 +41,10 @@ def _validate_shape(m, n, k):
 
 def run_gemm_pipeline_benchmark(m, n, k, warmup, repeat, iters, validate):
     _ensure_rocm_available("gemm_pipeline_transposed_b")
-    _validate_shape(m, n, k)
+    kernel = _select_kernel(m, n, k)
+    kernel_name = kernel.__name__.rsplit(".", 1)[-1]
+    if kernel is amdgpu_gemm:
+        _validate_fallback_shape(m, n, k)
 
     A = torch.randn((m, k), dtype=torch.bfloat16, device="cuda")
     B = torch.randn((n, k), dtype=torch.bfloat16, device="cuda")
@@ -30,14 +52,14 @@ def run_gemm_pipeline_benchmark(m, n, k, warmup, repeat, iters, validate):
 
     # Warmup to JIT-compile and stabilize clocks.
     for _ in range(warmup):
-        amdgpu_gemm.gemm_pipeline_transposed_b(A, B, out=C)
+        kernel.gemm_pipeline_transposed_b(A, B, out=C)
     torch.cuda.synchronize()
 
     # Capture the kernel launch in a CUDAGraph for low-overhead replays.
     graph = torch.cuda.CUDAGraph()
     capture_stream = torch.cuda.Stream()
     with torch.cuda.graph(graph, stream=capture_stream):
-        amdgpu_gemm.gemm_pipeline_transposed_b(A, B, out=C)
+        kernel.gemm_pipeline_transposed_b(A, B, out=C)
     torch.cuda.synchronize()
 
     start_evt = torch.cuda.Event(enable_timing=True)
@@ -57,7 +79,11 @@ def run_gemm_pipeline_benchmark(m, n, k, warmup, repeat, iters, validate):
     bytes_moved = (m * k + k * n + m * n) * 2
     bandwidth = bytes_moved / elapsed / 1.0e9
 
-    print(f"M={m} N={n} K={k} time_ms={elapsed * 1.0e3:.4f} tflops={tflops:.3f} bandwidth_gbs={bandwidth:.3f}")
+    print(
+        f"M={m} N={n} K={k} kernel={kernel_name} "
+        f"time_ms={elapsed * 1.0e3:.4f} tflops={tflops:.3f} "
+        f"bandwidth_gbs={bandwidth:.3f}"
+    )
 
     if validate:
         expected = (A.float() @ B.float().T).to(dtype=torch.bfloat16, device="cpu")
