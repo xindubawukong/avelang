@@ -1,26 +1,9 @@
 #!/usr/bin/env python3
 import argparse
+
 import torch
-from avelang_kernels import (
-    amdgpu_gemm,
-    amdgpu_gemm_1024,
-    amdgpu_gemm_2048,
-    amdgpu_gemm_4096,
-    amdgpu_gemm_8192,
-    amdgpu_gemm_16384,
-)
 
-
-_SHAPE_KERNELS = {
-    (1024, 1024, 1024): amdgpu_gemm_1024,
-    (2048, 2048, 2048): amdgpu_gemm_2048,
-    (4096, 4096, 4096): amdgpu_gemm_4096,
-    (8192, 8192, 8192): amdgpu_gemm_8192,
-    (16384, 16384, 16384): amdgpu_gemm_16384,
-}
-
-def _select_kernel(m, n, k):
-    return _SHAPE_KERNELS.get((m, n, k), amdgpu_gemm)
+from avelang_kernels import amdgpu_gemm
 
 
 def _ensure_rocm_available(label):
@@ -30,84 +13,128 @@ def _ensure_rocm_available(label):
         raise RuntimeError(f"HIP is not available; {label} benchmark requires ROCm.")
 
 
-def _validate_fallback_shape(m, n, k):
-    if m % amdgpu_gemm.GROUP_M != 0:
-        raise ValueError(f"M must be a multiple of {amdgpu_gemm.GROUP_M}, got {m}.")
-    if n % amdgpu_gemm.GROUP_N != 0:
-        raise ValueError(f"N must be a multiple of {amdgpu_gemm.GROUP_N}, got {n}.")
-    if k % amdgpu_gemm.GROUP_K != 0:
-        raise ValueError(f"K must be a multiple of {amdgpu_gemm.GROUP_K}, got {k}.")
+def _select_configs(m, n, k, algo, config_name):
+    if config_name is not None:
+        config = amdgpu_gemm.get_config(config_name)
+        if not config.supports(m, n, k):
+            raise ValueError(f"Config {config.name!r} does not support M={m}, N={n}, K={k}.")
+        return [config]
+
+    if algo == "tune":
+        configs = amdgpu_gemm.enumerate_configs(m, n, k)
+        if not configs:
+            raise ValueError(f"No AMDGPU GEMM config supports M={m}, N={n}, K={k}.")
+        return configs
+
+    return [amdgpu_gemm.default_config(m, n, k)]
 
 
-def run_gemm_pipeline_benchmark(m, n, k, warmup, repeat, iters, validate):
+def _validate_result(A, B, C):
+    expected = (A.float() @ B.float().T).to(dtype=torch.bfloat16, device="cpu")
+    actual = C.to("cpu")
+    max_abs = torch.max(torch.abs(actual - expected)).item()
+    if not torch.allclose(actual, expected, rtol=1e-1, atol=1e-1):
+        raise AssertionError(f"Validation failed (max abs diff {max_abs}).")
+    print(f"validation=max_abs_diff:{max_abs:.6f}")
+
+
+def _print_result(m, n, k, result):
+    config = result.config
+    print(
+        f"M={m} N={n} K={k} config={config.name} "
+        f"time_ms={result.elapsed_ms:.4f} tflops={result.tflops:.3f} "
+        f"bandwidth_gbs={result.bandwidth_gbs:.3f}"
+    )
+
+
+def run_gemm_pipeline_benchmark(
+    m,
+    n,
+    k,
+    warmup,
+    repeat,
+    iters,
+    validate,
+    algo,
+    config_name,
+):
     _ensure_rocm_available("gemm_pipeline_transposed_b")
-    kernel = _select_kernel(m, n, k)
-    kernel_name = kernel.__name__.rsplit(".", 1)[-1]
-    if kernel is amdgpu_gemm:
-        _validate_fallback_shape(m, n, k)
+    configs = _select_configs(m, n, k, algo, config_name)
 
     A = torch.randn((m, k), dtype=torch.bfloat16, device="cuda")
     B = torch.randn((n, k), dtype=torch.bfloat16, device="cuda")
     C = torch.zeros((m, n), dtype=torch.bfloat16, device="cuda")
 
-    # Warmup to JIT-compile and stabilize clocks.
-    for _ in range(warmup):
-        kernel.gemm_pipeline_transposed_b(A, B, out=C)
-    torch.cuda.synchronize()
+    results = []
+    for config in configs:
+        try:
+            result = amdgpu_gemm.benchmark_config(
+                config,
+                A,
+                B,
+                C,
+                warmup=warmup,
+                repeat=repeat,
+                iters=iters,
+            )
+        except Exception as exc:
+            if algo != "tune":
+                raise
+            print(f"config={config.name} failed={type(exc).__name__}: {exc}")
+            continue
+        results.append(result)
 
-    # Capture the kernel launch in a CUDAGraph for low-overhead replays.
-    graph = torch.cuda.CUDAGraph()
-    capture_stream = torch.cuda.Stream()
-    with torch.cuda.graph(graph, stream=capture_stream):
-        kernel.gemm_pipeline_transposed_b(A, B, out=C)
-    torch.cuda.synchronize()
+    if not results:
+        raise RuntimeError(f"No AMDGPU GEMM config completed for M={m}, N={n}, K={k}.")
 
-    start_evt = torch.cuda.Event(enable_timing=True)
-    end_evt = torch.cuda.Event(enable_timing=True)
-    start_evt.record()
-    for _ in range(repeat):
-        for _ in range(iters):
-            graph.replay()
-    end_evt.record()
-    torch.cuda.synchronize()
-    elapsed_ms = start_evt.elapsed_time(end_evt)
-    elapsed = (elapsed_ms * 1.0e-3) / (repeat * iters)
-
-    flops = 2.0 * m * n * k
-    tflops = flops / elapsed / 1.0e12
-
-    bytes_moved = (m * k + k * n + m * n) * 2
-    bandwidth = bytes_moved / elapsed / 1.0e9
-
-    print(
-        f"M={m} N={n} K={k} kernel={kernel_name} "
-        f"time_ms={elapsed * 1.0e3:.4f} tflops={tflops:.3f} "
-        f"bandwidth_gbs={bandwidth:.3f}"
-    )
+    if len(results) == 1:
+        best = results[0]
+        _print_result(m, n, k, best)
+    else:
+        results.sort(key=lambda result: result.tflops, reverse=True)
+        for result in results:
+            _print_result(m, n, k, result)
+        best = results[0]
+        print(f"best_config={best.config.name} tflops={best.tflops:.3f}")
 
     if validate:
-        expected = (A.float() @ B.float().T).to(dtype=torch.bfloat16, device="cpu")
-        actual = C.to("cpu")
-        max_abs = torch.max(torch.abs(actual - expected)).item()
-        if not torch.allclose(actual, expected, rtol=1e-1, atol=1e-1):
-            raise AssertionError(f"Validation failed (max abs diff {max_abs}).")
-        print(f"validation=max_abs_diff:{max_abs:.6f}")
+        amdgpu_gemm.gemm_pipeline_transposed_b(A, B, out=C, config=best.config)
+        torch.cuda.synchronize()
+        _validate_result(A, B, C)
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="AMDGPU GEMM pipeline benchmark (M,N multiples of 128; K multiple of 64)"
+        description="AMDGPU GEMM pipeline benchmark"
     )
     parser.add_argument("--m", type=int, default=1024)
     parser.add_argument("--n", type=int, default=1024)
     parser.add_argument("--k", type=int, default=1024)
+    parser.add_argument("--algo", choices=("default", "tune"), default="default")
+    parser.add_argument("--config", choices=sorted(amdgpu_gemm.CONFIG_BY_NAME), default=None)
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--repeat", type=int, default=100)
     parser.add_argument("--iters", type=int, default=100, help="Graph replays per timing repeat")
     parser.add_argument("--validate", action="store_true", default=False)
+    parser.add_argument("--list-configs", action="store_true", default=False)
     args = parser.parse_args()
 
-    run_gemm_pipeline_benchmark(args.m, args.n, args.k, args.warmup, args.repeat, args.iters, args.validate)
+    if args.list_configs:
+        for config in amdgpu_gemm.CONFIGS:
+            print(f"{config.name}: {config.source}")
+        return
+
+    run_gemm_pipeline_benchmark(
+        args.m,
+        args.n,
+        args.k,
+        args.warmup,
+        args.repeat,
+        args.iters,
+        args.validate,
+        args.algo,
+        args.config,
+    )
 
 
 if __name__ == "__main__":
