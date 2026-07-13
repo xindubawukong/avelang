@@ -13,22 +13,6 @@ def _ensure_rocm_available(label):
         raise RuntimeError(f"HIP is not available; {label} benchmark requires ROCm.")
 
 
-def _select_configs(m, n, k, algo, config_name):
-    if config_name is not None:
-        config = amdgpu_gemm.get_config(config_name)
-        if not config.supports(m, n, k):
-            raise ValueError(f"Config {config.name!r} does not support M={m}, N={n}, K={k}.")
-        return [config]
-
-    if algo == "tune":
-        configs = amdgpu_gemm.enumerate_configs(m, n, k)
-        if not configs:
-            raise ValueError(f"No AMDGPU GEMM config supports M={m}, N={n}, K={k}.")
-        return configs
-
-    return [amdgpu_gemm.default_config(m, n, k)]
-
-
 def _validate_result(A, B, C):
     expected = (A.float() @ B.float().T).to(dtype=torch.bfloat16, device="cpu")
     actual = C.to("cpu")
@@ -38,12 +22,39 @@ def _validate_result(A, B, C):
     print(f"validation=max_abs_diff:{max_abs:.6f}")
 
 
-def _print_result(m, n, k, result):
-    config = result.config
+def _benchmark(A, B, C, config, warmup, repeat, iters):
+    for _ in range(max(1, warmup)):
+        amdgpu_gemm.gemm_pipeline_transposed_b(A, B, out=C, config=config)
+    torch.cuda.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    capture_stream = torch.cuda.Stream()
+    with torch.cuda.graph(graph, stream=capture_stream):
+        amdgpu_gemm.gemm_pipeline_transposed_b(A, B, out=C, config=config)
+    torch.cuda.synchronize()
+
+    start_evt = torch.cuda.Event(enable_timing=True)
+    end_evt = torch.cuda.Event(enable_timing=True)
+    start_evt.record()
+    for _ in range(repeat):
+        for _ in range(iters):
+            graph.replay()
+    end_evt.record()
+    torch.cuda.synchronize()
+
+    elapsed_ms = start_evt.elapsed_time(end_evt) / (repeat * iters)
+    return elapsed_ms
+
+
+def _print_result(m, n, k, config, elapsed_ms):
+    elapsed_s = elapsed_ms * 1.0e-3
+    tflops = 2.0 * m * n * k / elapsed_s / 1.0e12
+    bytes_moved = (m * k + k * n + m * n) * 2
+    bandwidth_gbs = bytes_moved / elapsed_s / 1.0e9
     print(
         f"M={m} N={n} K={k} config={config.name} "
-        f"time_ms={result.elapsed_ms:.4f} tflops={result.tflops:.3f} "
-        f"bandwidth_gbs={result.bandwidth_gbs:.3f}"
+        f"time_ms={elapsed_ms:.4f} tflops={tflops:.3f} "
+        f"bandwidth_gbs={bandwidth_gbs:.3f}"
     )
 
 
@@ -55,50 +66,19 @@ def run_gemm_pipeline_benchmark(
     repeat,
     iters,
     validate,
-    algo,
-    config_name,
 ):
     _ensure_rocm_available("gemm_pipeline_transposed_b")
-    configs = _select_configs(m, n, k, algo, config_name)
+    config = amdgpu_gemm.default_config(m, n, k)
 
     A = torch.randn((m, k), dtype=torch.bfloat16, device="cuda")
     B = torch.randn((n, k), dtype=torch.bfloat16, device="cuda")
     C = torch.zeros((m, n), dtype=torch.bfloat16, device="cuda")
 
-    results = []
-    for config in configs:
-        try:
-            result = amdgpu_gemm.benchmark_config(
-                config,
-                A,
-                B,
-                C,
-                warmup=warmup,
-                repeat=repeat,
-                iters=iters,
-            )
-        except Exception as exc:
-            if algo != "tune":
-                raise
-            print(f"config={config.name} failed={type(exc).__name__}: {exc}")
-            continue
-        results.append(result)
-
-    if not results:
-        raise RuntimeError(f"No AMDGPU GEMM config completed for M={m}, N={n}, K={k}.")
-
-    if len(results) == 1:
-        best = results[0]
-        _print_result(m, n, k, best)
-    else:
-        results.sort(key=lambda result: result.tflops, reverse=True)
-        for result in results:
-            _print_result(m, n, k, result)
-        best = results[0]
-        print(f"best_config={best.config.name} tflops={best.tflops:.3f}")
+    elapsed_ms = _benchmark(A, B, C, config, warmup, repeat, iters)
+    _print_result(m, n, k, config, elapsed_ms)
 
     if validate:
-        amdgpu_gemm.gemm_pipeline_transposed_b(A, B, out=C, config=best.config)
+        amdgpu_gemm.gemm_pipeline_transposed_b(A, B, out=C, config=config)
         torch.cuda.synchronize()
         _validate_result(A, B, C)
 
@@ -110,19 +90,11 @@ def main():
     parser.add_argument("--m", type=int, default=1024)
     parser.add_argument("--n", type=int, default=1024)
     parser.add_argument("--k", type=int, default=1024)
-    parser.add_argument("--algo", choices=("default", "tune"), default="default")
-    parser.add_argument("--config", choices=sorted(amdgpu_gemm.CONFIG_BY_NAME), default=None)
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--repeat", type=int, default=100)
     parser.add_argument("--iters", type=int, default=100, help="Graph replays per timing repeat")
     parser.add_argument("--validate", action="store_true", default=False)
-    parser.add_argument("--list-configs", action="store_true", default=False)
     args = parser.parse_args()
-
-    if args.list_configs:
-        for config in amdgpu_gemm.CONFIGS:
-            print(f"{config.name}: {config.source}")
-        return
 
     run_gemm_pipeline_benchmark(
         args.m,
@@ -132,8 +104,6 @@ def main():
         args.repeat,
         args.iters,
         args.validate,
-        args.algo,
-        args.config,
     )
 
 

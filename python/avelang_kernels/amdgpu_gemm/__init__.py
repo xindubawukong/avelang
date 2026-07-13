@@ -1,6 +1,11 @@
 from __future__ import annotations
 
+from .amdgpu_gemm import gemm_pipeline_transposed_b
 from .config import (
+    CONFIGS,
+    CONFIG_BY_KEY,
+    CONFIG_BY_NAME,
+    DEFAULT_CONFIG_BY_SHAPE,
     LOAD_MODE_BASE_OFFSET,
     LOAD_MODE_DEFAULT,
     STAGGER_BY_M,
@@ -10,24 +15,12 @@ from .config import (
     WGM_XCC_MAPPING8,
     WGM_XCC_MAPPING32,
     GemmConfig,
-)
-from .kernel import (
-    gemm_pipeline_transposed_b,
-)
-from .registry import (
-    CONFIGS,
-    CONFIG_BY_KEY,
-    CONFIG_BY_NAME,
-    DEFAULT_CONFIG_BY_SHAPE,
     default_config,
     enumerate_configs,
     get_config,
 )
-from .tuner import BenchmarkResult, benchmark_config
-
 
 __all__ = [
-    "BenchmarkResult",
     "CONFIGS",
     "CONFIG_BY_KEY",
     "CONFIG_BY_NAME",
@@ -41,7 +34,6 @@ __all__ = [
     "WGM_XCC",
     "WGM_XCC_MAPPING8",
     "WGM_XCC_MAPPING32",
-    "benchmark_config",
     "default_config",
     "enumerate_configs",
     "gemm_pipeline_transposed_b",

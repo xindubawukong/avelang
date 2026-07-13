@@ -8,6 +8,7 @@ import avelang
 import avelang.language as al
 
 from .config import (
+    CONFIG_BY_KEY,
     LOAD_MODE_BASE_OFFSET,
     STAGGER_BY_N,
     WGM_ROW_MAJOR,
@@ -15,8 +16,9 @@ from .config import (
     WGM_XCC_MAPPING8,
     WGM_XCC_MAPPING32,
     GemmConfig,
+    default_config,
+    get_config,
 )
-from .registry import CONFIG_BY_KEY, default_config, get_config
 
 
 WARP_SIZE = 64
@@ -29,137 +31,64 @@ SCHED_MASK_BUFFER_LOAD = 0x20
 SCHED_MASK_DS_READ = 0x100
 SCHED_MASK_DS_WRITE = 0x200
 
-B4_GROUP_M = 224
-B4_GROUP_N = 256
-B4_GROUP_K = 64
-B4_PARTITION_M = 2
-B4_PARTITION_N = 2
-B4_NUM_WARPS = 4
-B4_THREADS = WARP_SIZE * B4_NUM_WARPS
-B4_WARP_MAT_M = B4_GROUP_M // B4_PARTITION_M
-B4_WARP_MAT_N = B4_GROUP_N // B4_PARTITION_N
-B4_M_TILES_PER_WARP = B4_WARP_MAT_M // 16
-B4_N_TILES_PER_WARP = B4_WARP_MAT_N // 16
-B4_GLOBAL_WORDS_PER_ROW = B4_GROUP_K * BF16_BYTES // 4
-B4_GLOBAL_ROWS_PER_ROUND = B4_THREADS // B4_GLOBAL_WORDS_PER_ROW
-B4_REG_WORDS_A = B4_GROUP_M // B4_GLOBAL_ROWS_PER_ROUND
-B4_REG_WORDS_B = B4_GROUP_N // B4_GLOBAL_ROWS_PER_ROUND
-B4_READ_ROWS_A = 1
-B4_READ_ROWS_B = 8
-B4_SHM_ROW_WORDS = B4_GROUP_K * BF16_BYTES // 4
-B4_SHM_GROUP_WORDS_A = B4_READ_ROWS_A * B4_SHM_ROW_WORDS + 2
-B4_SHM_GROUP_WORDS_B = B4_READ_ROWS_B * B4_SHM_ROW_WORDS + 2
-B4_SHM_GROUPS_A = B4_GROUP_M // B4_READ_ROWS_A
-B4_SHM_GROUPS_B = B4_GROUP_N // B4_READ_ROWS_B
-B4_SHM_TOTAL_WORDS_A = B4_SHM_GROUPS_A * B4_SHM_GROUP_WORDS_A
-B4_SHM_TOTAL_WORDS_B = B4_SHM_GROUPS_B * B4_SHM_GROUP_WORDS_B
-
 
 @avelang.jit
-def _batch4_store_shm_a(
-    shm: al.Tensor((B4_SHM_TOTAL_WORDS_A,), al.u32),
-    reg: al.Tensor((B4_REG_WORDS_A,), al.u32),
-    tid: al.u32,
-):
-    row = tid // B4_GLOBAL_WORDS_PER_ROW
-    col_word = tid - row * B4_GLOBAL_WORDS_PER_ROW
-    shm_word = row * B4_SHM_GROUP_WORDS_A + col_word
-    shm_word_stride = B4_GLOBAL_ROWS_PER_ROUND * B4_SHM_GROUP_WORDS_A
-    for i in al.range(B4_REG_WORDS_A):
-        shm[shm_word + i * shm_word_stride] = reg[i]
+def _wgm_mapping(
+    m: al.u32,
+    n: al.u32,
+    group_size_m: al.u32,
+    group_size_n: al.u32,
+    wgm_mode: al.u32,
+    ceil_groups: al.u32,
+) -> (al.u32, al.u32):
+    linear_group_id = al.block_id(0)
+    m_groups = m // group_size_m
+    n_groups = n // group_size_n
+    if ceil_groups != 0:
+        m_groups = (m + group_size_m - 1) // group_size_m
+        n_groups = (n + group_size_n - 1) // group_size_n
 
-
-@avelang.jit
-def _batch4_store_shm_b(
-    shm: al.Tensor((B4_SHM_TOTAL_WORDS_B,), al.u32),
-    reg: al.Tensor((B4_REG_WORDS_B,), al.u32),
-    tid: al.u32,
-):
-    row = tid // B4_GLOBAL_WORDS_PER_ROW
-    col_word = tid - row * B4_GLOBAL_WORDS_PER_ROW
-    row_group = row // B4_READ_ROWS_B
-    row_in_group = row - row_group * B4_READ_ROWS_B
-    shm_word = (
-        row_group * B4_SHM_GROUP_WORDS_B
-        + row_in_group * B4_SHM_ROW_WORDS
-        + col_word
-    )
-    shm_word_stride = (
-        B4_GLOBAL_ROWS_PER_ROUND // B4_READ_ROWS_B
-    ) * B4_SHM_GROUP_WORDS_B
-    for i in al.range(B4_REG_WORDS_B):
-        shm[shm_word + i * shm_word_stride] = reg[i]
-
-
-@avelang.jit
-def _batch4_store_shm_ba(
-    shm_a: al.Tensor((B4_SHM_TOTAL_WORDS_A,), al.u32),
-    shm_b: al.Tensor((B4_SHM_TOTAL_WORDS_B,), al.u32),
-    reg_a: al.Tensor((B4_REG_WORDS_A,), al.u32),
-    reg_b: al.Tensor((B4_REG_WORDS_B,), al.u32),
-    tid: al.u32,
-):
-    _batch4_store_shm_b(shm_b, reg_b, tid)
-    _batch4_store_shm_a(shm_a, reg_a, tid)
-
-
-@avelang.jit
-def _batch4_load_shm_to_regs_a(
-    shm: al.Tensor((B4_SHM_TOTAL_WORDS_A,), al.u32),
-    wid: al.u32,
-    batch_id: al.u32,
-    wtid: al.u32,
-    data: al.Tensor((B4_M_TILES_PER_WARP, 2), al.u32),
-):
-    lane = wtid % 16
-    quad = wtid // 16
-    warp_row = wid // B4_PARTITION_N
-    start_row = warp_row * 16 + lane
-    col_uint2 = quad + batch_id * 4
-    for tile in al.range(B4_M_TILES_PER_WARP):
-        uint2_index = (
-            start_row * (B4_SHM_GROUP_WORDS_A // 2)
-            + col_uint2
-            + tile * 32 * (B4_SHM_GROUP_WORDS_A // 2)
+    if wgm_mode != WGM_ROW_MAJOR:
+        total_groups = m_groups * n_groups
+        cu_count = al.convert(MI300_CU_COUNT, al.u32)
+        wgm_xcc = al.convert(WGM_XCC_WIDTH, al.u32)
+        linear_group_limit = (total_groups // wgm_xcc) * wgm_xcc
+        cu_base = (linear_group_id // cu_count) * cu_count
+        cu_xcc = (linear_group_id % cu_count) // wgm_xcc
+        cu_base = cu_base + cu_xcc
+        cu_tail_limit = (total_groups // cu_count) * cu_count
+        active_cu = (
+            (total_groups % cu_count)
+            if (linear_group_id >= cu_tail_limit)
+            else cu_count
         )
-        word_index = uint2_index * 2
-        data[tile, 0] = shm[word_index]
-        data[tile, 1] = shm[word_index + 1]
+        cu_xcc_stride = (active_cu // wgm_xcc) * (linear_group_id % wgm_xcc)
+        mapped = cu_base + cu_xcc_stride
+        linear_group_id = (
+            mapped if (linear_group_id < linear_group_limit) else linear_group_id
+        )
 
+    group_m = linear_group_id // n_groups
+    group_n = linear_group_id - group_m * n_groups
+    if wgm_mode == WGM_XCC_MAPPING8 or wgm_mode == WGM_XCC_MAPPING32:
+        workgroup_mapping = al.convert(8, al.u32)
+        if wgm_mode == WGM_XCC_MAPPING32:
+            workgroup_mapping = al.convert(32, al.u32)
+        mapping_block = group_m // workgroup_mapping
+        mapping_linear = group_n + (group_m % workgroup_mapping) * n_groups
+        mapping_groups = m_groups // workgroup_mapping
+        mapping_tail = m_groups % workgroup_mapping
+        mapping_tail = (
+            workgroup_mapping if (mapping_tail == 0) else mapping_tail
+        )
+        mapping_span = (
+            mapping_tail if (mapping_block >= mapping_groups) else workgroup_mapping
+        )
+        group_n = mapping_linear // mapping_span
+        group_m = mapping_linear % mapping_span
+        group_m = group_m + mapping_block * workgroup_mapping
 
-@avelang.jit
-def _batch4_load_shm_to_regs_b(
-    shm: al.Tensor((B4_SHM_TOTAL_WORDS_B,), al.u32),
-    wid: al.u32,
-    batch_id: al.u32,
-    wtid: al.u32,
-    data: al.Tensor((B4_N_TILES_PER_WARP, 2), al.u32),
-):
-    lane = wtid % 16
-    quad = wtid // 16
-    warp_col = wid % B4_PARTITION_N
-    start_row = warp_col * B4_WARP_MAT_N + lane * B4_READ_ROWS_B
-    col_uint2 = quad + batch_id * 4
-    start_uint2 = (start_row // B4_READ_ROWS_B) * (B4_SHM_GROUP_WORDS_B // 2)
-    for tile in al.range(B4_N_TILES_PER_WARP):
-        uint2_index = start_uint2 + col_uint2 + tile * 16
-        word_index = uint2_index * 2
-        data[tile, 0] = shm[word_index]
-        data[tile, 1] = shm[word_index + 1]
-
-
-@avelang.jit
-def _batch4_read_shm_ba(
-    shm_a: al.Tensor((B4_SHM_TOTAL_WORDS_A,), al.u32),
-    shm_b: al.Tensor((B4_SHM_TOTAL_WORDS_B,), al.u32),
-    wid: al.u32,
-    batch_id: al.u32,
-    wtid: al.u32,
-    data_a: al.Tensor((B4_M_TILES_PER_WARP, 2), al.u32),
-    data_b: al.Tensor((B4_N_TILES_PER_WARP, 2), al.u32),
-):
-    _batch4_load_shm_to_regs_b(shm_b, wid, batch_id, wtid, data_b)
-    _batch4_load_shm_to_regs_a(shm_a, wid, batch_id, wtid, data_a)
+    return group_m, group_n
 
 
 def _make_batch2_kernel(config: GemmConfig):
@@ -200,50 +129,6 @@ def _make_batch2_kernel(config: GemmConfig):
     PREFETCH_BEFORE_ZERO = config.prefetch_before_zero
     PREFETCH1_BEFORE_READ = config.prefetch1_before_read
     PIPELINE_INTERLEAVE = config.pipeline_interleave
-
-    @avelang.jit
-    def _wgm_mapping(m: al.u32, n: al.u32) -> (al.u32, al.u32):
-        linear_group_id = al.block_id(0)
-        m_groups = m // GROUP_M
-        n_groups = n // GROUP_N
-
-        if WGM_MODE == WGM_ROW_MAJOR:
-            group_m = linear_group_id // n_groups
-            group_n = linear_group_id - group_m * n_groups
-        else:
-            total_groups = m_groups * n_groups
-            cu_count = al.convert(MI300_CU_COUNT, al.u32)
-            wgm_xcc = al.convert(WGM_XCC_WIDTH, al.u32)
-
-            linear_group_limit = (total_groups // wgm_xcc) * wgm_xcc
-            cu_base = (linear_group_id // cu_count) * cu_count
-            cu_xcc = (linear_group_id % cu_count) // wgm_xcc
-            cu_base = cu_base + cu_xcc
-
-            cu_tail_limit = (total_groups // cu_count) * cu_count
-            active_cu = (total_groups % cu_count) if (linear_group_id > cu_tail_limit) else cu_count
-            cu_xcc_stride = (active_cu // wgm_xcc) * (linear_group_id % wgm_xcc)
-            linear_group_mapped = cu_base + cu_xcc_stride
-            linear_group_id = linear_group_mapped if (linear_group_id < linear_group_limit) else linear_group_id
-
-            group_m = linear_group_id // n_groups
-            group_n = linear_group_id - group_m * n_groups
-
-            if WGM_MODE == WGM_XCC_MAPPING8 or WGM_MODE == WGM_XCC_MAPPING32:
-                workgroup_mapping = al.convert(8, al.u32)
-                if WGM_MODE == WGM_XCC_MAPPING32:
-                    workgroup_mapping = al.convert(32, al.u32)
-                mapping_block = group_m // workgroup_mapping
-                mapping_linear = group_n + (group_m % workgroup_mapping) * n_groups
-                mapping_groups = m_groups // workgroup_mapping
-                mapping_tail = m_groups % workgroup_mapping
-                mapping_tail = workgroup_mapping if (mapping_tail == 0) else mapping_tail
-                mapping_span = mapping_tail if (mapping_block >= mapping_groups) else workgroup_mapping
-                group_n = mapping_linear // mapping_span
-                group_m = mapping_linear % mapping_span
-                group_m = group_m + mapping_block * workgroup_mapping
-
-        return group_m, group_n
 
     @avelang.jit
     def _k_tile(group_m: al.u32, group_n: al.u32, k_total: al.u32, offset: al.u32) -> al.u32:
@@ -464,42 +349,14 @@ def _make_batch2_kernel(config: GemmConfig):
         warp_row = wid // WARP_PER_COL
         warp_col = wid % WARP_PER_COL
 
-        linear_group_id = al.block_id(0)
-        m_groups = m // GROUP_M
-        n_groups = n // GROUP_N
-        group_m = al.convert(0, al.u32)
-        group_n = al.convert(0, al.u32)
-        if WGM_MODE == WGM_ROW_MAJOR:
-            group_m = linear_group_id // n_groups
-            group_n = linear_group_id - group_m * n_groups
-        else:
-            total_groups = m_groups * n_groups
-            cu_count = al.convert(MI300_CU_COUNT, al.u32)
-            wgm_xcc = al.convert(WGM_XCC_WIDTH, al.u32)
-            linear_group_limit = (total_groups // wgm_xcc) * wgm_xcc
-            cu_base = (linear_group_id // cu_count) * cu_count
-            cu_xcc = (linear_group_id % cu_count) // wgm_xcc
-            cu_base = cu_base + cu_xcc
-            cu_tail_limit = (total_groups // cu_count) * cu_count
-            active_cu = (total_groups % cu_count) if (linear_group_id > cu_tail_limit) else cu_count
-            cu_xcc_stride = (active_cu // wgm_xcc) * (linear_group_id % wgm_xcc)
-            linear_group_mapped = cu_base + cu_xcc_stride
-            linear_group_id = linear_group_mapped if (linear_group_id < linear_group_limit) else linear_group_id
-            group_m = linear_group_id // n_groups
-            group_n = linear_group_id - group_m * n_groups
-            if WGM_MODE == WGM_XCC_MAPPING8 or WGM_MODE == WGM_XCC_MAPPING32:
-                workgroup_mapping = al.convert(8, al.u32)
-                if WGM_MODE == WGM_XCC_MAPPING32:
-                    workgroup_mapping = al.convert(32, al.u32)
-                mapping_block = group_m // workgroup_mapping
-                mapping_linear = group_n + (group_m % workgroup_mapping) * n_groups
-                mapping_groups = m_groups // workgroup_mapping
-                mapping_tail = m_groups % workgroup_mapping
-                mapping_tail = workgroup_mapping if (mapping_tail == 0) else mapping_tail
-                mapping_span = mapping_tail if (mapping_block >= mapping_groups) else workgroup_mapping
-                group_n = mapping_linear // mapping_span
-                group_m = mapping_linear % mapping_span
-                group_m = group_m + mapping_block * workgroup_mapping
+        group_m, group_n = _wgm_mapping(
+            m,
+            n,
+            al.convert(GROUP_M, al.u32),
+            al.convert(GROUP_N, al.u32),
+            al.convert(WGM_MODE, al.u32),
+            al.convert(0, al.u32),
+        )
 
         a_tensor = al.make_tensor(A, al.bf16, al.make_layout((m, k), (k, 1)))
         b_tensor = al.make_tensor(B, al.bf16, al.make_layout((n, k), (k, 1)))
@@ -601,12 +458,12 @@ def _make_batch4_kernel(config: GemmConfig):
     THREADS = WARP_SIZE * NUM_WARPS
     WARP_MAT_M = GROUP_M // WARP_PER_ROW
     WARP_MAT_N = GROUP_N // WARP_PER_COL
-    M_TILES_PER_WARP = WARP_MAT_M // 16
-    N_TILES_PER_WARP = WARP_MAT_N // 16
+    M_TILES_PER_WARP = al.constexpr(WARP_MAT_M // 16)
+    N_TILES_PER_WARP = al.constexpr(WARP_MAT_N // 16)
     GLOBAL_WORDS_PER_ROW = GROUP_K * BF16_BYTES // 4
     GLOBAL_ROWS_PER_ROUND = THREADS // GLOBAL_WORDS_PER_ROW
-    REG_WORDS_A = GROUP_M // GLOBAL_ROWS_PER_ROUND
-    REG_WORDS_B = GROUP_N // GLOBAL_ROWS_PER_ROUND
+    REG_WORDS_A = al.constexpr(GROUP_M // GLOBAL_ROWS_PER_ROUND)
+    REG_WORDS_B = al.constexpr(GROUP_N // GLOBAL_ROWS_PER_ROUND)
     READ_ROWS_A = config.read_rows_a
     READ_ROWS_B = config.read_rows_b
     SHM_PAD_WORDS_A = config.pad_a_bytes // 4
@@ -616,82 +473,14 @@ def _make_batch4_kernel(config: GemmConfig):
     SHM_GROUP_WORDS_B = READ_ROWS_B * SHM_ROW_WORDS + SHM_PAD_WORDS_B
     SHM_GROUPS_A = GROUP_M // READ_ROWS_A
     SHM_GROUPS_B = GROUP_N // READ_ROWS_B
-    SHM_TOTAL_WORDS_A = SHM_GROUPS_A * SHM_GROUP_WORDS_A
-    SHM_TOTAL_WORDS_B = SHM_GROUPS_B * SHM_GROUP_WORDS_B
+    SHM_TOTAL_WORDS_A = al.constexpr(SHM_GROUPS_A * SHM_GROUP_WORDS_A)
+    SHM_TOTAL_WORDS_B = al.constexpr(SHM_GROUPS_B * SHM_GROUP_WORDS_B)
     WGM_MODE = config.wgm_mode
     LOAD_MODE = config.load_mode
     STORE_VEC = config.store_vec
     PREFETCH_BEFORE_ZERO = config.prefetch_before_zero
     PIPELINE_INTERLEAVE = config.pipeline_interleave
     LOOP_SCHEDULER = config.loop_scheduler
-
-    if WGM_MODE == WGM_ROW_MAJOR:
-        @avelang.jit
-        def _group_m(m: al.u32, n: al.u32) -> al.u32:
-            linear_group_id = al.block_id(0)
-            n_groups = (n + GROUP_N - 1) // GROUP_N
-            return linear_group_id // n_groups
-
-        @avelang.jit
-        def _group_n(m: al.u32, n: al.u32) -> al.u32:
-            linear_group_id = al.block_id(0)
-            n_groups = (n + GROUP_N - 1) // GROUP_N
-            group_m = linear_group_id // n_groups
-            return linear_group_id - group_m * n_groups
-    else:
-        @avelang.jit
-        def _linear_group_id(m: al.u32, n: al.u32) -> al.u32:
-            linear_group_id = al.block_id(0)
-            m_groups = (m + GROUP_M - 1) // GROUP_M
-            n_groups = (n + GROUP_N - 1) // GROUP_N
-            total_groups = m_groups * n_groups
-            cu_count = al.convert(MI300_CU_COUNT, al.u32)
-            wgm_xcc = al.convert(WGM_XCC_WIDTH, al.u32)
-            linear_group_limit = (total_groups // wgm_xcc) * wgm_xcc
-            cu_base = (linear_group_id // cu_count) * cu_count
-            cu_xcc = (linear_group_id % cu_count) // wgm_xcc
-            cu_base = cu_base + cu_xcc
-            cu_tail_limit = (total_groups // cu_count) * cu_count
-            active_cu = (total_groups % cu_count) if (linear_group_id > cu_tail_limit) else cu_count
-            cu_xcc_stride = (active_cu // wgm_xcc) * (linear_group_id % wgm_xcc)
-            mapped = cu_base + cu_xcc_stride
-            return mapped if (linear_group_id < linear_group_limit) else linear_group_id
-
-        @avelang.jit
-        def _group_m(m: al.u32, n: al.u32) -> al.u32:
-            linear_group_id = _linear_group_id(m, n)
-            m_groups = (m + GROUP_M - 1) // GROUP_M
-            n_groups = (n + GROUP_N - 1) // GROUP_N
-            group_m = linear_group_id // n_groups
-            group_n = linear_group_id - group_m * n_groups
-            workgroup_mapping = al.convert(8, al.u32)
-            if WGM_MODE == WGM_XCC_MAPPING32:
-                workgroup_mapping = al.convert(32, al.u32)
-            mapping_block = group_m // workgroup_mapping
-            mapping_linear = group_n + (group_m % workgroup_mapping) * n_groups
-            mapping_groups = m_groups // workgroup_mapping
-            mapping_tail = m_groups % workgroup_mapping
-            mapping_tail = workgroup_mapping if (mapping_tail == 0) else mapping_tail
-            mapping_span = mapping_tail if (mapping_block >= mapping_groups) else workgroup_mapping
-            return mapping_linear % mapping_span + mapping_block * workgroup_mapping
-
-        @avelang.jit
-        def _group_n(m: al.u32, n: al.u32) -> al.u32:
-            linear_group_id = _linear_group_id(m, n)
-            m_groups = (m + GROUP_M - 1) // GROUP_M
-            n_groups = (n + GROUP_N - 1) // GROUP_N
-            group_m = linear_group_id // n_groups
-            group_n = linear_group_id - group_m * n_groups
-            workgroup_mapping = al.convert(8, al.u32)
-            if WGM_MODE == WGM_XCC_MAPPING32:
-                workgroup_mapping = al.convert(32, al.u32)
-            mapping_block = group_m // workgroup_mapping
-            mapping_linear = group_n + (group_m % workgroup_mapping) * n_groups
-            mapping_groups = m_groups // workgroup_mapping
-            mapping_tail = m_groups % workgroup_mapping
-            mapping_tail = workgroup_mapping if (mapping_tail == 0) else mapping_tail
-            mapping_span = mapping_tail if (mapping_block >= mapping_groups) else workgroup_mapping
-            return mapping_linear // mapping_span
 
     @avelang.jit
     def _load_global_a(
@@ -773,12 +562,15 @@ def _make_batch4_kernel(config: GemmConfig):
         _load_global_b(b_rsrc, k, group_n, k_idx, tid, reg_b)
         _load_global_a(a_rsrc, k, group_m, k_idx, tid, reg_a)
 
+    # AveLang dependency collection does not inspect parameter annotations.
+    # The no-op assignments below keep static shape constants visible.
     @avelang.jit
-    def _store_shm_a(
+    def _config_batch4_store_shm_a(
         shm: al.Tensor((SHM_TOTAL_WORDS_A,), al.u32),
         reg: al.Tensor((REG_WORDS_A,), al.u32),
         tid: al.u32,
     ):
+        _ = SHM_TOTAL_WORDS_A
         row = tid // GLOBAL_WORDS_PER_ROW
         col_word = tid - row * GLOBAL_WORDS_PER_ROW
         shm_word = row * SHM_GROUP_WORDS_A + col_word
@@ -787,11 +579,12 @@ def _make_batch4_kernel(config: GemmConfig):
             shm[shm_word + i * shm_word_stride] = reg[i]
 
     @avelang.jit
-    def _store_shm_b(
+    def _config_batch4_store_shm_b(
         shm: al.Tensor((SHM_TOTAL_WORDS_B,), al.u32),
         reg: al.Tensor((REG_WORDS_B,), al.u32),
         tid: al.u32,
     ):
+        _ = SHM_TOTAL_WORDS_B
         row = tid // GLOBAL_WORDS_PER_ROW
         col_word = tid - row * GLOBAL_WORDS_PER_ROW
         row_group = row // READ_ROWS_B
@@ -806,24 +599,31 @@ def _make_batch4_kernel(config: GemmConfig):
             shm[shm_word + i * shm_word_stride] = reg[i]
 
     @avelang.jit
-    def _store_shm_ab(
+    def _config_batch4_store_shm_ba(
         shm_a: al.Tensor((SHM_TOTAL_WORDS_A,), al.u32),
         shm_b: al.Tensor((SHM_TOTAL_WORDS_B,), al.u32),
         reg_a: al.Tensor((REG_WORDS_A,), al.u32),
         reg_b: al.Tensor((REG_WORDS_B,), al.u32),
         tid: al.u32,
     ):
-        _batch4_store_shm_b(shm_b, reg_b, tid)
-        _batch4_store_shm_a(shm_a, reg_a, tid)
+        _ = (
+            SHM_TOTAL_WORDS_A
+            + SHM_TOTAL_WORDS_B
+            + REG_WORDS_A
+            + REG_WORDS_B
+        )
+        _config_batch4_store_shm_b(shm_b, reg_b, tid)
+        _config_batch4_store_shm_a(shm_a, reg_a, tid)
 
     @avelang.jit
-    def _load_shm_to_regs_a(
+    def _config_batch4_load_shm_to_regs_a(
         shm: al.Tensor((SHM_TOTAL_WORDS_A,), al.u32),
         warp_row: al.u32,
         batch_id: al.u32,
         wtid: al.u32,
         data: al.Tensor((M_TILES_PER_WARP, 2), al.u32),
     ):
+        _ = SHM_TOTAL_WORDS_A
         lane = wtid % 16
         quad = wtid // 16
         start_row = warp_row * 16 + lane
@@ -839,13 +639,14 @@ def _make_batch4_kernel(config: GemmConfig):
             data[tile, 1] = shm[word_index + 1]
 
     @avelang.jit
-    def _load_shm_to_regs_b(
+    def _config_batch4_load_shm_to_regs_b(
         shm: al.Tensor((SHM_TOTAL_WORDS_B,), al.u32),
         warp_col: al.u32,
         batch_id: al.u32,
         wtid: al.u32,
         data: al.Tensor((N_TILES_PER_WARP, 2), al.u32),
     ):
+        _ = SHM_TOTAL_WORDS_B
         lane = wtid % 16
         quad = wtid // 16
         start_row = warp_col * WARP_MAT_N + lane * READ_ROWS_B
@@ -858,7 +659,7 @@ def _make_batch4_kernel(config: GemmConfig):
             data[tile, 1] = shm[word_index + 1]
 
     @avelang.jit
-    def _read_shm_ab(
+    def _config_batch4_read_shm_ba(
         shm_a: al.Tensor((SHM_TOTAL_WORDS_A,), al.u32),
         shm_b: al.Tensor((SHM_TOTAL_WORDS_B,), al.u32),
         wid: al.u32,
@@ -867,10 +668,20 @@ def _make_batch4_kernel(config: GemmConfig):
         data_a: al.Tensor((M_TILES_PER_WARP, 2), al.u32),
         data_b: al.Tensor((N_TILES_PER_WARP, 2), al.u32),
     ):
+        _ = (
+            SHM_TOTAL_WORDS_A
+            + SHM_TOTAL_WORDS_B
+            + M_TILES_PER_WARP
+            + N_TILES_PER_WARP
+        )
         warp_row = wid // WARP_PER_COL
         warp_col = wid % WARP_PER_COL
-        _load_shm_to_regs_b(shm_b, warp_col, batch_id, wtid, data_b)
-        _load_shm_to_regs_a(shm_a, warp_row, batch_id, wtid, data_a)
+        _config_batch4_load_shm_to_regs_b(
+            shm_b, warp_col, batch_id, wtid, data_b
+        )
+        _config_batch4_load_shm_to_regs_a(
+            shm_a, warp_row, batch_id, wtid, data_a
+        )
 
     @avelang.jit
     def _matmul(
@@ -986,8 +797,14 @@ def _make_batch4_kernel(config: GemmConfig):
         tid = al.thread_id(0)
         wid = tid // WARP_SIZE
         wtid = tid % WARP_SIZE
-        group_m = _group_m(m, n)
-        group_n = _group_n(m, n)
+        group_m, group_n = _wgm_mapping(
+            m,
+            n,
+            al.convert(GROUP_M, al.u32),
+            al.convert(GROUP_N, al.u32),
+            al.convert(WGM_MODE, al.u32),
+            al.convert(1, al.u32),
+        )
 
         a_tensor = al.make_tensor(A, al.bf16, al.make_layout((m, k), (k, 1)))
         b_tensor = al.make_tensor(B, al.bf16, al.make_layout((n, k), (k, 1)))
@@ -1028,54 +845,54 @@ def _make_batch4_kernel(config: GemmConfig):
                 tid, reg_a, reg_b
             )
 
-        _batch4_store_shm_ba(shm_a, shm_b, reg_a, reg_b, tid)
+        _config_batch4_store_shm_ba(shm_a, shm_b, reg_a, reg_b, tid)
         al.syncthreads()
-        _batch4_read_shm_ba(shm_a, shm_b, wid, 0, wtid, data_a0, data_b0)
+        _config_batch4_read_shm_ba(shm_a, shm_b, wid, 0, wtid, data_a0, data_b0)
         _load_global_next(
             a_rsrc, b_rsrc, k, group_m, group_n, al.convert(1, al.u32),
             tid, reg_a, reg_b
         )
 
         for k_idx in al.range(0, k_total - 2):
-            _batch4_read_shm_ba(shm_a, shm_b, wid, 1, wtid, data_a1, data_b1)
+            _config_batch4_read_shm_ba(shm_a, shm_b, wid, 1, wtid, data_a1, data_b1)
             _matmul(data_a0, data_b0, acc)
-            _batch4_read_shm_ba(shm_a, shm_b, wid, 2, wtid, data_a2, data_b2)
+            _config_batch4_read_shm_ba(shm_a, shm_b, wid, 2, wtid, data_a2, data_b2)
             _matmul(data_a1, data_b1, acc)
-            _batch4_read_shm_ba(shm_a, shm_b, wid, 3, wtid, data_a3, data_b3)
+            _config_batch4_read_shm_ba(shm_a, shm_b, wid, 3, wtid, data_a3, data_b3)
             _matmul(data_a2, data_b2, acc)
             al.syncthreads()
             if PIPELINE_INTERLEAVE:
-                _batch4_store_shm_b(shm_b, reg_b, tid)
+                _config_batch4_store_shm_b(shm_b, reg_b, tid)
                 _load_global_b(b_rsrc, k, group_n, k_idx + 2, tid, reg_b)
-                _batch4_store_shm_a(shm_a, reg_a, tid)
+                _config_batch4_store_shm_a(shm_a, reg_a, tid)
                 _load_global_a(a_rsrc, k, group_m, k_idx + 2, tid, reg_a)
             else:
-                _batch4_store_shm_ba(shm_a, shm_b, reg_a, reg_b, tid)
+                _config_batch4_store_shm_ba(shm_a, shm_b, reg_a, reg_b, tid)
                 _load_global_ab(
                     a_rsrc, b_rsrc, k, group_m, group_n, k_idx + 2,
                     tid, reg_a, reg_b
                 )
             al.syncthreads()
-            _batch4_read_shm_ba(shm_a, shm_b, wid, 0, wtid, data_a0, data_b0)
+            _config_batch4_read_shm_ba(shm_a, shm_b, wid, 0, wtid, data_a0, data_b0)
             _matmul(data_a3, data_b3, acc)
             _hot_loop_scheduler()
 
-        _batch4_read_shm_ba(shm_a, shm_b, wid, 1, wtid, data_a1, data_b1)
+        _config_batch4_read_shm_ba(shm_a, shm_b, wid, 1, wtid, data_a1, data_b1)
         _matmul(data_a0, data_b0, acc)
-        _batch4_read_shm_ba(shm_a, shm_b, wid, 2, wtid, data_a2, data_b2)
+        _config_batch4_read_shm_ba(shm_a, shm_b, wid, 2, wtid, data_a2, data_b2)
         _matmul(data_a1, data_b1, acc)
-        _batch4_read_shm_ba(shm_a, shm_b, wid, 3, wtid, data_a3, data_b3)
+        _config_batch4_read_shm_ba(shm_a, shm_b, wid, 3, wtid, data_a3, data_b3)
         _matmul(data_a2, data_b2, acc)
         al.syncthreads()
-        _batch4_store_shm_ba(shm_a, shm_b, reg_a, reg_b, tid)
+        _config_batch4_store_shm_ba(shm_a, shm_b, reg_a, reg_b, tid)
         al.syncthreads()
-        _batch4_read_shm_ba(shm_a, shm_b, wid, 0, wtid, data_a0, data_b0)
+        _config_batch4_read_shm_ba(shm_a, shm_b, wid, 0, wtid, data_a0, data_b0)
         _matmul(data_a3, data_b3, acc)
-        _batch4_read_shm_ba(shm_a, shm_b, wid, 1, wtid, data_a1, data_b1)
+        _config_batch4_read_shm_ba(shm_a, shm_b, wid, 1, wtid, data_a1, data_b1)
         _matmul(data_a0, data_b0, acc)
-        _batch4_read_shm_ba(shm_a, shm_b, wid, 2, wtid, data_a2, data_b2)
+        _config_batch4_read_shm_ba(shm_a, shm_b, wid, 2, wtid, data_a2, data_b2)
         _matmul(data_a1, data_b1, acc)
-        _batch4_read_shm_ba(shm_a, shm_b, wid, 3, wtid, data_a3, data_b3)
+        _config_batch4_read_shm_ba(shm_a, shm_b, wid, 3, wtid, data_a3, data_b3)
         _matmul(data_a2, data_b2, acc)
         _matmul(data_a3, data_b3, acc)
         _write_results(c_rsrc, n, group_m, group_n, wtid, wid, acc)
@@ -1148,3 +965,4 @@ def gemm_pipeline_transposed_b(
     kernel = _kernel_for_key(resolved.key)
     kernel[lambda: ((grid_size, 1, 1), (block_size, 1, 1))](A, B, out, m, n, k)
     return out
+
