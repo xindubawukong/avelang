@@ -39,6 +39,10 @@ def perm(lhs, rhs, sel):
     pass
 
 
+def bitreverse(value):
+    pass
+
+
 def get_dpp(old, src, dpp_ctrl, row_mask, bank_mask, bound_ctrl):
     pass
 
@@ -92,6 +96,11 @@ def cvt_pk_fp8_f32(src0, src1, old, word_sel):
 
 def cvt_pk_bf8_f32(src0, src1, old, word_sel):
     pass
+
+
+def cvt_pk_f32_bf8(src, word_sel):
+    pass
+
 
 def sched_group_barrier(mask, size, group_id):
     pass

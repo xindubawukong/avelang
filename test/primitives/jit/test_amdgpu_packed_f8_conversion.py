@@ -31,6 +31,19 @@ def kernel_packed_f8_conversion(
     bf8_high[0] = S.amdgpu.cvt_pk_bf8_f32(src_a[0], src_b[0], old[0], 1)
 
 
+@avelang.jit
+def kernel_unpack_bf8(
+    packed: S.Tensor((1,), S.u32),
+    unpacked: S.Tensor((4,), S.f32),
+):
+    low = S.amdgpu.cvt_pk_f32_bf8(packed[0], 0)
+    high = S.amdgpu.cvt_pk_f32_bf8(packed[0], 1)
+    unpacked[0] = low[0]
+    unpacked[1] = low[1]
+    unpacked[2] = high[0]
+    unpacked[3] = high[1]
+
+
 def packed_pair(src_a: torch.Tensor, src_b: torch.Tensor, dtype: torch.dtype) -> int:
     values = torch.cat((src_a, src_b)).to(dtype).view(torch.uint8)
     return values[0].item() | (values[1].item() << 8)
@@ -62,6 +75,21 @@ class TestAMDGPUPackedF8Conversion(unittest.TestCase):
 
         self.assertEqual(fp8_low.item() & 0xFFFFFFFF, expected_fp8_low)
         self.assertEqual(bf8_high.item() & 0xFFFFFFFF, expected_bf8_high)
+
+    def test_unpack_bf8(self):
+        values = torch.tensor(
+            [0.5, -1.0, 2.0, -4.0],
+            dtype=torch.float8_e5m2fnuz,
+            device="cuda",
+        )
+        packed = values.view(torch.uint8).cpu()
+        packed_u32 = sum(int(packed[i]) << (8 * i) for i in range(4))
+        src = torch.tensor([packed_u32], dtype=torch.uint32, device="cuda")
+        unpacked = torch.empty((4,), dtype=torch.float32, device="cuda")
+
+        kernel_unpack_bf8[lambda: ((1, 1, 1), (1, 1, 1))](src, unpacked)
+
+        torch.testing.assert_close(unpacked.cpu(), values.float().cpu())
 
 
 if __name__ == "__main__":
