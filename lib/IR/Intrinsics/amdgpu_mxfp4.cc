@@ -142,6 +142,35 @@ SymbolScope::Function MxFp4Pack() {
             }};
 }
 
+SymbolScope::Function BufferAtomicAddBf16x2() {
+    return {[](ast::Call *call, GeneratorContext *ctx, Args args) {
+                auto &builder =
+                    ctx->GetCurrentFunctionGenerator()->GetBuilder();
+                auto loc = ctx->GetMLIRLocation(builder.getContext(), call);
+                Intrinsic(builder, loc, args[0].getType(),
+                          "llvm.amdgcn.raw.buffer.atomic.fadd",
+                          {args[0], args[1], args[2], Constant(builder, loc, 0),
+                           Constant(builder, loc, 0)});
+                return ctx->GetCurrentFunctionGenerator()
+                    ->GetExprGenerator()
+                    ->CreateVoidValue();
+            },
+            [](ast::Call *call, GeneratorContext *ctx, Args args) {
+                if (!CheckArgs(call, args, 3))
+                    return Error(call, ctx,
+                                 "raw_buffer_atomic_add_bf16x2 expects value, "
+                                 "resource and byte offset");
+                auto type = mlir::dyn_cast<mlir::VectorType>(args[0].getType());
+                if (!type || type.getShape() != llvm::ArrayRef<int64_t>{2} ||
+                    !type.getElementType().isBF16() ||
+                    !IsVector4(args[1], true) || !IsI32(args[2]))
+                    return Error(call, ctx,
+                                 "raw_buffer_atomic_add_bf16x2 expects "
+                                 "vector<2xbf16>, vector<4xi32> and i32");
+                return true;
+            }};
+}
+
 SymbolScope::Function BufferStoreU8() {
     return {
         [](ast::Call *call, GeneratorContext *ctx, Args args) {

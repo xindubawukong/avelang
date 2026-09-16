@@ -1596,9 +1596,11 @@ mlir::Value ExprGenerator::VisitCall(ast::Call *call) {
                     }
                     resolved_args[0] = loaded;
                 }
-            } else if (symbol_name.rfind("raw_buffer_store_", 0) == 0) {
+            } else if (symbol_name.rfind("raw_buffer_store_", 0) == 0 ||
+                       symbol_name.rfind("raw_buffer_atomic_", 0) == 0) {
                 auto widthOpt = ParseIntAfterMarker(symbol_name, "_x");
-                int width = widthOpt.value_or(1);
+                int width = widthOpt.value_or(
+                    symbol_name == "raw_buffer_atomic_add_bf16x2" ? 2 : 1);
                 if (resolved_args.size() > 0 && resolved_args[0] &&
                     mlir::isa<cf::MemRefType>(resolved_args[0].getType())) {
                     mlir::Value loaded;

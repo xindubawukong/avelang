@@ -6,6 +6,7 @@ namespace causalflow::avelang::ir::intrinsics {
 
 SymbolScope::Function MxFp4ScaledMfma();
 SymbolScope::Function MxFp4Pack();
+SymbolScope::Function BufferAtomicAddBf16x2();
 SymbolScope::Function BufferStoreU8();
 SymbolScope::Function DsSwizzle();
 SymbolScope::Function MaximumF32();

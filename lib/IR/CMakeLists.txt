@@ -57,6 +57,7 @@ add_library(ave-lang-mlir
   Intrinsics/nvvm_module.cc
   Intrinsics/amdgpu_module.cc
   Intrinsics/amdgpu_mxfp4.cc
+  Intrinsics/amdgpu_sync.cc
   mangler.cc
   mlir_generator.cc
   expr_generator.cc

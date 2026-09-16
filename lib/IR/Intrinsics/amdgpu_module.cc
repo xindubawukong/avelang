@@ -2,6 +2,7 @@
 #include "Dialect/AveLang/IR/AveLangOps.h"
 #include "IR/Intrinsics/amdgpu_mfma_signatures.h"
 #include "IR/Intrinsics/amdgpu_mxfp4.h"
+#include "IR/Intrinsics/amdgpu_sync.h"
 #include "IR/builtin_module.h"
 #include "IR/constant_folder.h"
 #include "IR/generator_context.h"
@@ -433,6 +434,9 @@ void AMDGPUIntrinsic::Initialize() {
                                                       resolved_args, 4);
         });
 
+    addIntrinsic("compiler_barrier", intrinsics::CompilerBarrier());
+    addIntrinsic("fence", intrinsics::Fence());
+    addIntrinsic("s_sleep", intrinsics::Sleep());
 
     AddFunction(
         "sched_barrier",
@@ -460,6 +464,9 @@ void AMDGPUIntrinsic::Initialize() {
                                                   resolved_args);
         });
 
+    addIntrinsic("raw_buffer_atomic_add_u32", intrinsics::BufferAtomicI32(false));
+    addIntrinsic("raw_buffer_atomic_or_u32", intrinsics::BufferAtomicI32(true));
+    addIntrinsic("raw_buffer_atomic_add_bf16x2", intrinsics::BufferAtomicAddBf16x2());
 
     AddFunction(
         "atomic_add",
@@ -1788,21 +1795,30 @@ mlir::Value AMDGPUIntrinsic::CreateGlobalAtomicAddFunction(
         builder, location, builder.getI64Type(), resolved_args[0]);
     auto address = mlir::arith::AddIOp::create(builder, location, baseAddress,
                                                 byteOffset);
+    unsigned addressSpace = 1;
+    auto tensorType = mlir::cast<cf::MemRefType>(resolved_args[2].getType());
+    if (auto space = mlir::dyn_cast_or_null<mlir::gpu::AddressSpaceAttr>(
+            tensorType.getMemorySpace())) {
+        if (space.getValue() == mlir::gpu::AddressSpace::Workgroup)
+            addressSpace = 3;
+        else if (space.getValue() == mlir::gpu::AddressSpace::Private)
+            addressSpace = 5;
+    }
     auto pointer = mlir::LLVM::IntToPtrOp::create(
         builder, location,
-        mlir::LLVM::LLVMPointerType::get(builder.getContext(), 1),
+        mlir::LLVM::LLVMPointerType::get(builder.getContext(), addressSpace),
         address.getResult(), nullptr);
 
     auto elementType = *GetAtomicElementType(resolved_args[1].getType());
     auto binOp = mlir::isa<mlir::FloatType>(elementType)
                      ? mlir::LLVM::AtomicBinOp::fadd
                      : mlir::LLVM::AtomicBinOp::add;
-    mlir::LLVM::AtomicRMWOp::create(
+    auto result = mlir::LLVM::AtomicRMWOp::create(
         builder, location, binOp, pointer, resolved_args[1],
         mlir::LLVM::AtomicOrdering::monotonic, *syncScope);
 
-    return ctx->GetCurrentFunctionGenerator()->GetExprGenerator()
-        ->CreateVoidValue();
+    SetTypeInfo(result.getResult(), GetTypeInfo(resolved_args[1]));
+    return result.getResult();
 }
 
 bool AMDGPUIntrinsic::CheckGlobalAtomicAddFunction(

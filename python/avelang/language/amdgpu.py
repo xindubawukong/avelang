@@ -11,6 +11,19 @@ class AtomicScope:
 
 
 def atomic_add(voffset, data, tensor, scope):
+    """Add at a byte offset in global/LDS storage and return the old value."""
+
+
+def raw_buffer_atomic_add_u32(value, resource, byte_offset, soffset, aux):
+    """Return old u32 and add value; aux 0 selects agent, 16 system scope."""
+
+
+def raw_buffer_atomic_or_u32(value, resource, byte_offset, soffset, aux):
+    """Return old u32 and OR value; aux 0 selects agent, 16 system scope."""
+
+
+def raw_buffer_atomic_add_bf16x2(value, resource, byte_offset):
+    """Add a BF16 pair; a buffer offset outside the resource is discarded."""
     pass
 
 
@@ -151,6 +164,14 @@ def s_waitcnt(vmcnt, expcnt, lgkmcnt):
     pass
 
 
+def compiler_barrier():
+    """Prevent compiler motion of memory operations across this point."""
+
+
+def fence(ordering, scope):
+    """Ordering: 0 acquire, 1 release, 2 both; scope: 0 workgroup, 1 agent, 2 system."""
+
+
 def sched_group_barrier(mask, size, group_id):
     pass
 
@@ -161,6 +182,10 @@ def sched_barrier(mask):
 
 def s_setprio(priority):
     pass
+
+
+def s_sleep(cycles):
+    """Back off a polling wave; constant hardware sleep immediate in [0, 15]."""
 
 
 def v_setvskip(mask, skip_id):
