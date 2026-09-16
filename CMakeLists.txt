@@ -71,6 +71,17 @@ find_package(LLVM CONFIG REQUIRED)
 find_package(MLIR CONFIG REQUIRED)
 find_package(Clang REQUIRED CONFIG)
 
+# Match the linkage used by the imported MLIR/Clang libraries. Mixing a
+# distribution's shared libLLVM with static components duplicates LLVM state.
+function(ave_lang_llvm_libraries output)
+    if(LLVM_LINK_LLVM_DYLIB)
+        set(${output} LLVM PARENT_SCOPE)
+    else()
+        llvm_map_components_to_libnames(libraries ${ARGN})
+        set(${output} ${libraries} PARENT_SCOPE)
+    endif()
+endfunction()
+
 # Locate build tool executables using paths exported by LLVM/MLIR packages.
 if(NOT MLIR_OPT_EXECUTABLE)
     set(_mlir_opt_hints)
@@ -125,6 +136,11 @@ if(WITH_AMDGPU)
   message(STATUS "AMDGPU support enabled")
   find_package(hip REQUIRED)
 
+  # Device bitcode must be read by the same LLVM version that produced it.
+  # ROCm's bundled clang can be older than the LLVM used to build Ave.
+  find_program(AVE_LANG_AMDGPU_CLANG_EXECUTABLE NAMES clang
+               HINTS "${LLVM_TOOLS_BINARY_DIR}" NO_DEFAULT_PATH REQUIRED)
+
   # Extract ROCm paths from HIP package detection
   set(ROCM_ROOT_PATH "${HIP_PACKAGE_PREFIX_DIR}")
   set(ROCM_DEVICE_LIBRARY_PATH "${ROCM_ROOT_PATH}/amdgcn/bitcode")
@@ -138,7 +154,7 @@ else()
 endif()
 
 include_directories(include lib)
-include_directories(${LLVM_INCLUDE_DIRS} ${CLANG_INCLUDE_DIRS})
+include_directories(${LLVM_INCLUDE_DIRS} ${MLIR_INCLUDE_DIRS} ${CLANG_INCLUDE_DIRS})
 
 file(MAKE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/include/avelang)
 configure_file(

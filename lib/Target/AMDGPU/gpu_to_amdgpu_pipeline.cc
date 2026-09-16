@@ -10,7 +10,11 @@
 #include <mlir/Conversion/ReconcileUnrealizedCasts/ReconcileUnrealizedCasts.h>
 #include <mlir/Conversion/SCFToControlFlow/SCFToControlFlow.h>
 #include <mlir/Dialect/AMDGPU/Utils/Chipset.h>
+#if __has_include(<mlir/Dialect/Affine/Transforms/Passes.h>)
+#include <mlir/Dialect/Affine/Transforms/Passes.h>
+#else
 #include <mlir/Dialect/Affine/Passes.h>
+#endif
 #include <mlir/Dialect/Bufferization/Transforms/OneShotAnalysis.h>
 #include <mlir/Dialect/Bufferization/Transforms/Passes.h>
 #include <mlir/Dialect/GPU/IR/GPUDialect.h>

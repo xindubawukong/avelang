@@ -1,3 +1,5 @@
+ave_lang_llvm_libraries(ave_llvm_libs AMDGPU asmprinter bitwriter codegen target core support)
+
 add_library(ave-lang-target-amdgpu
   gpu_to_amdgpu_pipeline.cc
   legalize_gpu_shuffle_to_idx_pass.cc
@@ -31,15 +33,7 @@ target_link_libraries(ave-lang-target-amdgpu
   MLIRMemRefTransforms
   ave-lang-mlir
   ave-lang-dialect-transforms
-  LLVMAMDGPUCodeGen
-  LLVMAMDGPUInfo
-  LLVMAMDGPUDesc
-  LLVMAsmPrinter
-  LLVMBitWriter
-  LLVMCodeGen
-  LLVMTarget
-  LLVMCore
-  LLVMSupport
+  ${ave_llvm_libs}
   clangDriver
 )
 

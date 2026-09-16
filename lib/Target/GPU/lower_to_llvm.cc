@@ -10,6 +10,7 @@
 #include "gpu_backend.h"
 #include "gpu_passes.h"
 
+#include <llvm/Config/llvm-config.h>
 #include <llvm/IR/Function.h>
 #include <llvm/IR/LLVMContext.h>
 #include <llvm/MC/TargetRegistry.h>
@@ -114,7 +115,11 @@ class LowerToLLVM::Impl {
             ::mlir::registerConvertFuncToLLVMInterface(registry);
             ::mlir::index::registerConvertIndexToLLVMInterface(registry);
             ::mlir::LLVM::registerInlinerInterface(registry);
+#if LLVM_VERSION_MAJOR < 24
             ::mlir::NVVM::registerInlinerInterface(registry);
+#else
+            // LLVM 24 registers this interface when loading the NVVM dialect.
+#endif
             ::mlir::registerConvertMathToLLVMInterface(registry);
             ::mlir::registerConvertMemRefToLLVMInterface(registry);
             ::mlir::registerConvertNVVMToLLVMInterface(registry);

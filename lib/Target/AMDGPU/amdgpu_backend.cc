@@ -20,6 +20,9 @@
 #include <llvm/Support/raw_ostream.h>
 #include <llvm/Target/TargetMachine.h>
 #include <llvm/Target/TargetOptions.h>
+#if __has_include(<llvm/TargetParser/AMDGPUTargetParser.h>)
+#include <llvm/TargetParser/AMDGPUTargetParser.h>
+#endif
 #include <llvm/TargetParser/TargetParser.h>
 #include <llvm/TargetParser/Triple.h>
 #include <map>

@@ -14,7 +14,7 @@ SUPPORTED_ARCHES = {"gfx940", "gfx941", "gfx942", "gfx950"}
 def supports_packed_f8_conversion() -> bool:
     if not has_rocm():
         return False
-    props = torch.cuda.get_device_properties(0)
+    props = torch.cuda.get_device_properties(torch.cuda.current_device())
     arch = str(getattr(props, "gcnArchName", "")).split(":", 1)[0]
     return arch in SUPPORTED_ARCHES
 
@@ -31,6 +31,19 @@ def kernel_packed_f8_conversion(
     bf8_high[0] = S.amdgpu.cvt_pk_bf8_f32(src_a[0], src_b[0], old[0], 1)
 
 
+@avelang.jit
+def kernel_unpack_bf8(
+    packed: S.Tensor((1,), S.u32),
+    unpacked: S.Tensor((4,), S.f32),
+):
+    low = S.amdgpu.cvt_pk_f32_bf8(packed[0], 0)
+    high = S.amdgpu.cvt_pk_f32_bf8(packed[0], 1)
+    unpacked[0] = low[0]
+    unpacked[1] = low[1]
+    unpacked[2] = high[0]
+    unpacked[3] = high[1]
+
+
 def packed_pair(src_a: torch.Tensor, src_b: torch.Tensor, dtype: torch.dtype) -> int:
     values = torch.cat((src_a, src_b)).to(dtype).view(torch.uint8)
     return values[0].item() | (values[1].item() << 8)
@@ -38,7 +51,7 @@ def packed_pair(src_a: torch.Tensor, src_b: torch.Tensor, dtype: torch.dtype) ->
 
 @unittest.skipUnless(
     supports_packed_f8_conversion(),
-    "Requires a gfx940/gfx941/gfx942 ROCm GPU.",
+    "Requires a gfx940/gfx941/gfx942/gfx950 ROCm GPU.",
 )
 class TestAMDGPUPackedF8Conversion(unittest.TestCase):
     def test_packed_fp8_and_bf8_conversion(self):
@@ -52,16 +65,43 @@ class TestAMDGPUPackedF8Conversion(unittest.TestCase):
             src_a, src_b, old, fp8_low, bf8_high
         )
 
+        # CDNA4 uses OCP FP8 encodings; CDNA3 uses FNUZ encodings with
+        # different exponent biases, even for ordinary values like 1 and 2.
+        props = torch.cuda.get_device_properties(src_a.device)
+        arch = props.gcnArchName.split(":", 1)[0]
+        if arch == "gfx950":
+            fp8_dtype, bf8_dtype = torch.float8_e4m3fn, torch.float8_e5m2
+        else:
+            fp8_dtype, bf8_dtype = torch.float8_e4m3fnuz, torch.float8_e5m2fnuz
+
         old_bits = old.item() & 0xFFFFFFFF
         expected_fp8_low = (old_bits & 0xFFFF0000) | packed_pair(
-            src_a, src_b, torch.float8_e4m3fnuz
+            src_a, src_b, fp8_dtype
         )
         expected_bf8_high = (old_bits & 0x0000FFFF) | (
-            packed_pair(src_a, src_b, torch.float8_e5m2fnuz) << 16
+            packed_pair(src_a, src_b, bf8_dtype) << 16
         )
 
         self.assertEqual(fp8_low.item() & 0xFFFFFFFF, expected_fp8_low)
         self.assertEqual(bf8_high.item() & 0xFFFFFFFF, expected_bf8_high)
+
+    def test_unpack_bf8(self):
+        props = torch.cuda.get_device_properties(torch.cuda.current_device())
+        arch = props.gcnArchName.split(":", 1)[0]
+        dtype = torch.float8_e5m2 if arch == "gfx950" else torch.float8_e5m2fnuz
+        values = torch.tensor(
+            [0.5, -1.0, 2.0, -4.0],
+            dtype=dtype,
+            device="cuda",
+        )
+        packed = values.view(torch.uint8).cpu()
+        packed_u32 = sum(int(packed[i]) << (8 * i) for i in range(4))
+        src = torch.tensor([packed_u32], dtype=torch.uint32, device="cuda")
+        unpacked = torch.empty((4,), dtype=torch.float32, device="cuda")
+
+        kernel_unpack_bf8[lambda: ((1, 1, 1), (1, 1, 1))](src, unpacked)
+
+        torch.testing.assert_close(unpacked.cpu(), values.float().cpu())
 
 
 if __name__ == "__main__":

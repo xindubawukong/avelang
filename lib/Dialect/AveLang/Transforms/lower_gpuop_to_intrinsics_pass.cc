@@ -2,6 +2,7 @@
 #include "AveLangOps.h"
 #include "IR/Intrinsics/amdgpu_mfma_signatures.h"
 #include "IR/Intrinsics/intrinsic_support.h"
+#include "IR/constant_folder.h"
 #include "Utils/assert.h"
 
 #include <mlir/Dialect/Arith/IR/Arith.h>
@@ -24,6 +25,7 @@
 #include <llvm/ADT/STLExtras.h>
 #include <llvm/ADT/SmallString.h>
 #include <llvm/ADT/SmallVector.h>
+#include <llvm/Config/llvm-config.h>
 #include <llvm/Support/Casting.h>
 #include <llvm/Support/ErrorHandling.h>
 #include <llvm/Support/raw_ostream.h>
@@ -553,7 +555,15 @@ class AMDGPURawBufferLoadLowering
         auto rsrc = op.getRsrc();
         auto vindex = op.getVindex();
         auto soffset = op.getSoffset();
+#if LLVM_VERSION_MAJOR >= 24
+        auto auxValue = ir::ConstantFolder::FoldIntValue(op.getAux());
+        if (!auxValue)
+            return op.emitOpError(
+                "buffer cache policy must be a compile-time integer");
+        auto aux = rewriter.getI32IntegerAttr(*auxValue);
+#else
         auto aux = op.getAux();
+#endif
         auto resultType = op.getResult().getType();
 
         auto loadOp = mlir::ROCDL::RawBufferLoadOp::create(
@@ -575,7 +585,15 @@ class AMDGPURawBufferStoreLowering
         auto rsrc = op.getRsrc();
         auto vindex = op.getVindex();
         auto soffset = op.getSoffset();
+#if LLVM_VERSION_MAJOR >= 24
+        auto auxValue = ir::ConstantFolder::FoldIntValue(op.getAux());
+        if (!auxValue)
+            return op.emitOpError(
+                "buffer cache policy must be a compile-time integer");
+        auto aux = rewriter.getI32IntegerAttr(*auxValue);
+#else
         auto aux = op.getAux();
+#endif
 
         mlir::ROCDL::RawBufferStoreOp::create(rewriter, op.getLoc(), data, rsrc,
                                               vindex, soffset, aux);

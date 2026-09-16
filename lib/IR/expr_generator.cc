@@ -1129,10 +1129,11 @@ mlir::Value ExprGenerator::VisitConstant(ast::Constant *constant) {
 
     // Try to parse as integer first
     if (auto intValue = ParseConstantInteger(value)) {
-        // For integer constants, we'll use a default i32 type unless context
-        // suggests otherwise This can be extended later to infer type from
-        // usage context
-        auto intType = builder.getI32Type();
+        // Preserve large literal/captured offsets instead of silently
+        // truncating 2-4 GiB buffer sizes to negative i32 values.
+        auto intType = (*intValue >= INT32_MIN && *intValue <= INT32_MAX)
+                           ? builder.getI32Type()
+                           : builder.getI64Type();
 
         // Create integer constant using ConstantOp instead of deprecated
         // ConstantIndexOp for portability
@@ -1595,9 +1596,11 @@ mlir::Value ExprGenerator::VisitCall(ast::Call *call) {
                     }
                     resolved_args[0] = loaded;
                 }
-            } else if (symbol_name.rfind("raw_buffer_store_x", 0) == 0) {
+            } else if (symbol_name.rfind("raw_buffer_store_", 0) == 0 ||
+                       symbol_name.rfind("raw_buffer_atomic_", 0) == 0) {
                 auto widthOpt = ParseIntAfterMarker(symbol_name, "_x");
-                int width = widthOpt.value_or(0);
+                int width = widthOpt.value_or(
+                    symbol_name == "raw_buffer_atomic_add_bf16x2" ? 2 : 1);
                 if (resolved_args.size() > 0 && resolved_args[0] &&
                     mlir::isa<cf::MemRefType>(resolved_args[0].getType())) {
                     mlir::Value loaded;

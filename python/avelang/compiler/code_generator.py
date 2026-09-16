@@ -3,6 +3,7 @@ import json
 import types
 
 import _avelang_bindings as _C
+from .static_range import expand_static_ranges
 
 
 class _LocalNameCollector(ast.NodeVisitor):
@@ -81,7 +82,7 @@ class _LocalNameCollector(ast.NodeVisitor):
         self.generic_visit(node.value)
 
 
-def _serialize_constexprs(src) -> str:
+def _serialize_constexprs(src, *, include_globals=True) -> str:
     constants = getattr(src, "constants", None) or {}
     global_constants = getattr(src, "global_constants", None) or {}
     if not constants and not global_constants:
@@ -96,7 +97,7 @@ def _serialize_constexprs(src) -> str:
                 "value": info["value"],
             }
         )
-    for name, info in global_constants.items():
+    for name, info in global_constants.items() if include_globals else ():
         constexprs_list.append(
             {
                 "name": name,
@@ -122,11 +123,69 @@ def _serialize_global_constexprs(global_constants) -> str:
     return json.dumps(constexprs_list)
 
 
-def _get_function_def(py_module: ast.AST) -> ast.FunctionDef:
+def _get_function_def(py_module: ast.AST, constants=None) -> ast.FunctionDef:
     for node in getattr(py_module, "body", []):
         if isinstance(node, ast.FunctionDef):
-            return node
+            return expand_static_ranges(node, constants)
     raise ValueError("FunctionDef not found in parsed AST")
+
+
+def _materialize_numeric_captures(jit_callable):
+    """Bind each helper's numeric captures before sharing its AST with C++.
+
+    Address-space specialization can regenerate a helper in its caller's
+    context. Its closure values must not resolve through the caller's globals.
+    Keep JITCallable.parse() unchanged so cache dependency tracking still sees
+    the original global names.
+    """
+    module = jit_callable.parse()
+    captures = {}
+    scope = jit_callable.get_capture_scope()
+    used_names = {node.id for node in ast.walk(module) if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load)}
+    for name in used_names & scope.keys():
+        value = scope[name]
+        value = getattr(value, "value", value)
+        if isinstance(value, (bool, int, float)):
+            captures[name] = (
+                bool(value) if isinstance(value, bool) else int(value) if isinstance(value, int) else float(value)
+            )
+
+    class BindCaptures(ast.NodeTransformer):
+        def __init__(self):
+            self.locals = []
+
+        def visit_FunctionDef(self, node):
+            collector = _LocalNameCollector()
+            for statement in node.body:
+                collector.visit(statement)
+            args = node.args
+            names = collector.names | {arg.arg for arg in args.posonlyargs + args.args + args.kwonlyargs}
+            self.locals.append(names)
+            node = self.generic_visit(node)
+            self.locals.pop()
+            return node
+
+        def visit_Name(self, node):
+            if (
+                isinstance(node.ctx, ast.Load)
+                and node.id in captures
+                and not any(node.id in names for names in self.locals)
+            ):
+                return ast.copy_location(ast.Constant(value=captures[node.id]), node)
+            return node
+
+    return ast.fix_missing_locations(BindCaptures().visit(module))
+
+
+def _prepare_jit_dependencies(jit_deps):
+    """Expand loops before both eager generation and lazy specialization."""
+    prepared = []
+    for dep in jit_deps:
+        module = expand_static_ranges(_materialize_numeric_captures(dep), {})
+        # Captures now live in this AST. Injecting them into the shared module
+        # would also make unrelated helper locals accidentally immutable.
+        prepared.append((module, {}))
+    return prepared
 
 
 class DependenciesFinder(ast.NodeVisitor):
@@ -252,7 +311,7 @@ def _build_import_module(jit_fns: list) -> ast.Module:
 
 
 def compile_to_binary(src, target, opt_level: int = 2, options=None):
-    constexprs_json = _serialize_constexprs(src)
+    constexprs_json = _serialize_constexprs(src, include_globals=False)
 
     jit_deps = _collect_jit_dependencies(src.fn)
     import_module = _build_import_module([src.fn, *jit_deps])
@@ -260,18 +319,17 @@ def compile_to_binary(src, target, opt_level: int = 2, options=None):
     generator = _C.MLIRGenerator()
     generator.generate_from_python_ast(import_module)
 
-    for dep in jit_deps:
-        generator.add_jit_dependency(dep.parse())
+    prepared_deps = _prepare_jit_dependencies(jit_deps)
+    for module, _ in prepared_deps:
+        generator.add_jit_dependency(module)
 
-    for dep in jit_deps:
-        dep_func = _get_function_def(dep.parse())
-        dep_globals = {}
-        collect_globals = getattr(dep, "_collect_global_constexprs", None)
-        if callable(collect_globals):
-            dep_globals = collect_globals()
-        generator.visit_function_def(dep_func, _serialize_global_constexprs(dep_globals), "jit")
+    for module, constants in prepared_deps:
+        dep_func = _get_function_def(module, constants)
+        generator.visit_function_def(dep_func, _serialize_global_constexprs(constants), "jit")
 
-    kernel_func = _get_function_def(src.fn.parse())
+    kernel_func = _get_function_def(
+        _materialize_numeric_captures(src.fn), {c["name"]: c["value"] for c in json.loads(constexprs_json)}
+    )
     generator.visit_function_def(kernel_func, constexprs_json, "kernel")
 
     num_warps = getattr(options, "num_warps", -1)

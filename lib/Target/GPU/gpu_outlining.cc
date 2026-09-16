@@ -14,6 +14,7 @@
 #pragma clang diagnostic pop
 
 #include <llvm/ADT/SmallVector.h>
+#include <llvm/Config/llvm-config.h>
 
 namespace causalflow::avelang::target::gpu {
 
@@ -107,8 +108,12 @@ class GpuOutliningPass
                     mlir::TypeRange{}, // workgroup attributions
                     mlir::TypeRange{}  // private attributions
                 );
+#if LLVM_VERSION_MAJOR >= 24
+                gpuFunc.setKernel(true);
+#else
                 gpuFunc->setAttr(mlir::gpu::GPUDialect::getKernelFuncAttrName(),
                                  builder.getUnitAttr());
+#endif
 
                 // Copy function body
                 mlir::IRMapping mapping;

@@ -11,6 +11,9 @@
 #include <mlir/Pass/PassManager.h>
 #include <mlir/Transforms/Passes.h>
 
+#include <llvm/Config/llvm-config.h>
+#include <llvm/IR/Constants.h>
+#include <llvm/IR/Instructions.h>
 #include <llvm/IR/LLVMContext.h>
 #include <llvm/IR/Module.h>
 #include <llvm/IR/Verifier.h>
@@ -96,10 +99,10 @@ class LLVMTargetTest : public ::testing::Test {
         auto module = mlir::parseSourceString<mlir::ModuleOp>(
             mlirCode, compiler.getContext());
         EXPECT_TRUE(module);
-        EXPECT_TRUE(mlir::succeeded(mlir::verify(*module)));
         if (!module) {
             return nullptr;
         }
+        EXPECT_TRUE(mlir::succeeded(mlir::verify(*module)));
 
         if (mlirDump) {
             llvm::raw_string_ostream mlirOs(*mlirDump);
@@ -424,11 +427,36 @@ TEST_F(LLVMTargetTest, SharedMemoryUnionStyleSubviews) {
     ASSERT_NE(llvmModule, nullptr);
     EXPECT_NE(llvmDump.find("addrspace(3) global [32 x i8] undef"),
               std::string::npos);
-    EXPECT_NE(llvmDump.find(
-                  "store <2 x bfloat> <bfloat 0xR3F80, bfloat 0xR4000>, "
-                  "ptr addrspace(3) @__wg_test_shared_memory_union_subviews_0, "
-                  "align 16"),
-              std::string::npos);
+    // Check values and alignment rather than the version-dependent spelling
+    // of bfloat constants (hexadecimal in LLVM 22, decimal in LLVM 24).
+    auto *shared =
+        llvmModule->getNamedGlobal("__wg_test_shared_memory_union_subviews_0");
+    ASSERT_NE(shared, nullptr);
+    bool foundStore = false;
+    for (auto &func : *llvmModule)
+        for (auto &block : func)
+            for (auto &inst : block) {
+                auto *store = llvm::dyn_cast<llvm::StoreInst>(&inst);
+                if (!store || store->getPointerOperand() != shared)
+                    continue;
+                auto *value =
+                    llvm::dyn_cast<llvm::Constant>(store->getValueOperand());
+                ASSERT_NE(value, nullptr);
+                ASSERT_EQ(value->getType(),
+                          llvm::FixedVectorType::get(
+                              llvm::Type::getBFloatTy(llvmContext_), 2));
+                EXPECT_EQ(store->getAlign(), llvm::Align(16));
+                auto *first = llvm::dyn_cast<llvm::ConstantFP>(
+                    value->getAggregateElement(0u));
+                auto *second = llvm::dyn_cast<llvm::ConstantFP>(
+                    value->getAggregateElement(1u));
+                ASSERT_NE(first, nullptr);
+                ASSERT_NE(second, nullptr);
+                EXPECT_TRUE(first->isExactlyValue(1.0));
+                EXPECT_TRUE(second->isExactlyValue(2.0));
+                foundStore = true;
+            }
+    EXPECT_TRUE(foundStore) << llvmDump;
 }
 
 TEST_F(LLVMTargetTest, SharedMemorySubviewLayoutCastLowers) {
@@ -530,7 +558,13 @@ TEST_F(LLVMTargetTest, AMDGPUSchedGroupBarrierLowers) {
 module {
   gpu.module @kernels {
     gpu.func @sched_group_barrier_kernel() kernel {
-      rocdl.sched.group.barrier 2, 4, 1
+      rocdl.sched.group.barrier )"
+#if LLVM_VERSION_MAJOR >= 24
+                                 "valu"
+#else
+                                 "2"
+#endif
+                                 R"(, 4, 1
       gpu.return
     }
   }
@@ -678,7 +712,24 @@ module {
     auto llvmModule = CompileToLLVM(mlirCode, nullptr, &llvmDump);
     ASSERT_NE(llvmModule, nullptr);
 
-    EXPECT_NE(llvmDump.find("store <2 x i32>"), std::string::npos) << llvmDump;
+    // LLVM may combine the four outputs into two vector<2> stores or one
+    // vector<4> store. Both must still write all four i32 shuffle results.
+    unsigned storedElements = 0;
+    for (auto &func : *llvmModule)
+        for (auto &block : func)
+            for (auto &inst : block)
+                if (auto *store = llvm::dyn_cast<llvm::StoreInst>(&inst)) {
+                    auto *type = store->getValueOperand()->getType();
+                    if (auto *vector =
+                            llvm::dyn_cast<llvm::FixedVectorType>(type)) {
+                        EXPECT_TRUE(vector->getElementType()->isIntegerTy(32));
+                        storedElements += vector->getNumElements();
+                    } else {
+                        EXPECT_TRUE(type->isIntegerTy(32));
+                        ++storedElements;
+                    }
+                }
+    EXPECT_EQ(storedElements, 4u) << llvmDump;
 }
 #endif
 

@@ -1,6 +1,8 @@
 #include "AST/ast_nodes_expr.h"
 #include "Dialect/AveLang/IR/AveLangOps.h"
 #include "IR/Intrinsics/amdgpu_mfma_signatures.h"
+#include "IR/Intrinsics/amdgpu_mxfp4.h"
+#include "IR/Intrinsics/amdgpu_sync.h"
 #include "IR/builtin_module.h"
 #include "IR/constant_folder.h"
 #include "IR/generator_context.h"
@@ -10,6 +12,7 @@
 #include "Utils/assert.h"
 #include "Utils/embedded_filesystem_view.h"
 #include "intrinsic_support.h"
+#include <llvm/Config/llvm-config.h>
 
 #include <mlir/Dialect/Arith/IR/Arith.h>
 #include <mlir/Dialect/Func/IR/FuncOps.h>
@@ -92,9 +95,9 @@ class AMDGPUIntrinsic : public NamedModule {
     mlir::Value CreateRawBufferLoadX4Function(
         ast::Call *call_expr, GeneratorContext *ctx,
         llvm::ArrayRef<mlir::Value> resolved_args) const;
-    mlir::Value CreateRawBufferLoadX1LdsFunction(
+    mlir::Value CreateRawBufferLoadLdsFunction(
         ast::Call *call_expr, GeneratorContext *ctx,
-        llvm::ArrayRef<mlir::Value> resolved_args) const;
+        llvm::ArrayRef<mlir::Value> resolved_args, int width) const;
     mlir::Value CreateRawBufferStoreX1Function(
         ast::Call *call_expr, GeneratorContext *ctx,
         llvm::ArrayRef<mlir::Value> resolved_args) const;
@@ -110,6 +113,9 @@ class AMDGPUIntrinsic : public NamedModule {
     mlir::Value
     CreatePermFunction(ast::Call *call_expr, GeneratorContext *ctx,
                        llvm::ArrayRef<mlir::Value> resolved_args) const;
+    mlir::Value
+    CreateBitReverseFunction(ast::Call *call_expr, GeneratorContext *ctx,
+                             llvm::ArrayRef<mlir::Value> resolved_args) const;
     mlir::Value
     CreateGetDppFunction(ast::Call *call_expr, GeneratorContext *ctx,
                          llvm::ArrayRef<mlir::Value> resolved_args) const;
@@ -140,6 +146,9 @@ class AMDGPUIntrinsic : public NamedModule {
     mlir::Value CreateCvtPkBf8F32Function(
         ast::Call *call_expr, GeneratorContext *ctx,
         llvm::ArrayRef<mlir::Value> resolved_args) const;
+    mlir::Value CreateCvtPkF32Bf8Function(
+        ast::Call *call_expr, GeneratorContext *ctx,
+        llvm::ArrayRef<mlir::Value> resolved_args) const;
     mlir::Value
     CreateSetPrioFunction(ast::Call *call_expr, GeneratorContext *ctx,
                           llvm::ArrayRef<mlir::Value> resolved_args) const;
@@ -165,9 +174,9 @@ class AMDGPUIntrinsic : public NamedModule {
     bool CheckGenericRawBufferLoadFunction(
         ast::Call *call_expr, GeneratorContext *ctx,
         llvm::ArrayRef<mlir::Value> resolved_args, int width) const;
-    bool CheckRawBufferLoadX1LdsFunction(
+    bool CheckRawBufferLoadLdsFunction(
         ast::Call *call_expr, GeneratorContext *ctx,
-        llvm::ArrayRef<mlir::Value> resolved_args) const;
+        llvm::ArrayRef<mlir::Value> resolved_args, int width) const;
 
     bool CheckGenericRawBufferStoreFunction(
         ast::Call *call_expr, GeneratorContext *ctx,
@@ -177,6 +186,9 @@ class AMDGPUIntrinsic : public NamedModule {
                                llvm::ArrayRef<mlir::Value> resolved_args) const;
     bool CheckPermFunction(ast::Call *call_expr, GeneratorContext *ctx,
                            llvm::ArrayRef<mlir::Value> resolved_args) const;
+    bool CheckBitReverseFunction(
+        ast::Call *call_expr, GeneratorContext *ctx,
+        llvm::ArrayRef<mlir::Value> resolved_args) const;
     bool CheckGetDppFunction(ast::Call *call_expr, GeneratorContext *ctx,
                              llvm::ArrayRef<mlir::Value> resolved_args) const;
     bool CheckRcpFunction(ast::Call *call_expr, GeneratorContext *ctx,
@@ -202,6 +214,9 @@ class AMDGPUIntrinsic : public NamedModule {
         ast::Call *call_expr, GeneratorContext *ctx,
         llvm::ArrayRef<mlir::Value> resolved_args,
         llvm::StringRef intrinsic_name) const;
+    bool CheckCvtPkF32Bf8Function(
+        ast::Call *call_expr, GeneratorContext *ctx,
+        llvm::ArrayRef<mlir::Value> resolved_args) const;
     bool CheckSetPrioFunction(
         ast::Call *call_expr, GeneratorContext *ctx,
         llvm::ArrayRef<mlir::Value> resolved_args) const;
@@ -210,6 +225,9 @@ class AMDGPUIntrinsic : public NamedModule {
 AMDGPUIntrinsic::AMDGPUIntrinsic() : NamedModule("amdgpu") {}
 
 void AMDGPUIntrinsic::Initialize() {
+    const auto addIntrinsic = [this](const char *name, SymbolScope::Function fn) {
+        AddFunction(name, fn.implementation, fn.checker);
+    };
     for (const auto &config : amdgpu_mfma::MFMAConfig::GetConfigs()) {
         AddFunction(
             config.name.str(),
@@ -225,6 +243,8 @@ void AMDGPUIntrinsic::Initialize() {
                                                 resolved_args);
             });
     }
+
+    addIntrinsic("mfma_scale_16x16x128_fp4", intrinsics::MxFp4ScaledMfma());
 
     AddFunction(
         "make_rsrc",
@@ -249,6 +269,17 @@ void AMDGPUIntrinsic::Initialize() {
         });
 
     AddFunction(
+        "bitreverse",
+        [this](ast::Call *call_expr, GeneratorContext *gen_ctx,
+               llvm::ArrayRef<mlir::Value> resolved_args) -> mlir::Value {
+            return CreateBitReverseFunction(call_expr, gen_ctx, resolved_args);
+        },
+        [this](ast::Call *call_expr, GeneratorContext *gen_ctx,
+               llvm::ArrayRef<mlir::Value> resolved_args) -> bool {
+            return CheckBitReverseFunction(call_expr, gen_ctx, resolved_args);
+        });
+
+    AddFunction(
         "get_dpp",
         [this](ast::Call *call_expr, GeneratorContext *gen_ctx,
                llvm::ArrayRef<mlir::Value> resolved_args) -> mlir::Value {
@@ -258,6 +289,8 @@ void AMDGPUIntrinsic::Initialize() {
                llvm::ArrayRef<mlir::Value> resolved_args) -> bool {
             return CheckGetDppFunction(call_expr, gen_ctx, resolved_args);
         });
+
+    addIntrinsic("ds_swizzle", intrinsics::DsSwizzle());
 
     AddFunction(
         "rcp",
@@ -269,6 +302,8 @@ void AMDGPUIntrinsic::Initialize() {
                llvm::ArrayRef<mlir::Value> resolved_args) -> bool {
             return CheckRcpFunction(call_expr, gen_ctx, resolved_args);
         });
+
+    addIntrinsic("maximum_f32", intrinsics::MaximumF32());
 
     AddFunction(
         "s_waitcnt",
@@ -344,18 +379,22 @@ void AMDGPUIntrinsic::Initialize() {
                                                      resolved_args, 4);
         });
 
-    AddFunction(
-        "raw_buffer_load_x1_lds",
-        [this](ast::Call *call_expr, GeneratorContext *gen_ctx,
-               llvm::ArrayRef<mlir::Value> resolved_args) -> mlir::Value {
-            return CreateRawBufferLoadX1LdsFunction(call_expr, gen_ctx,
-                                                    resolved_args);
-        },
-        [this](ast::Call *call_expr, GeneratorContext *gen_ctx,
-               llvm::ArrayRef<mlir::Value> resolved_args) -> bool {
-            return CheckRawBufferLoadX1LdsFunction(call_expr, gen_ctx,
-                                                   resolved_args);
-        });
+    for (int width : {1, 4}) {
+        AddFunction(
+            "raw_buffer_load_x" + std::to_string(width) + "_lds",
+            [this, width](ast::Call *call_expr, GeneratorContext *gen_ctx,
+                          llvm::ArrayRef<mlir::Value> resolved_args) -> mlir::Value {
+                return CreateRawBufferLoadLdsFunction(call_expr, gen_ctx,
+                                                      resolved_args, width);
+            },
+            [this, width](ast::Call *call_expr, GeneratorContext *gen_ctx,
+                          llvm::ArrayRef<mlir::Value> resolved_args) -> bool {
+                return CheckRawBufferLoadLdsFunction(call_expr, gen_ctx,
+                                                     resolved_args, width);
+            });
+    }
+
+    addIntrinsic("raw_buffer_store_u8", intrinsics::BufferStoreU8());
 
     AddFunction(
         "raw_buffer_store_x1",
@@ -396,6 +435,10 @@ void AMDGPUIntrinsic::Initialize() {
                                                       resolved_args, 4);
         });
 
+    addIntrinsic("compiler_barrier", intrinsics::CompilerBarrier());
+    addIntrinsic("fence", intrinsics::Fence());
+    addIntrinsic("s_sleep", intrinsics::Sleep());
+
     AddFunction(
         "sched_barrier",
         [this](ast::Call *call_expr, GeneratorContext *gen_ctx,
@@ -421,6 +464,10 @@ void AMDGPUIntrinsic::Initialize() {
             return CheckSchedGroupBarrierFunction(call_expr, gen_ctx,
                                                   resolved_args);
         });
+
+    addIntrinsic("raw_buffer_atomic_add_u32", intrinsics::BufferAtomicI32(false));
+    addIntrinsic("raw_buffer_atomic_or_u32", intrinsics::BufferAtomicI32(true));
+    addIntrinsic("raw_buffer_atomic_add_bf16x2", intrinsics::BufferAtomicAddBf16x2());
 
     AddFunction(
         "atomic_add",
@@ -460,6 +507,21 @@ void AMDGPUIntrinsic::Initialize() {
             return CheckCvtPkF8F32Function(call_expr, gen_ctx, resolved_args,
                                             "cvt_pk_bf8_f32");
         });
+
+    AddFunction(
+        "cvt_pk_f32_bf8",
+        [this](ast::Call *call_expr, GeneratorContext *gen_ctx,
+               llvm::ArrayRef<mlir::Value> resolved_args) -> mlir::Value {
+            return CreateCvtPkF32Bf8Function(call_expr, gen_ctx,
+                                              resolved_args);
+        },
+        [this](ast::Call *call_expr, GeneratorContext *gen_ctx,
+               llvm::ArrayRef<mlir::Value> resolved_args) -> bool {
+            return CheckCvtPkF32Bf8Function(call_expr, gen_ctx,
+                                             resolved_args);
+        });
+
+    addIntrinsic("cvt_scalef32_pk_fp4_f32", intrinsics::MxFp4Pack());
 
     AddFunction(
         "s_setprio",
@@ -651,21 +713,13 @@ mlir::Value AMDGPUIntrinsic::CreateRawBufferLoadX4Function(
     return CreateGenericRawBufferLoadFunction(call_expr, ctx, resolved_args, 4);
 }
 
-mlir::Value AMDGPUIntrinsic::CreateRawBufferLoadX1LdsFunction(
+mlir::Value AMDGPUIntrinsic::CreateRawBufferLoadLdsFunction(
     ast::Call *call_expr, GeneratorContext *ctx,
-    llvm::ArrayRef<mlir::Value> resolved_args) const {
+    llvm::ArrayRef<mlir::Value> resolved_args, int width) const {
     auto &builder = ctx->GetCurrentFunctionGenerator()->GetBuilder();
     auto location = builder.getUnknownLoc();
-    auto size = ConstantFolder::FoldIntValue(resolved_args[2]);
-    auto aux = ConstantFolder::FoldIntValue(resolved_args[6]);
-
-    if (!size || *size != 4 || !aux || *aux != 0) {
-        ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
-                                        call_expr->GetSourceRange().getBegin())
-            << "raw_buffer_load_x1_lds currently requires compile-time "
-               "size=4 and aux=0";
+    if (!CheckRawBufferLoadLdsFunction(call_expr, ctx, resolved_args, width))
         return nullptr;
-    }
 
     auto ldsPtr = cf::AveLangMemRefExtractAlignedPointerAsIndexOp::create(
         builder, location, builder.getIndexType(), resolved_args[1]);
@@ -673,13 +727,23 @@ mlir::Value AMDGPUIntrinsic::CreateRawBufferLoadX1LdsFunction(
     auto ldsPtrWithOffset =
         mlir::arith::AddIOp::create(builder, location, ldsPtr, rawOffset);
 
-    auto funcName = intrinsics::MakeIntrinsicFuncName(
-        "amdgpu", "llvm_amdgcn_raw_buffer_load_lds_u32");
-    mlir::func::CallOp::create(
-        builder, location, funcName, mlir::TypeRange{},
-        mlir::ValueRange{resolved_args[0], ldsPtrWithOffset,
+    auto address = mlir::arith::IndexCastOp::create(
+        builder, location, builder.getI64Type(), ldsPtrWithOffset);
+    auto pointer = mlir::LLVM::IntToPtrOp::create(
+        builder, location,
+        mlir::LLVM::LLVMPointerType::get(builder.getContext(), 3),
+        address.getResult(), nullptr);
+    auto bytes = mlir::arith::ConstantIntOp::create(builder, location, width * 4, 32);
+    auto zero = mlir::arith::ConstantIntOp::create(builder, location, 0, 32);
+    auto aux = mlir::arith::ConstantIntOp::create(
+        builder, location, *ConstantFolder::FoldIntValue(resolved_args[6]), 32);
+    mlir::LLVM::CallIntrinsicOp::create(
+        builder, location,
+        builder.getStringAttr("llvm.amdgcn.raw.buffer.load.lds"),
+        mlir::ValueRange{resolved_args[0], pointer, bytes,
                          ConvertToI32(builder, location, resolved_args[3]),
-                         ConvertToI32(builder, location, resolved_args[4])});
+                         ConvertToI32(builder, location, resolved_args[4]),
+                         zero, aux});
 
     return ctx->GetCurrentFunctionGenerator()
         ->GetExprGenerator()
@@ -856,6 +920,7 @@ mlir::Value AMDGPUIntrinsic::CreateReadFirstLaneFunction(
     auto value = ConvertToI32(builder, location, resolved_args[0]);
     auto op = mlir::ROCDL::ReadfirstlaneOp::create(builder, location,
                                                    value.getType(), value);
+    SetTypeInfo(op.getResult(), GetTypeInfo(resolved_args[0]));
     return op.getResult();
 }
 
@@ -869,6 +934,17 @@ mlir::Value AMDGPUIntrinsic::CreatePermFunction(
     auto callOp = mlir::func::CallOp::create(
         builder, location, funcName, builder.getI32Type(), resolved_args);
     return callOp.getResult(0);
+}
+
+mlir::Value AMDGPUIntrinsic::CreateBitReverseFunction(
+    ast::Call *call_expr, GeneratorContext *ctx,
+    llvm::ArrayRef<mlir::Value> resolved_args) const {
+    auto &builder = ctx->GetCurrentFunctionGenerator()->GetBuilder();
+    auto location = GetCallLocation(ctx, call_expr);
+    auto op = mlir::LLVM::BitReverseOp::create(builder, location,
+                                                resolved_args[0]);
+    SetTypeInfo(op.getResult(), GetTypeInfo(resolved_args[0]));
+    return op.getResult();
 }
 
 mlir::Value AMDGPUIntrinsic::CreateGetDppFunction(
@@ -945,7 +1021,12 @@ mlir::Value AMDGPUIntrinsic::CreateSchedGroupBarrierFunction(
     }
 
     mlir::ROCDL::SchedGroupBarrier::create(
-        builder, location, static_cast<uint32_t>(*mask),
+        builder, location,
+#if LLVM_VERSION_MAJOR >= 24
+        static_cast<mlir::ROCDL::SchedGroupMask>(*mask),
+#else
+        static_cast<uint32_t>(*mask),
+#endif
         static_cast<uint32_t>(*size), static_cast<uint32_t>(*group_id));
 
     return ctx->GetCurrentFunctionGenerator()
@@ -969,8 +1050,13 @@ mlir::Value AMDGPUIntrinsic::CreateSchedBarrierFunction(
         return nullptr;
     }
 
-    mlir::ROCDL::SchedBarrier::create(builder, location,
-                                      static_cast<uint32_t>(*mask));
+    mlir::ROCDL::SchedBarrier::create(
+        builder, location,
+#if LLVM_VERSION_MAJOR >= 24
+        static_cast<mlir::ROCDL::SchedGroupMask>(*mask));
+#else
+        static_cast<uint32_t>(*mask));
+#endif
     return ctx->GetCurrentFunctionGenerator()
         ->GetExprGenerator()
         ->CreateVoidValue();
@@ -1009,6 +1095,21 @@ mlir::Value AMDGPUIntrinsic::CreateCvtPkBf8F32Function(
         call_expr, ctx, resolved_args);
 }
 
+mlir::Value AMDGPUIntrinsic::CreateCvtPkF32Bf8Function(
+    ast::Call *call_expr, GeneratorContext *ctx,
+    llvm::ArrayRef<mlir::Value> resolved_args) const {
+    auto &builder = ctx->GetCurrentFunctionGenerator()->GetBuilder();
+    auto location = GetCallLocation(ctx, call_expr);
+    auto wordSel = ConstantFolder::FoldIntValue(resolved_args[1]);
+    SS_ASSERT(wordSel && (*wordSel == 0 || *wordSel == 1));
+
+    auto resultType = mlir::VectorType::get({2}, builder.getF32Type());
+    auto wordSelAttr = mlir::IntegerAttr::get(builder.getI1Type(), *wordSel);
+    return mlir::ROCDL::CvtPkF32Bf8Op::create(builder, location, resultType,
+                                              resolved_args[0], wordSelAttr)
+        .getResult();
+}
+
 mlir::Value AMDGPUIntrinsic::CreateSetPrioFunction(
     ast::Call *call_expr, GeneratorContext *ctx,
     llvm::ArrayRef<mlir::Value> resolved_args) const {
@@ -1040,8 +1141,8 @@ mlir::Value AMDGPUIntrinsic::CreateGenericRawBufferLoadFunction(
     auto location = GetCallLocation(ctx, call_expr);
 
     auto rsrc = resolved_args[0];
-    auto vindex = resolved_args[1];
-    auto soffset = resolved_args[2];
+    auto vindex = ConvertToI32(builder, location, resolved_args[1]);
+    auto soffset = ConvertToI32(builder, location, resolved_args[2]);
     auto aux = resolved_args[3];
 
     mlir::Type result_type;
@@ -1070,10 +1171,12 @@ mlir::Value AMDGPUIntrinsic::CreateGenericRawBufferStoreFunction(
 
     auto vdata = resolved_args[0];
     auto rsrc = resolved_args[1];
-    auto vindex = resolved_args[2];
-    auto soffset = resolved_args[3];
+    auto vindex = ConvertToI32(builder, location, resolved_args[2]);
+    auto soffset = ConvertToI32(builder, location, resolved_args[3]);
     auto aux = resolved_args[4];
 
+    if (width == 1)
+        vdata = ConvertToI32(builder, location, vdata);
     auto vdata_type = vdata.getType();
 
     if (width > 1) {
@@ -1160,13 +1263,14 @@ bool AMDGPUIntrinsic::CheckGenericRawBufferLoadFunction(
     return true;
 }
 
-bool AMDGPUIntrinsic::CheckRawBufferLoadX1LdsFunction(
+bool AMDGPUIntrinsic::CheckRawBufferLoadLdsFunction(
     ast::Call *call_expr, GeneratorContext *ctx,
-    llvm::ArrayRef<mlir::Value> resolved_args) const {
+    llvm::ArrayRef<mlir::Value> resolved_args, int width) const {
+    const std::string name = "raw_buffer_load_x" + std::to_string(width) + "_lds";
     if (resolved_args.size() != 7) {
         ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
                                         call_expr->GetSourceRange().getBegin())
-            << "raw_buffer_load_x1_lds requires exactly 7 arguments: "
+            << name + " requires exactly 7 arguments: "
                "rsrc, lds_ptr, size, vindex, soffset, offset, aux";
         return false;
     }
@@ -1176,7 +1280,7 @@ bool AMDGPUIntrinsic::CheckRawBufferLoadX1LdsFunction(
             ctx->diagnostic_manager->Report(
                 basic::DiagnosticCode::kUnimplemented,
                 call_expr->GetSourceRange().getBegin())
-                << "Failed to generate operands for raw_buffer_load_x1_lds";
+                << "Failed to generate operands for " + name;
             return false;
         }
     }
@@ -1187,7 +1291,7 @@ bool AMDGPUIntrinsic::CheckRawBufferLoadX1LdsFunction(
         !rsrcVector.getElementType().isInteger(32)) {
         ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
                                         call_expr->GetSourceRange().getBegin())
-            << "raw_buffer_load_x1_lds expects rsrc to be vector<4xi32>";
+            << name + " expects rsrc to be vector<4xi32>";
         return false;
     }
 
@@ -1196,7 +1300,7 @@ bool AMDGPUIntrinsic::CheckRawBufferLoadX1LdsFunction(
     if (!memrefType) {
         ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
                                         call_expr->GetSourceRange().getBegin())
-            << "raw_buffer_load_x1_lds expects lds_ptr to be a memref";
+            << name + " expects lds_ptr to be a memref";
         return false;
     }
 
@@ -1206,7 +1310,7 @@ bool AMDGPUIntrinsic::CheckRawBufferLoadX1LdsFunction(
             ctx->diagnostic_manager->Report(
                 basic::DiagnosticCode::kUnimplemented,
                 call_expr->GetSourceRange().getBegin())
-                << "raw_buffer_load_x1_lds size/vindex/soffset/offset/aux "
+                << name + " size/vindex/soffset/offset/aux "
                    "operands must be integer or index types";
             return false;
         }
@@ -1214,11 +1318,12 @@ bool AMDGPUIntrinsic::CheckRawBufferLoadX1LdsFunction(
 
     auto size = ConstantFolder::FoldIntValue(resolved_args[2]);
     auto aux = ConstantFolder::FoldIntValue(resolved_args[6]);
-    if (!size || *size != 4 || !aux || *aux != 0) {
+    if (!size || *size != width * 4 || !aux || *aux < 0 || *aux > 31) {
         ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
                                         call_expr->GetSourceRange().getBegin())
-            << "raw_buffer_load_x1_lds currently requires compile-time "
-               "size=4 and aux=0";
+            << name +
+                   " requires compile-time size=" + std::to_string(width * 4) +
+                   " and aux in [0, 31]";
         return false;
     }
 
@@ -1460,6 +1565,27 @@ bool AMDGPUIntrinsic::CheckPermFunction(
     return true;
 }
 
+bool AMDGPUIntrinsic::CheckBitReverseFunction(
+    ast::Call *call_expr, GeneratorContext *ctx,
+    llvm::ArrayRef<mlir::Value> resolved_args) const {
+    if (call_expr->GetArgs().size() != 1 || resolved_args.size() != 1 ||
+        !resolved_args[0]) {
+        ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
+                                        call_expr->GetSourceRange().getBegin())
+            << "bitreverse() requires exactly one argument";
+        return false;
+    }
+
+    auto type = mlir::dyn_cast<mlir::IntegerType>(resolved_args[0].getType());
+    if (!type || type.getWidth() != 32) {
+        ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
+                                        call_expr->GetSourceRange().getBegin())
+            << "bitreverse() expects a 32-bit integer";
+        return false;
+    }
+    return true;
+}
+
 bool AMDGPUIntrinsic::CheckGetDppFunction(
     ast::Call *call_expr, GeneratorContext *ctx,
     llvm::ArrayRef<mlir::Value> resolved_args) const {
@@ -1636,6 +1762,31 @@ bool AMDGPUIntrinsic::CheckCvtPkF8F32Function(
     return true;
 }
 
+bool AMDGPUIntrinsic::CheckCvtPkF32Bf8Function(
+    ast::Call *call_expr, GeneratorContext *ctx,
+    llvm::ArrayRef<mlir::Value> resolved_args) const {
+    if (call_expr->GetArgs().size() != 2 || resolved_args.size() != 2 ||
+        !resolved_args[0] || !resolved_args[1]) {
+        ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
+                                        call_expr->GetSourceRange().getBegin())
+            << "cvt_pk_f32_bf8() requires exactly two arguments: src, opsel";
+        return false;
+    }
+
+    auto srcType =
+        mlir::dyn_cast<mlir::IntegerType>(resolved_args[0].getType());
+    auto wordSel = ConstantFolder::FoldIntValue(resolved_args[1]);
+    if (!srcType || srcType.getWidth() != 32 || !wordSel ||
+        (*wordSel != 0 && *wordSel != 1)) {
+        ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
+                                        call_expr->GetSourceRange().getBegin())
+            << "cvt_pk_f32_bf8() expects an i32 source and a compile-time "
+               "opsel of 0 or 1";
+        return false;
+    }
+    return true;
+}
+
 mlir::Value AMDGPUIntrinsic::CreateGlobalAtomicAddFunction(
     ast::Call *call_expr, GeneratorContext *ctx,
     llvm::ArrayRef<mlir::Value> resolved_args) const {
@@ -1655,21 +1806,30 @@ mlir::Value AMDGPUIntrinsic::CreateGlobalAtomicAddFunction(
         builder, location, builder.getI64Type(), resolved_args[0]);
     auto address = mlir::arith::AddIOp::create(builder, location, baseAddress,
                                                 byteOffset);
+    unsigned addressSpace = 1;
+    auto tensorType = mlir::cast<cf::MemRefType>(resolved_args[2].getType());
+    if (auto space = mlir::dyn_cast_or_null<mlir::gpu::AddressSpaceAttr>(
+            tensorType.getMemorySpace())) {
+        if (space.getValue() == mlir::gpu::AddressSpace::Workgroup)
+            addressSpace = 3;
+        else if (space.getValue() == mlir::gpu::AddressSpace::Private)
+            addressSpace = 5;
+    }
     auto pointer = mlir::LLVM::IntToPtrOp::create(
         builder, location,
-        mlir::LLVM::LLVMPointerType::get(builder.getContext(), 1),
+        mlir::LLVM::LLVMPointerType::get(builder.getContext(), addressSpace),
         address.getResult(), nullptr);
 
     auto elementType = *GetAtomicElementType(resolved_args[1].getType());
     auto binOp = mlir::isa<mlir::FloatType>(elementType)
                      ? mlir::LLVM::AtomicBinOp::fadd
                      : mlir::LLVM::AtomicBinOp::add;
-    mlir::LLVM::AtomicRMWOp::create(
+    auto result = mlir::LLVM::AtomicRMWOp::create(
         builder, location, binOp, pointer, resolved_args[1],
         mlir::LLVM::AtomicOrdering::monotonic, *syncScope);
 
-    return ctx->GetCurrentFunctionGenerator()->GetExprGenerator()
-        ->CreateVoidValue();
+    SetTypeInfo(result.getResult(), GetTypeInfo(resolved_args[1]));
+    return result.getResult();
 }
 
 bool AMDGPUIntrinsic::CheckGlobalAtomicAddFunction(
