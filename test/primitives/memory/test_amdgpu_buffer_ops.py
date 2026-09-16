@@ -60,6 +60,13 @@ def kernel_amdgpu_readfirstlane(out: S.Tensor((128,), S.i32)):
     out[tid] = S.amdgpu.readfirstlane(tid_i32)
 
 
+@avelang.jit
+def first_lane_unsigned(src: S.Tensor((64,), S.u32), out: S.Tensor((64,), S.u32)):
+    lane = S.thread_id(0)
+    value = S.amdgpu.readfirstlane(src[lane])
+    out[lane] = S.select(value >= 3, S.convert(1, S.u32), S.convert(0, S.u32))
+
+
 def generate_mlir(jit_fn) -> str:
     jit_deps = _collect_jit_dependencies(jit_fn)
     import_module = _build_import_module([jit_fn, *jit_deps])
@@ -132,6 +139,11 @@ class TestAMDGPUBufferOps(unittest.TestCase):
             f"Expected: {expected.tolist()}, Actual: {out.cpu().tolist()}",
         )
 
+    def test_readfirstlane_preserves_unsigned_sentinels(self):
+        src = torch.full((64,), 0xFFFFFFFF, dtype=torch.uint32, device="cuda")
+        out = torch.empty_like(src)
+        first_lane_unsigned[lambda: ((1, 1, 1), (64, 1, 1))](src, out)
+        torch.testing.assert_close(out, torch.ones_like(src), rtol=0, atol=0)
 
 if __name__ == "__main__":
     unittest.main()

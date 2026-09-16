@@ -1129,10 +1129,11 @@ mlir::Value ExprGenerator::VisitConstant(ast::Constant *constant) {
 
     // Try to parse as integer first
     if (auto intValue = ParseConstantInteger(value)) {
-        // For integer constants, we'll use a default i32 type unless context
-        // suggests otherwise This can be extended later to infer type from
-        // usage context
-        auto intType = builder.getI32Type();
+        // Preserve large literal/captured offsets instead of silently
+        // truncating 2-4 GiB buffer sizes to negative i32 values.
+        auto intType = (*intValue >= INT32_MIN && *intValue <= INT32_MAX)
+                           ? builder.getI32Type()
+                           : builder.getI64Type();
 
         // Create integer constant using ConstantOp instead of deprecated
         // ConstantIndexOp for portability

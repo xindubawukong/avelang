@@ -1,13 +1,24 @@
 #!/usr/bin/env python3
 import unittest
 
-import torch
 import avelang
 import avelang.language as S
+import torch
 
 
 def helper(x):
     return x + 1
+
+
+@avelang.jit
+def choose_value(condition: S.u1) -> S.u32:
+    return S.select(condition, S.convert(7, S.u32), S.convert(11, S.u32))
+
+
+@avelang.jit
+def kernel_bool_argument(output: S.Tensor((64,), S.u32)):
+    tid = S.thread_id(0)
+    output[tid] = choose_value(tid < 32)
 
 
 @avelang.jit
@@ -43,6 +54,12 @@ def kernel_add_nested(
 
 class TestJitCalls(unittest.TestCase):
     """Test that avelang.jit functions can be called from avelang.jit kernels."""
+
+    def test_boolean_helper_argument(self):
+        output = torch.empty(64, dtype=torch.int32, device="cuda")
+        kernel_bool_argument[lambda: ((1, 1, 1), (64, 1, 1))](output)
+        expected = torch.where(torch.arange(64) < 32, 7, 11).to(torch.int32)
+        self.assertTrue(torch.equal(output.cpu(), expected))
 
     def test_jit_function(self):
         WARP_SIZE = 64

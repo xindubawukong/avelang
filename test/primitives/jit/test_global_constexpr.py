@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 import unittest
 
-import torch
-
 import avelang
 import avelang.language as S
+import pytest
+import torch
 
 GLOBAL_SIZE = 16
 GLOBAL_OFFSET = S.constexpr(3)
@@ -67,6 +67,19 @@ class TestGlobalConstexprInjection(unittest.TestCase):
             f"Expected: {expected.tolist()}, Actual: {output_data.tolist()}",
         )
 
+
+@avelang.jit
+def large_literals_kernel(output: S.Tensor((2,), S.u64)):
+    if S.thread_id(0) == 0:
+        output[0] = S.convert(0x100000003, S.u64)
+        output[1] = S.convert(3086034172, S.u64)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
+def test_large_integer_literals_keep_their_bits():
+    output = torch.zeros(2, dtype=torch.int64, device="cuda")
+    large_literals_kernel[lambda: ((1, 1, 1), (64, 1, 1))](output)
+    assert output.cpu().tolist() == [0x100000003, 3086034172]
 
 if __name__ == "__main__":
     unittest.main()

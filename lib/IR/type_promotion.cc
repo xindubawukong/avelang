@@ -44,10 +44,24 @@ mlir::Value CreateTypeConversion(mlir::Value value, mlir::Type source_type,
         return value;
     }
 
+    // Arith conversion operations preserve a vector's shape. Inspect the
+    // element types while emitting a single vector conversion operation.
+    auto source_vector = mlir::dyn_cast<mlir::VectorType>(source_type);
+    auto target_vector = mlir::dyn_cast<mlir::VectorType>(target_type);
+    if (bool(source_vector) != bool(target_vector) ||
+        (source_vector &&
+         (source_vector.getShape() != target_vector.getShape() ||
+          source_vector.getScalableDims() != target_vector.getScalableDims())))
+        return nullptr;
+    auto source_element =
+        source_vector ? source_vector.getElementType() : source_type;
+    auto target_element =
+        target_vector ? target_vector.getElementType() : target_type;
+
     // Integer to integer conversions
-    if (source_type.isInteger() && target_type.isInteger()) {
-        auto source_width = source_type.getIntOrFloatBitWidth();
-        auto target_width = target_type.getIntOrFloatBitWidth();
+    if (source_element.isInteger() && target_element.isInteger()) {
+        auto source_width = source_element.getIntOrFloatBitWidth();
+        auto target_width = target_element.getIntOrFloatBitWidth();
 
         if (source_width < target_width) {
             auto isUnsigned = source_unsigned.value_or(false);
@@ -81,7 +95,7 @@ mlir::Value CreateTypeConversion(mlir::Value value, mlir::Type source_type,
     }
 
     // Integer to float conversions
-    if (source_type.isInteger() && mlir::isa<mlir::FloatType>(target_type)) {
+    if (source_element.isInteger() && mlir::isa<mlir::FloatType>(target_element)) {
         if (source_unsigned.value_or(false)) {
             return mlir::arith::UIToFPOp::create(builder, location, target_type,
                                                  value);
@@ -92,7 +106,7 @@ mlir::Value CreateTypeConversion(mlir::Value value, mlir::Type source_type,
     }
 
     // Float to integer conversions
-    if (mlir::isa<mlir::FloatType>(source_type) && target_type.isInteger()) {
+    if (mlir::isa<mlir::FloatType>(source_element) && target_element.isInteger()) {
         if (allow_demotion) {
             auto isUnsigned = target_unsigned.value_or(false);
             if (isUnsigned) {
@@ -112,10 +126,10 @@ mlir::Value CreateTypeConversion(mlir::Value value, mlir::Type source_type,
     }
 
     // Float to float conversions
-    if (mlir::isa<mlir::FloatType>(source_type) &&
-        mlir::isa<mlir::FloatType>(target_type)) {
-        auto source_width = source_type.getIntOrFloatBitWidth();
-        auto target_width = target_type.getIntOrFloatBitWidth();
+    if (mlir::isa<mlir::FloatType>(source_element) &&
+        mlir::isa<mlir::FloatType>(target_element)) {
+        auto source_width = source_element.getIntOrFloatBitWidth();
+        auto target_width = target_element.getIntOrFloatBitWidth();
 
         if (source_width < target_width) {
             return mlir::arith::ExtFOp::create(builder, location, target_type,
@@ -128,20 +142,31 @@ mlir::Value CreateTypeConversion(mlir::Value value, mlir::Type source_type,
                 return value;
             }
         } else {
-            return mlir::arith::ExtFOp::create(builder, location, target_type,
-                                               value);
+            // Different formats of the same width (e.g. f16 and bf16)
+            // require an intermediate wider float, not an equal-width extf.
+            if (!allow_demotion)
+                return value;
+            mlir::Type wide_type = builder.getF32Type();
+            if (source_vector)
+                wide_type =
+                    mlir::VectorType::get(source_vector.getShape(), wide_type,
+                                          source_vector.getScalableDims());
+            auto wide = mlir::arith::ExtFOp::create(builder, location,
+                                                    wide_type, value);
+            return mlir::arith::TruncFOp::create(builder, location, target_type,
+                                                 wide);
         }
     }
 
     // Index type conversions
-    if (source_type.isIndex() && target_type.isInteger()) {
+    if (source_element.isIndex() && target_element.isInteger()) {
         auto result = mlir::arith::IndexCastOp::create(builder, location,
                                                        target_type, value);
         SetTypeInfo(result.getResult(),
                     TypeInfo{target_unsigned.value_or(false)});
         return result;
     }
-    if (source_type.isInteger() && target_type.isIndex()) {
+    if (source_element.isInteger() && target_element.isIndex()) {
         return mlir::arith::IndexCastOp::create(builder, location, target_type,
                                                 value);
     }
