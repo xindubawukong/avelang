@@ -26,6 +26,7 @@ from .core import (
     # Other types
     constexpr,
     dynamic,
+    static_range,
     Tensor,
     Pointer,
     block_id,
@@ -70,6 +71,7 @@ __all__ = [
     # Other types
     "constexpr",
     "dynamic",
+    "static_range",
     "Tensor",
     "Pointer",
     "block_id",

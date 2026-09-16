@@ -153,13 +153,13 @@ def _build_generator(jit_fn, constexprs_json: str):
         generator.add_jit_dependency(module)
 
     for module, constants in prepared_deps:
-        dep_func = cg._get_function_def(module)
+        dep_func = cg._get_function_def(module, constants)
         generator.visit_function_def(dep_func, _serialize_global_constexprs(constants), "jit")
 
     # Auto-detect constexprs if not provided manually
     if constexprs_json == "[]":
         constexprs_json = _serialize_constexprs_from_jit_fn(jit_fn)
-    kernel_func = cg._get_function_def(jit_fn.parse())
+    kernel_func = cg._get_function_def(jit_fn.parse(), {c["name"]: c["value"] for c in json.loads(constexprs_json)})
     generator.visit_function_def(kernel_func, constexprs_json, "kernel")
     return generator
 

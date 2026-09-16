@@ -3,6 +3,7 @@ import json
 import types
 
 import _avelang_bindings as _C
+from .static_range import expand_static_ranges
 
 
 class _LocalNameCollector(ast.NodeVisitor):
@@ -122,10 +123,10 @@ def _serialize_global_constexprs(global_constants) -> str:
     return json.dumps(constexprs_list)
 
 
-def _get_function_def(py_module: ast.AST) -> ast.FunctionDef:
+def _get_function_def(py_module: ast.AST, constants=None) -> ast.FunctionDef:
     for node in getattr(py_module, "body", []):
         if isinstance(node, ast.FunctionDef):
-            return node
+            return expand_static_ranges(node, constants)
     raise ValueError("FunctionDef not found in parsed AST")
 
 
@@ -177,10 +178,10 @@ def _materialize_numeric_captures(jit_callable):
 
 
 def _prepare_jit_dependencies(jit_deps):
-    """Bind captures before both eager generation and lazy specialization."""
+    """Expand loops before both eager generation and lazy specialization."""
     prepared = []
     for dep in jit_deps:
-        module = _materialize_numeric_captures(dep)
+        module = expand_static_ranges(_materialize_numeric_captures(dep), {})
         # Captures now live in this AST. Injecting them into the shared module
         # would also make unrelated helper locals accidentally immutable.
         prepared.append((module, {}))
@@ -323,10 +324,12 @@ def compile_to_binary(src, target, opt_level: int = 2, options=None):
         generator.add_jit_dependency(module)
 
     for module, constants in prepared_deps:
-        dep_func = _get_function_def(module)
+        dep_func = _get_function_def(module, constants)
         generator.visit_function_def(dep_func, _serialize_global_constexprs(constants), "jit")
 
-    kernel_func = _get_function_def(_materialize_numeric_captures(src.fn))
+    kernel_func = _get_function_def(
+        _materialize_numeric_captures(src.fn), {c["name"]: c["value"] for c in json.loads(constexprs_json)}
+    )
     generator.visit_function_def(kernel_func, constexprs_json, "kernel")
 
     num_warps = getattr(options, "num_warps", -1)

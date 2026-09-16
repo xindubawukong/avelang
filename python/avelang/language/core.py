@@ -83,6 +83,11 @@ class constexpr:
 
 
 # Built-in functions for GPU kernels
+def static_range(*bounds):
+    """Unroll a small loop with literal or captured constexpr integer bounds."""
+    return range(*bounds)
+
+
 def block_id(dim: int):
     """Get the block ID in the specified dimension."""
     pass
