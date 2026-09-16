@@ -1,3 +1,5 @@
+ave_lang_llvm_libraries(ave_llvm_libs core support)
+
 add_library(ave-lang-target-gpu
   lower_to_llvm.cc
   gpu_outlining.cc
@@ -7,8 +9,7 @@ add_library(ave-lang-target-gpu
 
 target_link_libraries(ave-lang-target-gpu
   PRIVATE
-  LLVMCore
-  LLVMSupport
+  ${ave_llvm_libs}
   MLIRLLVMDialect
   MLIRTargetLLVMIRExport
   MLIRArithToLLVM

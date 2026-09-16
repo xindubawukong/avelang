@@ -1,4 +1,5 @@
 #include "amdgpu_toolchain.h"
+#include "avelang/config.h"
 #include "rocm_installation_detector.h"
 
 #include <llvm/Support/FileSystem.h>
@@ -15,6 +16,11 @@ namespace causalflow::avelang::target::amdgpu {
 Linker::Linker() : Tool("amdgpu::Linker", "ld.lld") {}
 
 std::string Linker::findLinkerExecutable() const {
+#ifdef AVE_LANG_AMDGPU_CLANG_EXECUTABLE
+    // Do not silently fall back to an older ROCm compiler if this toolchain
+    // was moved or removed: it may not understand the generated bitcode.
+    return AVE_LANG_AMDGPU_CLANG_EXECUTABLE;
+#endif
     // For AMDGPU device linking, we should use clang instead of ld.lld directly
     // because clang knows how to properly link LLVM bitcode files
     auto toolPaths = RocmPaths::getToolPaths();

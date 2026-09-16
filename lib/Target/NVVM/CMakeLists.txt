@@ -1,3 +1,5 @@
+ave_lang_llvm_libraries(ave_llvm_libs NVPTX asmprinter codegen target core support irreader)
+
 add_library(ave-lang-target-nvvm
   gpu_to_nvvm_pipeline.cc
   nvvm_backend.cc
@@ -22,14 +24,7 @@ target_link_libraries(ave-lang-target-nvvm
   MLIRUBToLLVM
   ave-lang-mlir
   ave-lang-dialect-transforms
-  LLVMNVPTXCodeGen
-  LLVMNVPTXInfo
-  LLVMNVPTXDesc
-  LLVMAsmPrinter
-  LLVMCodeGen
-  LLVMTarget
-  LLVMCore
-  LLVMSupport
+  ${ave_llvm_libs}
 )
 
 target_compile_definitions(ave-lang-target-nvvm PRIVATE ${LLVM_DEFINITIONS})
@@ -42,9 +37,7 @@ target_link_libraries(nvvm_codegen_test
   ave-lang-basic
   ave-lang-ast
   GTest::gtest_main
-  LLVMCore
-  LLVMSupport
-  LLVMIRReader
+  ${ave_llvm_libs}
   CUDA::cuda_driver
 )
 

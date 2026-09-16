@@ -1567,7 +1567,7 @@ def sched_group_barrier_test():
     bool found_sched_group_barrier = false;
     mlir->walk([&](mlir::ROCDL::SchedGroupBarrier op) {
         found_sched_group_barrier = true;
-        EXPECT_EQ(op.getMask(), 2u);
+        EXPECT_EQ(static_cast<uint32_t>(op.getMask()), 2u);
         EXPECT_EQ(op.getSize(), 4u);
         EXPECT_EQ(op.getGroupId(), 1u);
     });
@@ -1609,7 +1609,7 @@ def sched_barrier_test():
     bool found_sched_barrier = false;
     mlir->walk([&](mlir::ROCDL::SchedBarrier op) {
         found_sched_barrier = true;
-        EXPECT_EQ(op.getMask(), 0u);
+        EXPECT_EQ(static_cast<uint32_t>(op.getMask()), 0u);
     });
     EXPECT_TRUE(found_sched_barrier);
 

@@ -12,6 +12,7 @@
 #include "Utils/assert.h"
 #include "Utils/embedded_filesystem_view.h"
 #include "intrinsic_support.h"
+#include <llvm/Config/llvm-config.h>
 
 #include <mlir/Dialect/Arith/IR/Arith.h>
 #include <mlir/Dialect/Func/IR/FuncOps.h>
@@ -1020,7 +1021,12 @@ mlir::Value AMDGPUIntrinsic::CreateSchedGroupBarrierFunction(
     }
 
     mlir::ROCDL::SchedGroupBarrier::create(
-        builder, location, static_cast<uint32_t>(*mask),
+        builder, location,
+#if LLVM_VERSION_MAJOR >= 24
+        static_cast<mlir::ROCDL::SchedGroupMask>(*mask),
+#else
+        static_cast<uint32_t>(*mask),
+#endif
         static_cast<uint32_t>(*size), static_cast<uint32_t>(*group_id));
 
     return ctx->GetCurrentFunctionGenerator()
@@ -1044,8 +1050,13 @@ mlir::Value AMDGPUIntrinsic::CreateSchedBarrierFunction(
         return nullptr;
     }
 
-    mlir::ROCDL::SchedBarrier::create(builder, location,
-                                      static_cast<uint32_t>(*mask));
+    mlir::ROCDL::SchedBarrier::create(
+        builder, location,
+#if LLVM_VERSION_MAJOR >= 24
+        static_cast<mlir::ROCDL::SchedGroupMask>(*mask));
+#else
+        static_cast<uint32_t>(*mask));
+#endif
     return ctx->GetCurrentFunctionGenerator()
         ->GetExprGenerator()
         ->CreateVoidValue();

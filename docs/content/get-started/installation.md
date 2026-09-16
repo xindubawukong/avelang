@@ -5,7 +5,7 @@ title: Installation guide
 
 ## Prerequisites
 
-- LLVM, MLIR, and Clang 22. For AMDGPU target we recommend using the [ROCm 7.2.x fork of LLVM](https://github.com/ROCm/llvm-project).
+- LLVM, MLIR, and Clang 22 or 24, all from the same toolchain. The ROCm backend is tested with LLVM 22.1.8 and the ROCm LLVM 24 development toolchain. CUDA validation still targets LLVM 22.
 - CMake 3.25 or newer
 - Ninja
 - Python 3.10 or newer
@@ -26,14 +26,23 @@ CMAKE_ARGS='-DAVE_LANG_BACKEND=cuda -DWITH_PYTHON=ON \
 
 For ROCm:
 
+Use the prefix of your LLVM 22 or 24 toolchain in place of `/path/to/llvm22`.
+Include `/opt/rocm` separately so CMake can find HIP and the device libraries.
+
 ```bash
 uv venv .venv
 source .venv/bin/activate
 CMAKE_ARGS="-DAVE_LANG_BACKEND=rocm -DWITH_PYTHON=ON \
   -DCMAKE_C_COMPILER=/path/to/llvm22/bin/clang \
   -DCMAKE_CXX_COMPILER=/path/to/llvm22/bin/clang++ \
-  -DCMAKE_PREFIX_PATH='/path/to/llvm22;/opt/rocm'" uv pip install -e .
+  -DCMAKE_PREFIX_PATH=/path/to/llvm22;/opt/rocm" uv pip install -e .
 ```
+
+Ave uses Clang from the selected LLVM toolchain for AMDGPU device linking.
+This prevents ROCm's bundled Clang from trying to read newer LLVM bitcode.
+For a custom installation, set `-DAVE_LANG_AMDGPU_CLANG_EXECUTABLE=/path/to/matching/clang`.
+Rebuild the Python extension when switching LLVM versions; each build uses one
+LLVM version and regenerates its embedded MLIR bytecode with that version.
 
 You should be able to run the python test via `python -m pytest test` once the build and installation are completed.
 
