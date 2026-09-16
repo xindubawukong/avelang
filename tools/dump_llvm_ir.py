@@ -148,22 +148,18 @@ def _build_generator(jit_fn, constexprs_json: str):
     generator = _C.MLIRGenerator()
     generator.generate_from_python_ast(import_module)
 
-    for dep in jit_deps:
-        generator.add_jit_dependency(dep.parse())
+    prepared_deps = cg._prepare_jit_dependencies(jit_deps)
+    for module, _ in prepared_deps:
+        generator.add_jit_dependency(module)
 
-    for dep in jit_deps:
-        dep_func = cg._get_function_def(dep.parse())
-        # Collect global constexprs from this dependency
-        dep_globals = {}
-        collect_globals = getattr(dep, "_collect_global_constexprs", None)
-        if callable(collect_globals):
-            dep_globals = collect_globals()
-        generator.visit_function_def(dep_func, _serialize_global_constexprs(dep_globals), "jit")
+    for module, constants in prepared_deps:
+        dep_func = cg._get_function_def(module)
+        generator.visit_function_def(dep_func, _serialize_global_constexprs(constants), "jit")
 
-    kernel_func = cg._get_function_def(jit_fn.parse())
     # Auto-detect constexprs if not provided manually
     if constexprs_json == "[]":
         constexprs_json = _serialize_constexprs_from_jit_fn(jit_fn)
+    kernel_func = cg._get_function_def(jit_fn.parse())
     generator.visit_function_def(kernel_func, constexprs_json, "kernel")
     return generator
 
