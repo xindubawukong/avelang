@@ -142,6 +142,37 @@ SymbolScope::Function MxFp4Pack() {
             }};
 }
 
+SymbolScope::Function BufferStoreU8() {
+    return {
+        [](ast::Call *call, GeneratorContext *ctx, Args args) {
+            auto &builder = ctx->GetCurrentFunctionGenerator()->GetBuilder();
+            auto loc = ctx->GetMLIRLocation(builder.getContext(), call);
+            mlir::LLVM::CallIntrinsicOp::create(
+                builder, loc,
+                builder.getStringAttr("llvm.amdgcn.raw.buffer.store"),
+                mlir::ValueRange{
+                    args[0], args[1], args[2], args[3],
+                    Constant(builder, loc,
+                             *ConstantFolder::FoldIntValue(args[4]))});
+            return ctx->GetCurrentFunctionGenerator()
+                ->GetExprGenerator()
+                ->CreateVoidValue();
+        },
+        [](ast::Call *call, GeneratorContext *ctx, Args args) {
+            if (!CheckArgs(call, args, 5) || !args[0].getType().isInteger(8) ||
+                !IsVector4(args[1], true) || !IsI32(args[2]) || !IsI32(args[3]))
+                return Error(call, ctx,
+                             "raw_buffer_store_u8 expects i8 value, resource, "
+                             "i32 offsets and constant aux");
+            auto aux = ConstantFolder::FoldIntValue(args[4]);
+            if (!aux || *aux < 0 || *aux > 31)
+                return Error(
+                    call, ctx,
+                    "raw_buffer_store_u8 aux must be a constant in [0, 31]");
+            return true;
+        }};
+}
+
 SymbolScope::Function DsSwizzle() {
     return {
         [](ast::Call *call, GeneratorContext *ctx, Args args) {

@@ -10,6 +10,7 @@
 #include <mlir/Dialect/Arith/IR/Arith.h>
 #include <mlir/Dialect/Func/IR/FuncOps.h>
 #include <mlir/Dialect/GPU/IR/GPUDialect.h>
+#include <mlir/Dialect/LLVMIR/LLVMDialect.h>
 #include <mlir/Dialect/LLVMIR/ROCDLDialect.h>
 #include <mlir/Dialect/Math/IR/Math.h>
 #include <mlir/Dialect/MemRef/IR/MemRef.h>
@@ -1758,8 +1759,9 @@ import avelang.language as S
 
 @avelang.jit
 def raw_buffer_load_lds_test(rsrc: S.Tensor((4,), S.u32)):
-    shared_mem = S.make_shared((16,), S.u32)
+    shared_mem = S.make_shared((1024,), S.u32)
     S.amdgpu.raw_buffer_load_x1_lds(rsrc, shared_mem, 4, 0, 0, 16, 0)
+    S.amdgpu.raw_buffer_load_x4_lds(rsrc, shared_mem, 16, 0, 0, 1024, 0)
 )""""";
 
     ast::ASTNode *root;
@@ -1776,17 +1778,18 @@ def raw_buffer_load_lds_test(rsrc: S.Tensor((4,), S.u32)):
         << diagHandler_.GetErrorMessages(&SM);
     ASSERT_NE(mlir, nullptr);
 
-    bool foundLoadLdsCall = false;
-    mlir->walk([&](mlir::func::CallOp op) {
-        if (op.getCallee() ==
-            "_avelang_amdgpu_llvm_amdgcn_raw_buffer_load_lds_u32") {
-            foundLoadLdsCall = true;
-            EXPECT_EQ(op.getNumOperands(), 4u);
+    std::multiset<int64_t> transferSizes;
+    mlir->walk([&](mlir::LLVM::CallIntrinsicOp op) {
+        if (op.getIntrin() == "llvm.amdgcn.raw.buffer.load.lds") {
+            EXPECT_EQ(op.getNumOperands(), 7u);
             EXPECT_EQ(op.getNumResults(), 0u);
+            auto size = op.getOperand(2).getDefiningOp<mlir::arith::ConstantOp>();
+            ASSERT_TRUE(size);
+            transferSizes.insert(mlir::cast<mlir::IntegerAttr>(size.getValue()).getInt());
         }
     });
 
-    EXPECT_TRUE(foundLoadLdsCall);
+    EXPECT_EQ(transferSizes, (std::multiset<int64_t>{4, 16}));
 
     mlir::PassManager pm(mlir.getContext());
     pm.addPass(mlir::createCanonicalizerPass());
@@ -1795,6 +1798,34 @@ def raw_buffer_load_lds_test(rsrc: S.Tensor((4,), S.u32)):
 
     ASSERT_TRUE(mlir::succeeded(mlir::verify(mlir)))
         << "MLIR verification failed!";
+}
+
+TEST_F(MLIRGeneratorTest, RawBufferLoadX1LdsRejectsSixteenBytes) {
+    RunMLIRGenerationErrorTest(R"(
+import avelang
+import avelang.language as S
+
+@avelang.jit
+def invalid(rsrc: S.Tensor((4,), S.u32)):
+    shared_mem = S.make_shared((1024,), S.u32)
+    S.amdgpu.raw_buffer_load_x1_lds(rsrc, shared_mem, 16, 0, 0, 0, 0)
+)",
+                               "raw_buffer_load_x1_lds requires compile-time "
+                               "size=4 and aux in [0, 31]");
+}
+
+TEST_F(MLIRGeneratorTest, RawBufferLoadX4LdsRejectsFourBytes) {
+    RunMLIRGenerationErrorTest(R"(
+import avelang
+import avelang.language as S
+
+@avelang.jit
+def invalid(rsrc: S.Tensor((4,), S.u32)):
+    shared_mem = S.make_shared((1024,), S.u32)
+    S.amdgpu.raw_buffer_load_x4_lds(rsrc, shared_mem, 4, 0, 0, 0, 0)
+)",
+                               "raw_buffer_load_x4_lds requires compile-time "
+                               "size=16 and aux in [0, 31]");
 }
 
 TEST_F(MLIRGeneratorTest, GenerateMLIRAMDGPUSWaitcnt) {

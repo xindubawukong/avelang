@@ -93,9 +93,9 @@ class AMDGPUIntrinsic : public NamedModule {
     mlir::Value CreateRawBufferLoadX4Function(
         ast::Call *call_expr, GeneratorContext *ctx,
         llvm::ArrayRef<mlir::Value> resolved_args) const;
-    mlir::Value CreateRawBufferLoadX1LdsFunction(
+    mlir::Value CreateRawBufferLoadLdsFunction(
         ast::Call *call_expr, GeneratorContext *ctx,
-        llvm::ArrayRef<mlir::Value> resolved_args) const;
+        llvm::ArrayRef<mlir::Value> resolved_args, int width) const;
     mlir::Value CreateRawBufferStoreX1Function(
         ast::Call *call_expr, GeneratorContext *ctx,
         llvm::ArrayRef<mlir::Value> resolved_args) const;
@@ -172,9 +172,9 @@ class AMDGPUIntrinsic : public NamedModule {
     bool CheckGenericRawBufferLoadFunction(
         ast::Call *call_expr, GeneratorContext *ctx,
         llvm::ArrayRef<mlir::Value> resolved_args, int width) const;
-    bool CheckRawBufferLoadX1LdsFunction(
+    bool CheckRawBufferLoadLdsFunction(
         ast::Call *call_expr, GeneratorContext *ctx,
-        llvm::ArrayRef<mlir::Value> resolved_args) const;
+        llvm::ArrayRef<mlir::Value> resolved_args, int width) const;
 
     bool CheckGenericRawBufferStoreFunction(
         ast::Call *call_expr, GeneratorContext *ctx,
@@ -377,18 +377,22 @@ void AMDGPUIntrinsic::Initialize() {
                                                      resolved_args, 4);
         });
 
-    AddFunction(
-        "raw_buffer_load_x1_lds",
-        [this](ast::Call *call_expr, GeneratorContext *gen_ctx,
-               llvm::ArrayRef<mlir::Value> resolved_args) -> mlir::Value {
-            return CreateRawBufferLoadX1LdsFunction(call_expr, gen_ctx,
-                                                    resolved_args);
-        },
-        [this](ast::Call *call_expr, GeneratorContext *gen_ctx,
-               llvm::ArrayRef<mlir::Value> resolved_args) -> bool {
-            return CheckRawBufferLoadX1LdsFunction(call_expr, gen_ctx,
-                                                   resolved_args);
-        });
+    for (int width : {1, 4}) {
+        AddFunction(
+            "raw_buffer_load_x" + std::to_string(width) + "_lds",
+            [this, width](ast::Call *call_expr, GeneratorContext *gen_ctx,
+                          llvm::ArrayRef<mlir::Value> resolved_args) -> mlir::Value {
+                return CreateRawBufferLoadLdsFunction(call_expr, gen_ctx,
+                                                      resolved_args, width);
+            },
+            [this, width](ast::Call *call_expr, GeneratorContext *gen_ctx,
+                          llvm::ArrayRef<mlir::Value> resolved_args) -> bool {
+                return CheckRawBufferLoadLdsFunction(call_expr, gen_ctx,
+                                                     resolved_args, width);
+            });
+    }
+
+    addIntrinsic("raw_buffer_store_u8", intrinsics::BufferStoreU8());
 
     AddFunction(
         "raw_buffer_store_x1",
@@ -429,6 +433,7 @@ void AMDGPUIntrinsic::Initialize() {
                                                       resolved_args, 4);
         });
 
+
     AddFunction(
         "sched_barrier",
         [this](ast::Call *call_expr, GeneratorContext *gen_ctx,
@@ -454,6 +459,7 @@ void AMDGPUIntrinsic::Initialize() {
             return CheckSchedGroupBarrierFunction(call_expr, gen_ctx,
                                                   resolved_args);
         });
+
 
     AddFunction(
         "atomic_add",
@@ -699,21 +705,13 @@ mlir::Value AMDGPUIntrinsic::CreateRawBufferLoadX4Function(
     return CreateGenericRawBufferLoadFunction(call_expr, ctx, resolved_args, 4);
 }
 
-mlir::Value AMDGPUIntrinsic::CreateRawBufferLoadX1LdsFunction(
+mlir::Value AMDGPUIntrinsic::CreateRawBufferLoadLdsFunction(
     ast::Call *call_expr, GeneratorContext *ctx,
-    llvm::ArrayRef<mlir::Value> resolved_args) const {
+    llvm::ArrayRef<mlir::Value> resolved_args, int width) const {
     auto &builder = ctx->GetCurrentFunctionGenerator()->GetBuilder();
     auto location = builder.getUnknownLoc();
-    auto size = ConstantFolder::FoldIntValue(resolved_args[2]);
-    auto aux = ConstantFolder::FoldIntValue(resolved_args[6]);
-
-    if (!size || *size != 4 || !aux || *aux != 0) {
-        ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
-                                        call_expr->GetSourceRange().getBegin())
-            << "raw_buffer_load_x1_lds currently requires compile-time "
-               "size=4 and aux=0";
+    if (!CheckRawBufferLoadLdsFunction(call_expr, ctx, resolved_args, width))
         return nullptr;
-    }
 
     auto ldsPtr = cf::AveLangMemRefExtractAlignedPointerAsIndexOp::create(
         builder, location, builder.getIndexType(), resolved_args[1]);
@@ -721,13 +719,23 @@ mlir::Value AMDGPUIntrinsic::CreateRawBufferLoadX1LdsFunction(
     auto ldsPtrWithOffset =
         mlir::arith::AddIOp::create(builder, location, ldsPtr, rawOffset);
 
-    auto funcName = intrinsics::MakeIntrinsicFuncName(
-        "amdgpu", "llvm_amdgcn_raw_buffer_load_lds_u32");
-    mlir::func::CallOp::create(
-        builder, location, funcName, mlir::TypeRange{},
-        mlir::ValueRange{resolved_args[0], ldsPtrWithOffset,
+    auto address = mlir::arith::IndexCastOp::create(
+        builder, location, builder.getI64Type(), ldsPtrWithOffset);
+    auto pointer = mlir::LLVM::IntToPtrOp::create(
+        builder, location,
+        mlir::LLVM::LLVMPointerType::get(builder.getContext(), 3),
+        address.getResult(), nullptr);
+    auto bytes = mlir::arith::ConstantIntOp::create(builder, location, width * 4, 32);
+    auto zero = mlir::arith::ConstantIntOp::create(builder, location, 0, 32);
+    auto aux = mlir::arith::ConstantIntOp::create(
+        builder, location, *ConstantFolder::FoldIntValue(resolved_args[6]), 32);
+    mlir::LLVM::CallIntrinsicOp::create(
+        builder, location,
+        builder.getStringAttr("llvm.amdgcn.raw.buffer.load.lds"),
+        mlir::ValueRange{resolved_args[0], pointer, bytes,
                          ConvertToI32(builder, location, resolved_args[3]),
-                         ConvertToI32(builder, location, resolved_args[4])});
+                         ConvertToI32(builder, location, resolved_args[4]),
+                         zero, aux});
 
     return ctx->GetCurrentFunctionGenerator()
         ->GetExprGenerator()
@@ -1115,8 +1123,8 @@ mlir::Value AMDGPUIntrinsic::CreateGenericRawBufferLoadFunction(
     auto location = GetCallLocation(ctx, call_expr);
 
     auto rsrc = resolved_args[0];
-    auto vindex = resolved_args[1];
-    auto soffset = resolved_args[2];
+    auto vindex = ConvertToI32(builder, location, resolved_args[1]);
+    auto soffset = ConvertToI32(builder, location, resolved_args[2]);
     auto aux = resolved_args[3];
 
     mlir::Type result_type;
@@ -1145,10 +1153,12 @@ mlir::Value AMDGPUIntrinsic::CreateGenericRawBufferStoreFunction(
 
     auto vdata = resolved_args[0];
     auto rsrc = resolved_args[1];
-    auto vindex = resolved_args[2];
-    auto soffset = resolved_args[3];
+    auto vindex = ConvertToI32(builder, location, resolved_args[2]);
+    auto soffset = ConvertToI32(builder, location, resolved_args[3]);
     auto aux = resolved_args[4];
 
+    if (width == 1)
+        vdata = ConvertToI32(builder, location, vdata);
     auto vdata_type = vdata.getType();
 
     if (width > 1) {
@@ -1235,13 +1245,14 @@ bool AMDGPUIntrinsic::CheckGenericRawBufferLoadFunction(
     return true;
 }
 
-bool AMDGPUIntrinsic::CheckRawBufferLoadX1LdsFunction(
+bool AMDGPUIntrinsic::CheckRawBufferLoadLdsFunction(
     ast::Call *call_expr, GeneratorContext *ctx,
-    llvm::ArrayRef<mlir::Value> resolved_args) const {
+    llvm::ArrayRef<mlir::Value> resolved_args, int width) const {
+    const std::string name = "raw_buffer_load_x" + std::to_string(width) + "_lds";
     if (resolved_args.size() != 7) {
         ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
                                         call_expr->GetSourceRange().getBegin())
-            << "raw_buffer_load_x1_lds requires exactly 7 arguments: "
+            << name + " requires exactly 7 arguments: "
                "rsrc, lds_ptr, size, vindex, soffset, offset, aux";
         return false;
     }
@@ -1251,7 +1262,7 @@ bool AMDGPUIntrinsic::CheckRawBufferLoadX1LdsFunction(
             ctx->diagnostic_manager->Report(
                 basic::DiagnosticCode::kUnimplemented,
                 call_expr->GetSourceRange().getBegin())
-                << "Failed to generate operands for raw_buffer_load_x1_lds";
+                << "Failed to generate operands for " + name;
             return false;
         }
     }
@@ -1262,7 +1273,7 @@ bool AMDGPUIntrinsic::CheckRawBufferLoadX1LdsFunction(
         !rsrcVector.getElementType().isInteger(32)) {
         ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
                                         call_expr->GetSourceRange().getBegin())
-            << "raw_buffer_load_x1_lds expects rsrc to be vector<4xi32>";
+            << name + " expects rsrc to be vector<4xi32>";
         return false;
     }
 
@@ -1271,7 +1282,7 @@ bool AMDGPUIntrinsic::CheckRawBufferLoadX1LdsFunction(
     if (!memrefType) {
         ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
                                         call_expr->GetSourceRange().getBegin())
-            << "raw_buffer_load_x1_lds expects lds_ptr to be a memref";
+            << name + " expects lds_ptr to be a memref";
         return false;
     }
 
@@ -1281,7 +1292,7 @@ bool AMDGPUIntrinsic::CheckRawBufferLoadX1LdsFunction(
             ctx->diagnostic_manager->Report(
                 basic::DiagnosticCode::kUnimplemented,
                 call_expr->GetSourceRange().getBegin())
-                << "raw_buffer_load_x1_lds size/vindex/soffset/offset/aux "
+                << name + " size/vindex/soffset/offset/aux "
                    "operands must be integer or index types";
             return false;
         }
@@ -1289,11 +1300,12 @@ bool AMDGPUIntrinsic::CheckRawBufferLoadX1LdsFunction(
 
     auto size = ConstantFolder::FoldIntValue(resolved_args[2]);
     auto aux = ConstantFolder::FoldIntValue(resolved_args[6]);
-    if (!size || *size != 4 || !aux || *aux != 0) {
+    if (!size || *size != width * 4 || !aux || *aux < 0 || *aux > 31) {
         ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
                                         call_expr->GetSourceRange().getBegin())
-            << "raw_buffer_load_x1_lds currently requires compile-time "
-               "size=4 and aux=0";
+            << name +
+                   " requires compile-time size=" + std::to_string(width * 4) +
+                   " and aux in [0, 31]";
         return false;
     }
 
