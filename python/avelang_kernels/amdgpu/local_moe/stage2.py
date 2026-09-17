@@ -7,7 +7,7 @@ import avelang.language as al
 
 from .config import MoeConfig
 from .dispatch import resolve_2stage_implementation
-from .intermediate_mxfp4 import make_stage2_input_k256
+from .intermediate_mxfp4 import make_stage2_input_k128, make_stage2_input_k256
 from .solutionid import DataType
 from .weight_mxfp4 import make_w2_k128_weight_loads, make_w2_resources
 
@@ -159,10 +159,11 @@ def _make_weighted_fragment_store(tile_m, words):
 
 @cache
 def make_stage2_compute_k128(intermediate, tile_m, scale_columns, weight_cache):
-    """Load one K128 tile, compute it, and finish before reusing its LDS."""
+    """Keep K128 activations resident; load each weight tile synchronously."""
     I, BM, MR, SC = intermediate, tile_m, tile_m // 16, scale_columns
     WORDS, SX, KT = BM * 128, BM // 32, intermediate // 128
     load_w2_values, load_w2_scales = make_w2_k128_weight_loads(I, SC, weight_cache)
+    prefetch_resident_input, read_resident_input, _load_input_scales = make_stage2_input_k128(I, BM, SC)
     write_fragment = _make_weighted_fragment_store(BM, WORDS)
 
     @avelang.jit
@@ -188,13 +189,10 @@ def make_stage2_compute_k128(intermediate, tile_m, scale_columns, weight_cache):
         fragments = al.make_local((MR, 4), al.u32)
         input_scales = al.make_local((2,), al.u32)
         route_weights = al.make_local((MR,), al.f32)
-        lds = al.view(storage, al.u32, al.make_layout((BM, 4, 4), (16, 4, 1)))
+        prefetch_resident_input(act_resource, storage, block, wave, lane)
+        al.amdgpu.s_waitcnt(0, 0, 0)
+        al.syncthreads()
         for k in al.static_range(KT):
-            if wave < BM // 16:
-                row = wave * 16 + lane // 4
-                vector = (lane % 4) ^ ((row >> 1) & 3)
-                offset = (block * BM + row) * (I // 2) + k * 64 + vector * 16
-                al.amdgpu.raw_buffer_load_x4_lds(act_resource, storage, 16, offset, 0, wave * 256 * 4, 0)
             load_w2_values(weight_resource, weights, al.convert(k, al.u32), wave, lane)
             load_w2_scales(scale_resource, scale_cache, weight_scales, al.convert(k, al.u32), wave, lane)
             for n in al.static_range(2):
@@ -205,9 +203,7 @@ def make_stage2_compute_k128(intermediate, tile_m, scale_columns, weight_cache):
                 input_scales[m32] = packed_scale >> (16 * (k % 2))
             al.amdgpu.s_waitcnt(0, 0, 0)
             al.syncthreads()
-            for m in al.static_range(MR):
-                row = m * 16 + lane % 16
-                fragments[m] = lds[row, (lane // 16) ^ ((row >> 1) & 3)]
+            read_resident_input(storage, fragments, al.convert(k, al.u32), lane)
             for n in al.static_range(4):
                 for m in al.static_range(MR):
                     accum[n, m] = al.amdgpu.mfma_scale_16x16x128_fp4(
