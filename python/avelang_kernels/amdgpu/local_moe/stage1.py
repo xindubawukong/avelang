@@ -20,6 +20,17 @@ from .weight_mxfp4 import make_w13_resources, make_w13_weight_loads
 from .workgroup import make_grouped_workgroup_mapping
 
 
+@avelang.jit
+def _schedule_stage1_instructions():
+    for _ in al.static_range(6):
+        al.amdgpu.sched_group_barrier(0x20, 1, 0)
+        al.amdgpu.sched_group_barrier(0x8, 4, 0)
+    for _ in al.static_range(2):
+        al.amdgpu.sched_group_barrier(0x1, 1, 0)
+        al.amdgpu.sched_group_barrier(0x8, 4, 0)
+    al.amdgpu.sched_barrier(0)
+
+
 @cache
 def make_stage1_compute(config, *, prefetch_input, read_input):
     """Write FP32 [tile_m, projection_n] activations into the shared arena.
@@ -36,8 +47,10 @@ def make_stage1_compute(config, *, prefetch_input, read_input):
     SWIGLU = config.activation == ActivationFunction.OPENAI_SWIGLU
     SITU = config.activation == ActivationFunction.SITU_V2
     K_TILES = D // KG // 256
+    FOUR_PHASE = NR == 2 and (WM == 32 or config.stage1_num_warps == 4)
+    VMEM = 2 * (2 * NR + NS)
     BIAS_STRIDE = (I + 255) // 256 * 256
-    load_weights = make_w13_weight_loads(config)
+    load_weights, prefetch_weight_phase = make_w13_weight_loads(config)
 
     @avelang.jit
     def stage1_compute(
@@ -62,7 +75,9 @@ def make_stage1_compute(config, *, prefetch_input, read_input):
                     for c in al.static_range(4):
                         accum[projection, n, m, c] = al.convert(0.0, al.f32)
         weights = al.make_local((2, 2, NR, 4), al.u32)
+        next_weights = al.make_local((2, 2, NR, 4), al.u32)
         weight_scales = al.make_local((2, NS), al.u32)
+        next_scales = al.make_local((2, NS), al.u32)
         fragments = al.make_local((MR, 2, 4), al.u32)
         input_scales = al.make_local((2,), al.u32)
         prefetch_input(
@@ -73,6 +88,7 @@ def make_stage1_compute(config, *, prefetch_input, read_input):
         al.syncthreads()
         read_input(storage, fragments, input_scales, al.convert(0, al.u32), wave, lane)
         for k in al.static_range(K_TILES):
+            _schedule_stage1_instructions()
             if k + 1 < K_TILES:
                 prefetch_input(
                     act_resource,
@@ -84,22 +100,59 @@ def make_stage1_compute(config, *, prefetch_input, read_input):
                     wave,
                     lane,
                 )
-            for projection in al.static_range(2):
-                for half_k in al.static_range(2):
-                    for n in al.static_range(NR):
-                        for m in al.static_range(MR):
-                            accum[projection, n, m] = al.amdgpu.mfma_scale_16x16x128_fp4(
-                                weights[projection, half_k, n],
-                                weight_scales[projection, n // 2],
-                                fragments[m, half_k],
+            if FOUR_PHASE:
+                for phase in al.static_range(4):
+                    if k + 1 < K_TILES:
+                        prefetch_weight_phase(
+                            resource_w,
+                            resource_ws,
+                            next_weights,
+                            next_scales,
+                            al.convert(k + 1, al.u32),
+                            wave,
+                            lane,
+                            al.convert(phase, al.u32),
+                        )
+                    al.amdgpu.sched_barrier(0)
+                    al.amdgpu.s_setprio(1)
+                    for m in al.static_range(MR):
+                        for projection in al.static_range(2):
+                            accum[projection, phase % 2, m] = al.amdgpu.mfma_scale_16x16x128_fp4(
+                                weights[projection, phase // 2, phase % 2],
+                                weight_scales[projection, 0],
+                                fragments[m, phase // 2],
                                 input_scales[m // 2],
-                                accum[projection, n, m],
-                                2 * half_k + n % 2,
-                                2 * half_k + m % 2,
+                                accum[projection, phase % 2, m],
+                                phase,
+                                2 * (phase // 2) + m % 2,
                             )
+                    al.amdgpu.s_setprio(0)
+                    al.amdgpu.sched_barrier(0)
+                if k + 1 < K_TILES:
+                    for projection in al.static_range(2):
+                        for half_k in al.static_range(2):
+                            for n in al.static_range(NR):
+                                weights[projection, half_k, n] = next_weights[projection, half_k, n]
+                        for n in al.static_range(NS):
+                            weight_scales[projection, n] = next_scales[projection, n]
+            else:
+                for projection in al.static_range(2):
+                    for half_k in al.static_range(2):
+                        for n in al.static_range(NR):
+                            for m in al.static_range(MR):
+                                accum[projection, n, m] = al.amdgpu.mfma_scale_16x16x128_fp4(
+                                    weights[projection, half_k, n],
+                                    weight_scales[projection, n // 2],
+                                    fragments[m, half_k],
+                                    input_scales[m // 2],
+                                    accum[projection, n, m],
+                                    2 * half_k + n % 2,
+                                    2 * half_k + m % 2,
+                                )
+                if k + 1 < K_TILES:
+                    load_weights(resource_w, resource_ws, weights, weight_scales, al.convert(k + 1, al.u32), wave, lane)
             if k + 1 < K_TILES:
-                load_weights(resource_w, resource_ws, weights, weight_scales, al.convert(k + 1, al.u32), wave, lane)
-                al.amdgpu.s_waitcnt(0, 0, 0)
+                al.amdgpu.s_waitcnt(VMEM, 0, 0)
                 al.syncthreads()
                 read_input(storage, fragments, input_scales, al.convert(k + 1, al.u32), wave, lane)
         if KG == 2:

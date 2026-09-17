@@ -14,6 +14,7 @@ their own commits.
 Implemented optimization steps in this revision:
 
 - epilogue
+- four phase
 - fused input quant
 - grouped grid
 - k128 dma
