@@ -25,6 +25,7 @@ Implemented optimization steps in this revision:
 - kimi tiles
 - native scales
 - route reduce
+- situ algebra
 - sorted act
 - stage1 dma
 - stage1 pipeline

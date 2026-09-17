@@ -24,14 +24,28 @@ def openai_swiglu(gate: al.f32, up: al.f32) -> al.f32:
 
 
 @avelang.jit
-def situ_v2(gate: al.f32, up: al.f32) -> al.f32:
-    """Direct 100*tanh(gate/4)*sigmoid(gate)*tanh(up/25)."""
+def situ_v2_exponents(gate: al.f32, up: al.f32) -> (al.f32, al.f32):
+    """Independent exponentials that Stage1 can issue across its whole tile."""
+    eg = al.exp2(al.abs(gate) * al.convert(-0.7213475204444817, al.f32))
+    eu = al.exp2(al.abs(up) * al.convert(-0.11541560327111708, al.f32))
+    return eg, eu
+
+
+@avelang.jit
+def situ_v2_finish(gate: al.f32, up: al.f32, eg: al.f32, eu: al.f32) -> al.f32:
+    """Finish SiTU from precomputed exponentials, preserving HIP rounding."""
+    eg2 = eg * eg
     one = al.convert(1.0, al.f32)
-    eg = al.exp2(-al.abs(gate) * al.convert(0.7213475204444817, al.f32))
-    eu = al.exp2(-al.abs(up) * al.convert(0.11541560327111708, al.f32))
-    tg = (one - eg) * al.amdgpu.rcp(one + eg)
-    tu = (one - eu) * al.amdgpu.rcp(one + eu)
-    tg = al.select(gate < 0.0, -tg, tg)
-    tu = al.select(up < 0.0, -tu, tu)
-    sigmoid = al.amdgpu.rcp(one + al.exp2(-gate * al.convert(1.4426950408889634, al.f32)))
-    return al.convert(100.0, al.f32) * tg * sigmoid * tu
+    numerator = (one - eg) * (one - eu)
+    # HIP contracts eg*eg + 1 in Petit's denominator. Preserve that single
+    # rounding explicitly; a one-ulp difference can cross an FP4 midpoint.
+    denominator = (one + eg) * al.fma(eg, eg, one) * (one + eu)
+    positive = al.convert(100.0, al.f32) * numerator * al.amdgpu.rcp(denominator)
+    gated = al.select(gate > al.convert(0.0, al.f32), positive, -positive * eg2)
+    return al.select(up > al.convert(0.0, al.f32), gated, -gated)
+
+
+@avelang.jit
+def situ_v2(gate: al.f32, up: al.f32) -> al.f32:
+    eg, eu = situ_v2_exponents(gate, up)
+    return situ_v2_finish(gate, up, eg, eu)
