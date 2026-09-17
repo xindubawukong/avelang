@@ -10,7 +10,7 @@ from functools import cache
 import avelang
 import avelang.language as al
 
-from .activation import openai_swiglu, silu_dot, situ_v2
+from .activation import openai_swiglu, silu_dot, situ_v2_exponents, situ_v2_finish
 from .config import MoeConfig
 from .dispatch import resolve_2stage_implementation
 from .input_mxfp4 import make_mxfp4_input
@@ -189,22 +189,43 @@ def make_stage1_compute(config, *, prefetch_input, read_input):
                                 bias_values[n, c], al.f32
                             )
         hidden = al.view(storage, al.f32, al.make_layout((BM, BN // 4, 4), (BN, 4, 1)))
-        activated = al.make_local((NR, MR, 4), al.f32)
-        for n in al.range(NR):
-            for m in al.range(MR):
-                for c in al.range(4):
-                    gate, up = accum[0, n, m, c], accum[1, n, m, c]
-                    if SITU:
-                        activated[n, m, c] = situ_v2(gate, up)
-                    elif SWIGLU:
-                        activated[n, m, c] = openai_swiglu(gate, up)
-                    else:
-                        activated[n, m, c] = silu_dot(gate, up)
-        al.syncthreads()
-        if KG == 1 or wave < 2:
+        if SITU:
+            # Expose the independent exponentials before the dependent rcp
+            # chains. Finish and store one float4 at a time so later arithmetic
+            # can overlap each LDS write, as in Petit's Stage1 epilogue.
+            eg = al.make_local((NR, MR, 4), al.f32)
+            eu = al.make_local((NR, MR, 4), al.f32)
             for n in al.static_range(NR):
                 for m in al.static_range(MR):
-                    hidden[wave_m * WM + m * 16 + lane % 16, wave_n * (NR * 4) + n * 4 + lane // 16] = activated[n, m]
+                    for c in al.static_range(4):
+                        g, u = situ_v2_exponents(accum[0, n, m, c], accum[1, n, m, c])
+                        eg[n, m, c] = g
+                        eu[n, m, c] = u
+            al.syncthreads()
+            fragment = al.make_local((1, 4), al.f32)
+            for n in al.static_range(NR):
+                for m in al.static_range(MR):
+                    for c in al.static_range(4):
+                        fragment[0, c] = situ_v2_finish(accum[0, n, m, c], accum[1, n, m, c], eg[n, m, c], eu[n, m, c])
+                    if KG == 1 or wave < 2:
+                        hidden[wave_m * WM + m * 16 + lane % 16, wave_n * (NR * 4) + n * 4 + lane // 16] = fragment[0]
+        else:
+            activated = al.make_local((NR, MR, 4), al.f32)
+            for n in al.range(NR):
+                for m in al.range(MR):
+                    for c in al.range(4):
+                        gate, up = accum[0, n, m, c], accum[1, n, m, c]
+                        if SWIGLU:
+                            activated[n, m, c] = openai_swiglu(gate, up)
+                        else:
+                            activated[n, m, c] = silu_dot(gate, up)
+            al.syncthreads()
+            if KG == 1 or wave < 2:
+                for n in al.static_range(NR):
+                    for m in al.static_range(MR):
+                        hidden[wave_m * WM + m * 16 + lane % 16, wave_n * (NR * 4) + n * 4 + lane // 16] = activated[
+                            n, m
+                        ]
 
     return stage1_compute
 

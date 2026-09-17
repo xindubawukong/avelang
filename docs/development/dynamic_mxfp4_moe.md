@@ -27,6 +27,7 @@ Implemented optimization steps in this revision:
 - native scales
 - route reduce
 - situ algebra
+- situ overlap
 - sorted act
 - stage1 dma
 - stage1 pipeline
