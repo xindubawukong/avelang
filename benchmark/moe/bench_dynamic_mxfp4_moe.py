@@ -9,6 +9,7 @@ from pathlib import Path
 import torch
 from avelang_kernels.amdgpu.local_moe import ExpertWeights, MoeWorkspace, Routing, dynamic_mxfp4_moe, get_2stage_cfgs
 from avelang_kernels.amdgpu.local_moe.api import prepare_input
+from avelang_kernels.amdgpu.local_moe.route_reduce import make_route_reduce
 from avelang_kernels.amdgpu.local_moe.stage1 import make_stage1
 from avelang_kernels.amdgpu.local_moe.stage2 import make_stage2
 
@@ -90,6 +91,7 @@ def run_case(args, model, tokens):
     config = get_2stage_cfgs(token=tokens, **BENCH_CASES[model], arch="gfx950")
     x, weights, routing = make_inputs(config, tokens, args.seed)
     ws = MoeWorkspace.allocate(x, routing, config)
+    d = config.hidden
     stage1_kernel, stage2_kernel = make_stage1(config), make_stage2(config)
 
     def stage1():
@@ -108,7 +110,8 @@ def run_case(args, model, tokens):
         )
 
     def stage2():
-        ws.out.zero_()
+        if not config.use_route_reduce:
+            ws.out.zero_()
         stage2_kernel[lambda: config.stage2_grid(tokens, routing.capacity)](
             ws.intermediate,
             weights.w2,
@@ -118,10 +121,17 @@ def run_case(args, model, tokens):
             routing.experts,
             routing.weights,
             routing.counts,
-            ws.out,
+            ws.route_output if config.use_route_reduce else ws.out,
             routing.capacity,
             num_warps=config.stage2_num_warps,
         )
+        if config.use_route_reduce:
+            make_route_reduce(d, config.topk)[lambda: ((tokens, (d // 8 + 511) // 512, 1), (512, 1, 1))](
+                ws.route_output,
+                ws.out,
+                tokens,
+                num_warps=8,
+            )
         return ws.out
 
     def compute():

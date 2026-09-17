@@ -23,6 +23,7 @@ Implemented optimization steps in this revision:
 - k256 prefetch
 - kimi tiles
 - native scales
+- route reduce
 - sorted act
 - stage1 dma
 - stage1 pipeline

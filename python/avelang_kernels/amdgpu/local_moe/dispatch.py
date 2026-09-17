@@ -160,8 +160,14 @@ def _registered_2stage_implementations(hidden, intermediate):
 def resolve_2stage_implementation(config: MoeConfig):
     """Resolve a complete solution to its registered pair of kernel factories."""
     implementations = _registered_2stage_implementations(config.hidden, config.intermediate)
-    if config.use_route_reduce:
-        raise ValueError("route reduction is not implemented")
+    if config.use_route_reduce and (
+        config.hidden,
+        config.intermediate,
+        config.activation,
+        config.solution.bias_dtype,
+        config.stage2_tile_k,
+    ) != (3584, 384, ActivationFunction.SITU_V2, DataType.NONE, 128):
+        raise ValueError("route reduction requires the local Kimi K3 K128 implementation")
     try:
         return implementations[config.solution]
     except KeyError:
@@ -250,9 +256,10 @@ def _get_2stage_cfgs_cached(token, requested, arch, policy1, policy2, explicit, 
                 s.stage2_weight_load_policy != (policy2 if policy2 is not None else preferred2),
             ),
         )
-    if route_reduce:
-        raise ValueError("route reduction is not implemented")
-    return MoeConfig(selected, requested.experts, requested.topk)
+    reduce = kimi and token >= 8192 and not is_ep if route_reduce is None else route_reduce
+    if reduce and (is_ep or not kimi or selected.stage2_tile_k != 128):
+        raise ValueError("route reduction requires complete local Kimi K3 routing and K128 stage2")
+    return MoeConfig(selected, requested.experts, requested.topk, reduce)
 
 
 def get_2stage_cfgs(

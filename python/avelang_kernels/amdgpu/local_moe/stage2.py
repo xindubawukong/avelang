@@ -374,6 +374,7 @@ def _make_stage2_kernel_k128(config: MoeConfig):
     SC = config.scale_columns
     RATIO = config.stage1_tile_m // BM
     WORDS = BM * 128
+    ROUTE_OUTPUT = config.use_route_reduce
     map_workgroup = make_grouped_workgroup_mapping(D // 256, 2, 4)
     stage2_compute_k128 = make_stage2_compute_k128(I, BM, SC, config.stage2_weight_load_aux)
     initialize_w2_resources = make_w2_resources(D, I, E, SC)
@@ -415,8 +416,11 @@ def _make_stage2_kernel_k128(config: MoeConfig):
         route_weight_view = al.subview(route_weights, (block * BM,), (BM,), (1,))
         route_resource = al.amdgpu.make_rsrc(route_view, BM * 4)
         rw_resource = al.amdgpu.make_rsrc(route_weight_view, BM * 4)
-        output = al.make_tensor(out_ptr, al.bf16, al.make_layout((al.convert(tokens, al.u64) * 1 * D,), (1,)))
+        output = al.make_tensor(
+            out_ptr, al.bf16, al.make_layout((al.convert(tokens, al.u64) * (TOPK if ROUTE_OUTPUT else 1) * D,), (1,))
+        )
         output_resource = al.amdgpu.make_rsrc(output, tokens * D * 2)
+        route_out = al.view(output, al.bf16, al.make_layout((tokens, TOPK, D // 2, 2), (TOPK * D, D, 2, 1)))
         storage = al.make_shared((WORDS,), al.u32)
         stage2_compute_k128(act_resource, weight_resource, scale_resource, rw_resource, storage, block, act_bytes, tid)
         shared = al.view(storage, al.bf16, al.make_layout((BM * 128, 2), (2, 1)))
@@ -433,9 +437,14 @@ def _make_stage2_kernel_k128(config: MoeConfig):
                 offset = al.convert(token * D * 2 + tile * 512 + (tid % 32) * 4, al.u32)
                 for n in al.static_range(4):
                     index = output_word_index(row, (n * 32 + tid % 32) * 2)
-                    al.amdgpu.raw_buffer_atomic_add_bf16x2(
-                        shared[index], output_resource, offset + al.convert(n * 128, al.u32)
-                    )
+                    if ROUTE_OUTPUT:
+                        route_out[
+                            al.convert(token, al.u64), slot, al.convert(tile * 128 + tid % 32, al.u64) + n * 32
+                        ] = shared[index]
+                    else:
+                        al.amdgpu.raw_buffer_atomic_add_bf16x2(
+                            shared[index], output_resource, offset + al.convert(n * 128, al.u32)
+                        )
 
     return stage2
 

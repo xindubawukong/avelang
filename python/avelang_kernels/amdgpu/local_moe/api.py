@@ -7,6 +7,7 @@ import torch
 from .config import MoeConfig
 from .dispatch import resolve_2stage_implementation
 from .intermediate_mxfp4 import IntermediateLayout
+from .route_reduce import make_route_reduce
 from .scale_layout import ceildiv, scale_byte_shape
 from .solutionid import DataType
 from .stage1 import make_stage1
@@ -110,7 +111,9 @@ class MoeWorkspace:
             byte_tensor(scale_byte_shape(routing.capacity, d)),
             byte_tensor((layout.nbytes,)),
             torch.empty_like(x),
-            None,
+            torch.empty((m, config.topk, d), dtype=torch.bfloat16, device=x.device)
+            if config.use_route_reduce
+            else None,
         )
 
 
@@ -218,6 +221,15 @@ def dynamic_mxfp4_moe(
     ):
         raise ValueError("workspace output must match input shape, device and dtype")
     IntermediateLayout(capacity, i, config.sorted_intermediate).views(workspace.intermediate, x.shape[0], config.topk)
+    route_output = workspace.route_output if config.use_route_reduce else workspace.out
+    if config.use_route_reduce and (
+        route_output is None
+        or route_output.shape != (x.shape[0], config.topk, d)
+        or route_output.dtype != torch.bfloat16
+        or route_output.device != x.device
+        or not route_output.is_contiguous()
+    ):
+        raise ValueError("route reduction requires a BF16 [tokens, topk, hidden] workspace")
     out = workspace.out
     if not x.shape[0]:
         return out
@@ -243,7 +255,8 @@ def dynamic_mxfp4_moe(
             capacity,
             num_warps=config1.stage1_num_warps,
         )
-        out.zero_()
+        if not config.use_route_reduce:
+            out.zero_()
         make_stage2(config2)[lambda: config2.stage2_grid(x.shape[0], capacity)](
             workspace.intermediate,
             weights.w2,
@@ -253,8 +266,12 @@ def dynamic_mxfp4_moe(
             routing.experts,
             routing.weights,
             routing.counts,
-            out,
+            route_output,
             capacity,
             num_warps=config2.stage2_num_warps,
         )
+        if config.use_route_reduce:
+            make_route_reduce(d, config.topk)[lambda: ((x.shape[0], (d // 8 + 511) // 512, 1), (512, 1, 1))](
+                route_output, out, x.shape[0], num_warps=8
+            )
         return out
