@@ -13,6 +13,7 @@ their own commits.
 
 Implemented optimization steps in this revision:
 
+- epilogue
 - k256 lds
 - k256 prefetch
 - native scales
