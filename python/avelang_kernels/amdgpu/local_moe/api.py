@@ -139,12 +139,18 @@ def prepare_input(x: torch.Tensor, routing: Routing, config: MoeConfig, workspac
     # Keep AITER a dependency of BF16 input preparation, not kernel imports.
     from aiter.ops.quant import (
         dynamic_per_group_scaled_quant,
+        fused_dynamic_mx_quant_moe_sort_hip,
         mxfp4_moe_sort_hip,
     )
 
     sorted_scales = scales.view(routing.capacity, columns // 32)
-    dynamic_per_group_scaled_quant(act, x, per_token, 32, shuffle_scale=False)
-    mxfp4_moe_sort_hip(sorted_scales, per_token, routing.ids, routing.counts, tokens, columns)
+    if tokens <= 2048 // config.topk:
+        fused_dynamic_mx_quant_moe_sort_hip(
+            act, sorted_scales, x, routing.ids, routing.counts, tokens, config.stage1_tile_m, 32
+        )
+    else:
+        dynamic_per_group_scaled_quant(act, x, per_token, 32, shuffle_scale=False)
+        mxfp4_moe_sort_hip(sorted_scales, per_token, routing.ids, routing.counts, tokens, columns)
     return act, scales
 
 
