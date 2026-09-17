@@ -14,6 +14,7 @@ their own commits.
 Implemented optimization steps in this revision:
 
 - k256 lds
+- k256 prefetch
 - native scales
 - sorted act
 - stage1 dma

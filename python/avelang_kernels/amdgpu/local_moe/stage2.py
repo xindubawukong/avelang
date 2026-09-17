@@ -53,14 +53,20 @@ def make_stage2_compute_k256(intermediate, bias, weight_cache, act_cache=0, word
         fragments = al.make_local((2, 2, 4), al.u32)
         packed_bias = al.make_local((4, 2), al.u32)
         route_weights = al.make_local((2,), al.f32)
+        for m in al.static_range(2):
+            bits = al.amdgpu.raw_buffer_load_x1(rw_resource, (m * 16 + lane % 16) * 4, 0, act_cache)
+            route_weights[m] = al.bitcast(bits, al.f32)
+        if BIAS:
+            for n in al.static_range(4):
+                offset = (tile * 256 + wave * 64 + n * 4 + (lane // 16) * 16) * 2
+                packed_bias[n] = al.amdgpu.raw_buffer_load_x2(bias_resource, offset, 0, 0)
         for k in al.static_range(K_TILES):
             stage = k % 2
             prefetched, scale = prefetch_stage2_input(
                 act_resource, act_offset, act_base, scale_offset, scale_base, input_valid, al.convert(k, al.u32)
             )
-            lds[stage, input_row, vector ^ (input_row & 15)] = prefetched
-            al.syncthreads()
-            read_stage2_input(storage, fragments, al.convert(k, al.u32), lane)
+            # Keep the weight issue group next to the LDS handoff/MFMA loop.
+            # A bulk-load helper changed allocation/scheduling and slowed DSv4 EP8.
             for half_k in al.static_range(2):
                 for n in al.static_range(4):
                     offset_w = (wave * 64 + n * 16) * (I // 2) + half_k * 1024 + lane * 16
@@ -69,6 +75,9 @@ def make_stage2_compute_k256(intermediate, bias, weight_cache, act_cache=0, word
                 weight_scales[n] = al.amdgpu.raw_buffer_load_x1(
                     scale_resource, (wave * 2 + n) * I + lane * 4, k * 256, 0
                 )
+            lds[stage, input_row, vector ^ (input_row & 15)] = prefetched
+            al.syncthreads()
+            read_stage2_input(storage, fragments, al.convert(k, al.u32), lane)
             for half_k in al.static_range(2):
                 for n in al.static_range(4):
                     for m in al.static_range(2):
@@ -81,14 +90,6 @@ def make_stage2_compute_k256(intermediate, bias, weight_cache, act_cache=0, word
                             2 * half_k + n % 2,
                             2 * half_k + m,
                         )
-            al.syncthreads()
-        for m in al.static_range(2):
-            bits = al.amdgpu.raw_buffer_load_x1(rw_resource, (m * 16 + lane % 16) * 4, 0, act_cache)
-            route_weights[m] = al.bitcast(bits, al.f32)
-        if BIAS:
-            for n in al.static_range(4):
-                offset = (tile * 256 + wave * 64 + n * 4 + (lane // 16) * 16) * 2
-                packed_bias[n] = al.amdgpu.raw_buffer_load_x2(bias_resource, offset, 0, 0)
         al.syncthreads()
         shared = al.view(storage, al.bf16, al.make_layout((32, 256), (256, 1)))
         bias_values = al.view(packed_bias, al.bf16, al.make_layout((4, 4), (4, 1)))
