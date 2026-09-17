@@ -101,6 +101,22 @@ def make_stage1_compute(config, *, prefetch_input, read_input):
                 al.amdgpu.s_waitcnt(0, 0, 0)
                 al.syncthreads()
                 read_input(storage, fragments, input_scales, al.convert(k + 1, al.u32), wave, lane)
+        if KG == 2:
+            partials = al.view(
+                storage, al.f32, al.make_layout((2, NR, MR, 128, 4), (NR * MR * 512, MR * 512, 512, 4, 1))
+            )
+            al.syncthreads()
+            if wave >= 2:
+                for projection in al.static_range(2):
+                    for n in al.static_range(NR):
+                        for m in al.static_range(MR):
+                            partials[projection, n, m, tid - 128] = accum[projection, n, m]
+            al.syncthreads()
+            if wave < 2:
+                for projection in al.static_range(2):
+                    for n in al.static_range(NR):
+                        for m in al.static_range(MR):
+                            accum[projection, n, m] = accum[projection, n, m] + partials[projection, n, m, tid]
         if BIAS:
             for projection in al.static_range(2):
                 packed_bias = al.make_local((NR, 2), al.u32)

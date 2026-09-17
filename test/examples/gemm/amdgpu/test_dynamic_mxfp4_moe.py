@@ -308,7 +308,7 @@ def test_aiter_input_preparation(tokens, columns, capacity):
 
 
 @pytest.mark.skipif(not gfx950, reason="Native MXFP4 requires gfx950")
-@pytest.mark.parametrize("s1,s2", [(0, 1)])
+@pytest.mark.parametrize("s1,s2", [(0, 1), (4, 1), (2, 1), (2, 2)])
 def test_k128_tiles_with_known_projection_and_padded_routes(s1, s2):
     from avelang_kernels.amdgpu.local_moe import ExpertWeights, MoeConfig, MoeSolutionId, dynamic_mxfp4_moe
     from avelang_kernels.amdgpu.local_moe.solutionid import DataType
@@ -346,3 +346,19 @@ def test_k128_tiles_with_known_projection_and_padded_routes(s1, s2):
     for token, slot, expert, weight in routes:
         expected[token] += (value * weight).bfloat16()
     torch.testing.assert_close(actual.cpu(), expected, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not gfx950, reason="Native MXFP4 requires gfx950")
+@pytest.mark.parametrize("activation", ["swiglu", "situ"])
+def test_m64_n512_stage1_bias_and_m32_stage2(activation):
+    from dataclasses import replace
+
+    from avelang_kernels.amdgpu.local_moe import dynamic_mxfp4_moe
+    from avelang_kernels.amdgpu.local_moe.solutionid import Stage1TileShape
+
+    config = get_2stage_cfgs(35, 512, 256, 3, 2, activation=activation, bias_dtype="bf16")
+    config = replace(config, solution=replace(config.solution, stage1_tile_shape=Stage1TileShape.M64_N512))
+    x, weights, routing, raw, routes = make_problem(config, 35)
+    actual = dynamic_mxfp4_moe(x, weights, routing, config)
+    expected = moe_reference(x, config, raw, routes)
+    torch.testing.assert_close(actual.cpu(), expected, rtol=0.02, atol=0.01)

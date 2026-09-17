@@ -20,6 +20,7 @@ Implemented optimization steps in this revision:
 - k128 resident
 - k256 lds
 - k256 prefetch
+- kimi tiles
 - native scales
 - sorted act
 - stage1 dma

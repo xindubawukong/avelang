@@ -122,7 +122,11 @@ def _registered_2stage_implementations(hidden, intermediate):
     implementations = {}
     shapes = (
         (Stage1TileShape.M32_N256, Stage2TileShape.M32_N256_K256),
+        (Stage1TileShape.M64_N512, Stage2TileShape.M32_N256_K256),
         (Stage1TileShape.M32_N256, Stage2TileShape.M32_N256_K128),
+        (Stage1TileShape.M32_N128_K2, Stage2TileShape.M32_N256_K128),
+        (Stage1TileShape.M64_N256, Stage2TileShape.M32_N256_K128),
+        (Stage1TileShape.M64_N256, Stage2TileShape.M64_N256_K128),
     )
     for activation in ActivationFunction:
         for bias in (DataType.NONE, DataType.BF16):
@@ -220,8 +224,8 @@ def _get_2stage_cfgs_cached(token, requested, arch, policy1, policy2, explicit, 
         if kimi:
             preferred1 = WeightLoadPolicy.NON_TEMPORAL
             preferred2 = WeightLoadPolicy.NON_TEMPORAL
-            s1_shape = Stage1TileShape.M32_N256
-            s2_shape = Stage2TileShape.M32_N256_K128
+            s1_shape = Stage1TileShape.M64_N256 if token >= 2048 else Stage1TileShape.M32_N128_K2
+            s2_shape = Stage2TileShape.M64_N256_K128 if token >= 2048 else Stage2TileShape.M32_N256_K128
         else:
             preferred1 = preferred2 = WeightLoadPolicy.NON_TEMPORAL
             s1_shape, s2_shape = Stage1TileShape.M32_N256, Stage2TileShape.M32_N256_K256

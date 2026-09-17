@@ -170,7 +170,7 @@ def test_direct_construction_cannot_bypass_implementation_resolution(changes):
 
 def test_dispatch_routes_only_registered_complete_combinations(monkeypatch):
     base = choose(weight_load_policy="non_temporal")
-    solution = base.solution
+    solution = replace(base.solution, stage1_tile_shape=Stage1TileShape.M64_N512)
     config = replace(base, solution=solution)
     stage1, stage2 = object(), object()
     registry = dispatch._registered_2stage_implementations(config.hidden, config.intermediate)
