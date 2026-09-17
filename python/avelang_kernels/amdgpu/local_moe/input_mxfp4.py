@@ -10,7 +10,7 @@ import avelang.language as al
 def make_mxfp4_input(config):
     """Local routed input: issue DMA without waiting; read after caller's barrier.
 
-    LDS act is [stage, k_group, row, vector8, word4], in row-major order.
+    LDS act is [stage, k_group, row, vector8, word4], with XOR row swizzle.
     Scale words follow each stage's act. Each u32 packs four E8M0 scales.
     """
     D = config.compute_hidden
@@ -36,17 +36,14 @@ def make_mxfp4_input(config):
             for load in al.static_range(LOADS):
                 offset = input_offsets[load] + group * (D // KG // 2) + k * 128
                 destination = (stage * STRIDE + group * BM * 32 + wave * TB * 32 + load * 256) * 4
-                value = al.amdgpu.raw_buffer_load_x4(act_resource, offset, 0, 0)
-                words = al.view(storage, al.u32, al.make_layout((WORDS // 4, 4), (4, 1)))
-                words[destination // 16 + lane] = value
+                al.amdgpu.raw_buffer_load_x4_lds(act_resource, storage, 16, offset, 0, destination, 0)
         # Match the source pipeline: all act copies precede scale copies.
         # A single wave guard avoids splitting the K2 act path in two.
         if wave < BM // 32:
             for group in al.static_range(KG):
                 offset_s = ((block * (BM // 32) + wave) * (D // 256) + k + group * (D // KG // 256)) * 256 + lane * 4
                 destination_s = (stage * STRIDE + ACT_WORDS + (group * (BM // 32) + wave) * 64) * 4
-                scale = al.amdgpu.raw_buffer_load_x1(act_scale_resource, offset_s, 0, 0)
-                storage[destination_s // 4 + lane] = scale
+                al.amdgpu.raw_buffer_load_x1_lds(act_scale_resource, storage, 4, offset_s, 0, destination_s, 0)
 
     @avelang.jit
     def read_input(
@@ -64,7 +61,7 @@ def make_mxfp4_input(config):
         for m in al.static_range(MR):
             for half_k in al.static_range(2):
                 row = wave_m * WM + m * 16 + lane % 16
-                fragments[m, half_k] = lds[stage, group, row, lane // 16 + half_k * 4]
+                fragments[m, half_k] = lds[stage, group, row, (lane // 16 + half_k * 4) ^ (row & 7)]
         for m32 in al.static_range(SX):
             scales[m32] = storage[stage * STRIDE + ACT_WORDS + (group * (BM // 32) + wave_m * SX + m32) * 64 + lane]
 

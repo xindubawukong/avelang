@@ -187,7 +187,7 @@ def make_stage1_kernel(config: MoeConfig):
         for load in al.static_range(INPUT_LOADS):
             row = wave * TB + load * 8 + lane // 8
             token = storage[ARENA + row] & 0xFFFFFF
-            input_offsets[load] = al.min(token, num_tokens) * (D // 2) + (lane % 8) * 16
+            input_offsets[load] = al.min(token, num_tokens) * (D // 2) + ((lane % 8) ^ (row & 7)) * 16
         act_resource = al.amdgpu.make_rsrc(ACT, num_tokens * D // 2)
         act_scale_resource = al.amdgpu.make_rsrc(ACT_SCALES, capacity * D // 32)
         stage1_compute(
