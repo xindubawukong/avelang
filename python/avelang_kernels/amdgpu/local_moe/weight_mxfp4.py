@@ -13,7 +13,7 @@ import avelang.language as al
 @cache
 def make_w13_weight_loads(config):
     """Fill [projection, half_k, n_fragment, word4] registers; caller owns waits."""
-    D = config.compute_hidden
+    D, I = config.compute_hidden, config.intermediate
     WN, KG, NR = config.stage1_warps_n, config.stage1_k_groups, config.stage1_wave_n // 16
     NS, CACHE = NR // 2, config.stage1_weight_load_aux
 
@@ -21,8 +21,6 @@ def make_w13_weight_loads(config):
     def load_weights(
         w: al.Tensor((4,), al.u32),
         ws: al.Tensor((4,), al.u32),
-        wup: al.Tensor((4,), al.u32),
-        wsup: al.Tensor((4,), al.u32),
         values: al.Tensor((2, 2, NR, 4), al.u32),
         scales: al.Tensor((2, NS), al.u32),
         k: al.u32,
@@ -35,16 +33,16 @@ def make_w13_weight_loads(config):
             for half_k in al.static_range(2):
                 for n in al.static_range(NR):
                     offset = (
-                        (wave_n * (NR * 16) + n * 16) * (D // 2) + group * (D // KG) * 8 + lane * 16 + half_k * 1024
+                        (wave_n * (NR * 16) + n * 16) * (D // 2)
+                        + group * (D // KG) * 8
+                        + lane * 16
+                        + half_k * 1024
+                        + projection * I * D // 2
                     )
-                    values[projection, half_k, n] = al.amdgpu.raw_buffer_load_x4(
-                        w if projection == 0 else wup, offset, k * 2048, CACHE
-                    )
+                    values[projection, half_k, n] = al.amdgpu.raw_buffer_load_x4(w, offset, k * 2048, CACHE)
             for n in al.static_range(NS):
-                offset_s = (wave_n * NS + n) * D + group * (D // KG) + lane * 4
-                scales[projection, n] = al.amdgpu.raw_buffer_load_x1(
-                    ws if projection == 0 else wsup, offset_s, k * 256, 0
-                )
+                offset_s = (wave_n * NS + n) * D + group * (D // KG) + lane * 4 + projection * I * D // 32
+                scales[projection, n] = al.amdgpu.raw_buffer_load_x1(ws, offset_s, k * 256, 0)
 
     return load_weights
 
@@ -61,18 +59,13 @@ def make_w13_resources(hidden, intermediate, experts, projection_n, bias_stride)
         expert: al.u32,
         tile: al.u32,
         bias_enabled: al.u32,
-        projection: al.u32,
     ) -> (al.Tensor((4,), al.u32), al.Tensor((4,), al.u32), al.Tensor((4,), al.u32)):
         weights = al.make_tensor(weight, al.u32, al.make_layout((E * (I * D // 4),), (1,)))
         scales = al.make_tensor(ws, al.u32, al.make_layout((E * (I * D // 64),), (1,)))
-        weight_view = al.subview(
-            weights, ((expert * 2 + projection) * I * D // 8 + tile * BN * D // 8,), (BN * D // 8,), (1,)
-        )
-        scale_view = al.subview(
-            scales, ((expert * 2 + projection) * I * D // 128 + tile * BN * D // 128,), (BN * D // 128,), (1,)
-        )
-        weight_resource = al.amdgpu.make_rsrc(weight_view, BN * D // 2)
-        scale_resource = al.amdgpu.make_rsrc(scale_view, BN * D // 32)
+        weight_view = al.subview(weights, (expert * (I * D // 4) + tile * BN * D // 8,), ((I + BN) * D // 8,), (1,))
+        scale_view = al.subview(scales, (expert * (I * D // 64) + tile * BN * D // 128,), ((I + BN) * D // 128,), (1,))
+        weight_resource = al.amdgpu.make_rsrc(weight_view, (I + BN) * D // 2)
+        scale_resource = al.amdgpu.make_rsrc(scale_view, (I + BN) * D // 32)
         biases = al.make_tensor(bias_ptr, al.bf16, al.make_layout((E * 2 * BIAS_STRIDE,), (1,)))
         bias_view = al.subview(biases, (expert * 2 * BIAS_STRIDE + tile * BN,), (BN,), (1,))
         bias_resource = al.amdgpu.make_rsrc(

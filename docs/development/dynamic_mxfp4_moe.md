@@ -13,6 +13,7 @@ their own commits.
 
 Implemented optimization steps in this revision:
 
+- w13 resources
 
 
 Validation in this reconstructed history is offline gfx950 compilation only.

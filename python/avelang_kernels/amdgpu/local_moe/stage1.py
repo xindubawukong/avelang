@@ -44,8 +44,6 @@ def make_stage1_compute(config, *, prefetch_input, read_input):
         act_scale_resource: al.Tensor((4,), al.u32),
         resource_w: al.Tensor((4,), al.u32),
         resource_ws: al.Tensor((4,), al.u32),
-        resource_wup: al.Tensor((4,), al.u32),
-        resource_wsup: al.Tensor((4,), al.u32),
         bias_resource: al.Tensor((4,), al.u32),
         storage: al.Tensor((WORDS,), al.u32),
         input_offsets: al.Tensor((2,), al.u32),
@@ -73,17 +71,7 @@ def make_stage1_compute(config, *, prefetch_input, read_input):
             al.amdgpu.s_waitcnt(0, 0, 0)
             al.syncthreads()
             read_input(storage, fragments, input_scales, al.convert(k, al.u32), wave, lane)
-            load_weights(
-                resource_w,
-                resource_ws,
-                resource_wup,
-                resource_wsup,
-                weights,
-                weight_scales,
-                al.convert(k, al.u32),
-                wave,
-                lane,
-            )
+            load_weights(resource_w, resource_ws, weights, weight_scales, al.convert(k, al.u32), wave, lane)
             for projection in al.static_range(2):
                 for half_k in al.static_range(2):
                     for n in al.static_range(NR):
@@ -182,10 +170,7 @@ def make_stage1_kernel(config: MoeConfig):
         ACT = al.make_tensor(act, al.u32, al.make_layout((num_tokens * D // 8,), (1,)))
         ACT_SCALES = al.make_tensor(act_scales, al.u32, al.make_layout((capacity * D // 128,), (1,)))
         resource_w, resource_ws, bias_resource = initialize_w13_resources(
-            weight, ws, bias_ptr, expert, tile, al.convert(1, al.u32), al.convert(0, al.u32)
-        )
-        resource_wup, resource_wsup, _unused_bias = initialize_w13_resources(
-            weight, ws, bias_ptr, expert, tile, al.convert(1, al.u32), al.convert(1, al.u32)
+            weight, ws, bias_ptr, expert, tile, al.convert(1, al.u32)
         )
         scale_base = capacity * I // 2
         workspace_bytes = scale_base + ((capacity + 255) // 256) * 256 * SCALE_COLS
@@ -210,8 +195,6 @@ def make_stage1_kernel(config: MoeConfig):
             act_scale_resource,
             resource_w,
             resource_ws,
-            resource_wup,
-            resource_wsup,
             bias_resource,
             storage,
             input_offsets,
