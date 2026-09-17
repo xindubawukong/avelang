@@ -47,7 +47,7 @@ def make_stage2_compute_k256(intermediate, bias, weight_cache, act_cache=0, word
         lane, wave = tid % 64, al.amdgpu.readfirstlane(tid // 64)
         input_row, vector = tid // 8, tid % 8
         accum = al.full((4, 2, 4), 0, al.f32)
-        lds = al.view(storage, al.u32, al.make_layout((2, 32, 8, 4), (1024, 32, 4, 1)))
+        lds = al.view(storage, al.u32, al.make_layout((2, 32, 16, 4), (2048, 64, 4, 1)))
         weights = al.make_local((2, 4, 4), al.u32)
         weight_scales = al.make_local((2,), al.u32)
         fragments = al.make_local((2, 2, 4), al.u32)
@@ -58,7 +58,7 @@ def make_stage2_compute_k256(intermediate, bias, weight_cache, act_cache=0, word
             prefetched, scale = prefetch_stage2_input(
                 act_resource, act_offset, act_base, scale_offset, scale_base, input_valid, al.convert(k, al.u32)
             )
-            lds[stage, input_row, vector] = prefetched
+            lds[stage, input_row, vector ^ (input_row & 15)] = prefetched
             al.syncthreads()
             read_stage2_input(storage, fragments, al.convert(k, al.u32), lane)
             for half_k in al.static_range(2):

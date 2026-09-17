@@ -106,10 +106,10 @@ def make_stage2_input_k256(words, act_aux):
         k: al.u32,
         lane: al.u32,
     ):
-        lds = al.view(storage, al.u32, al.make_layout((2, 32, 8, 4), (1024, 32, 4, 1)))
+        lds = al.view(storage, al.u32, al.make_layout((2, 32, 16, 4), (2048, 64, 4, 1)))
         for m in al.static_range(2):
             for half_k in al.static_range(2):
                 row = m * 16 + lane % 16
-                fragments[m, half_k] = lds[k % 2, row, lane // 16 + half_k * 4]
+                fragments[m, half_k] = lds[k % 2, row, (lane // 16 + half_k * 4) ^ (row & 15)]
 
     return prefetch_stage2_input, read_stage2_input

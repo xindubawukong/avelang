@@ -13,6 +13,7 @@ their own commits.
 
 Implemented optimization steps in this revision:
 
+- k256 lds
 - native scales
 - sorted act
 - stage1 dma
