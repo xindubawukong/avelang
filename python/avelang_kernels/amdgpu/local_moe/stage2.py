@@ -108,7 +108,7 @@ def make_stage2_compute_k256(intermediate, bias, weight_cache, act_cache=0, word
 
 
 @cache
-def make_stage2_compute_k128(intermediate, tile_m, scale_columns, weight_cache, topk):
+def make_stage2_compute_k128(intermediate, tile_m, scale_columns, weight_cache):
     """Load one K128 tile, compute it, and finish before reusing its LDS."""
     I, BM, MR, SC = intermediate, tile_m, tile_m // 16, scale_columns
     WORDS, SX, KT = BM * 128, BM // 32, intermediate // 128
@@ -120,8 +120,6 @@ def make_stage2_compute_k128(intermediate, tile_m, scale_columns, weight_cache, 
         weight_resource: al.Tensor((4,), al.u32),
         scale_resource: al.Tensor((4,), al.u32),
         rw_resource: al.Tensor((4,), al.u32),
-        route_resource: al.Tensor((4,), al.u32),
-        tokens: al.u32,
         storage: al.Tensor((WORDS,), al.u32),
         block: al.u32,
         act_bytes: al.u32,
@@ -139,13 +137,7 @@ def make_stage2_compute_k128(intermediate, tile_m, scale_columns, weight_cache, 
         for k in al.static_range(KT):
             if wave < BM // 16:
                 row, vector = wave * 16 + lane // 4, lane % 4
-                route = al.amdgpu.raw_buffer_load_x1(route_resource, row * 4, 0, 0)
-                token, slot = route & 0xFFFFFF, route >> 24
-                offset = al.select(
-                    token < tokens and slot < topk,
-                    (token * topk + slot) * (I // 2) + k * 64 + vector * 16,
-                    al.convert(0xFFFFFFFF, al.u32),
-                )
+                offset = (block * BM + row) * (I // 2) + k * 64 + vector * 16
                 value = al.amdgpu.raw_buffer_load_x4(act_resource, offset, 0, 0)
                 lds[row, lane % 4] = value
             load_w2_values(weight_resource, weights, al.convert(k, al.u32), wave, lane)
@@ -289,7 +281,7 @@ def _make_stage2_kernel_k128(config: MoeConfig):
     SC = config.scale_columns
     RATIO = config.stage1_tile_m // BM
     WORDS = BM * 128
-    stage2_compute_k128 = make_stage2_compute_k128(I, BM, SC, config.stage2_weight_load_aux, TOPK)
+    stage2_compute_k128 = make_stage2_compute_k128(I, BM, SC, config.stage2_weight_load_aux)
     initialize_w2_resources = make_w2_resources(D, I, E, SC)
 
     @avelang.jit
@@ -332,18 +324,7 @@ def _make_stage2_kernel_k128(config: MoeConfig):
         output = al.make_tensor(out_ptr, al.bf16, al.make_layout((al.convert(tokens, al.u64) * 1 * D,), (1,)))
         output_resource = al.amdgpu.make_rsrc(output, tokens * D * 2)
         storage = al.make_shared((WORDS,), al.u32)
-        stage2_compute_k128(
-            act_resource,
-            weight_resource,
-            scale_resource,
-            rw_resource,
-            route_resource,
-            tokens,
-            storage,
-            block,
-            act_bytes,
-            tid,
-        )
+        stage2_compute_k128(act_resource, weight_resource, scale_resource, rw_resource, storage, block, act_bytes, tid)
         shared = al.view(storage, al.bf16, al.make_layout((BM * 128, 2), (2, 1)))
         output_routes = al.make_local((OUTPUT_CHUNKS,), al.u32)
         for chunk in al.static_range(OUTPUT_CHUNKS):

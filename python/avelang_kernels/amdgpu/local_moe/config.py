@@ -121,7 +121,7 @@ class MoeConfig:
 
     @property
     def sorted_intermediate(self) -> bool:
-        return False
+        return self.stage2_tile_k == 128
 
     @property
     def scale_columns(self) -> int:
