@@ -64,14 +64,25 @@ def make_stage1_compute(config, *, prefetch_input, read_input):
         weight_scales = al.make_local((2, NS), al.u32)
         fragments = al.make_local((MR, 2, 4), al.u32)
         input_scales = al.make_local((2,), al.u32)
+        prefetch_input(
+            act_resource, act_scale_resource, storage, input_offsets, block, al.convert(0, al.u32), wave, lane
+        )
+        load_weights(resource_w, resource_ws, weights, weight_scales, al.convert(0, al.u32), wave, lane)
+        al.amdgpu.s_waitcnt(0, 0, 0)
+        al.syncthreads()
+        read_input(storage, fragments, input_scales, al.convert(0, al.u32), wave, lane)
         for k in al.static_range(K_TILES):
-            prefetch_input(
-                act_resource, act_scale_resource, storage, input_offsets, block, al.convert(k, al.u32), wave, lane
-            )
-            al.amdgpu.s_waitcnt(0, 0, 0)
-            al.syncthreads()
-            read_input(storage, fragments, input_scales, al.convert(k, al.u32), wave, lane)
-            load_weights(resource_w, resource_ws, weights, weight_scales, al.convert(k, al.u32), wave, lane)
+            if k + 1 < K_TILES:
+                prefetch_input(
+                    act_resource,
+                    act_scale_resource,
+                    storage,
+                    input_offsets,
+                    block,
+                    al.convert(k + 1, al.u32),
+                    wave,
+                    lane,
+                )
             for projection in al.static_range(2):
                 for half_k in al.static_range(2):
                     for n in al.static_range(NR):
@@ -85,7 +96,11 @@ def make_stage1_compute(config, *, prefetch_input, read_input):
                                 2 * half_k + n % 2,
                                 2 * half_k + m % 2,
                             )
-            al.syncthreads()
+            if k + 1 < K_TILES:
+                load_weights(resource_w, resource_ws, weights, weight_scales, al.convert(k + 1, al.u32), wave, lane)
+                al.amdgpu.s_waitcnt(0, 0, 0)
+                al.syncthreads()
+                read_input(storage, fragments, input_scales, al.convert(k + 1, al.u32), wave, lane)
         if BIAS:
             for projection in al.static_range(2):
                 packed_bias = al.make_local((NR, 2), al.u32)

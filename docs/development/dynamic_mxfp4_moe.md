@@ -14,6 +14,7 @@ their own commits.
 Implemented optimization steps in this revision:
 
 - stage1 dma
+- stage1 pipeline
 - w13 resources
 
 
