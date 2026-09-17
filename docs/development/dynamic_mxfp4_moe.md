@@ -15,6 +15,7 @@ Implemented optimization steps in this revision:
 
 - epilogue
 - k128 dma
+- k128 epilogue
 - k128 pipeline
 - k128 resident
 - k256 lds

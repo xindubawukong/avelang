@@ -233,22 +233,37 @@ def make_stage2_compute_k128(intermediate, tile_m, scale_columns, weight_cache):
                 al.syncthreads()
             al.amdgpu.sched_barrier(0)
             al.amdgpu.s_setprio(1)
-            for n32 in al.static_range(2):
-                for m in al.static_range(MR):
-                    for n16 in al.static_range(2):
-                        accum[n32 * 2 + n16, m] = al.amdgpu.mfma_scale_16x16x128_fp4(
-                            weights[stage, n32 * 2 + n16],
-                            weight_scales[stage, n32],
+            if k + 1 == KT:
+                # Store the preceding N fragment while the next one computes.
+                for n in al.static_range(4):
+                    for m in al.static_range(MR):
+                        accum[n, m] = al.amdgpu.mfma_scale_16x16x128_fp4(
+                            weights[stage, n],
+                            weight_scales[stage, n // 2],
                             fragments[m],
                             input_scales[m // 2],
-                            accum[n32 * 2 + n16, m],
-                            n16,
+                            accum[n, m],
+                            n % 2,
                             m % 2,
                         )
+                    if n > 0:
+                        write_fragment(accum[n - 1], route_weights, storage, wave, lane, al.convert(n - 1, al.u32))
+                write_fragment(accum[3], route_weights, storage, wave, lane, al.convert(3, al.u32))
+            else:
+                for n32 in al.static_range(2):
+                    for m in al.static_range(MR):
+                        for n16 in al.static_range(2):
+                            accum[n32 * 2 + n16, m] = al.amdgpu.mfma_scale_16x16x128_fp4(
+                                weights[stage, n32 * 2 + n16],
+                                weight_scales[stage, n32],
+                                fragments[m],
+                                input_scales[m // 2],
+                                accum[n32 * 2 + n16, m],
+                                n16,
+                                m % 2,
+                            )
             al.amdgpu.s_setprio(0)
             al.amdgpu.sched_barrier(0)
-        for n in al.static_range(4):
-            write_fragment(accum[n], route_weights, storage, wave, lane, al.convert(n, al.u32))
 
     return stage2_compute_k128
 
