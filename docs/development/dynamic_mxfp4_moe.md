@@ -34,6 +34,7 @@ Implemented optimization steps in this revision:
 - stage2 persistent
 - w13 resources
 - weight cache
+- writeback bound
 
 
 Validation in this reconstructed history is offline gfx950 compilation only.
