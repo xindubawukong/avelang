@@ -14,6 +14,7 @@ their own commits.
 Implemented optimization steps in this revision:
 
 - epilogue
+- grouped grid
 - k128 dma
 - k128 epilogue
 - k128 pipeline

@@ -243,3 +243,23 @@ def mapping_kernel(n_tiles, m_group, groups):
         result[bid, 1] = m
 
     return kernel
+
+
+@pytest.mark.skipif(not torch.version.hip or not torch.cuda.is_available(), reason="Requires AMD GPU")
+@pytest.mark.parametrize("n_tiles,m_group,groups", [(3, 4, 8), (14, 2, 4)])
+def test_grouped_mapping_is_a_permutation_including_partial_groups(n_tiles, m_group, groups):
+    kernel = mapping_kernel(n_tiles, m_group, groups)
+    for grid_m in (1, 2, 3, 5, 7, 16, 17, 65):
+        output = torch.empty((grid_m * n_tiles, 2), dtype=torch.int32, device="cuda")
+        kernel[lambda grid_m=grid_m: ((grid_m * n_tiles, 1, 1), (1, 1, 1))](output, grid_m)
+        expected = []
+        blocks = grid_m * n_tiles
+        for block in range(blocks):
+            group = block % groups
+            remapped = group * (blocks // groups) + min(group, blocks % groups) + block // groups
+            first_m = remapped // (m_group * n_tiles) * m_group
+            height = min(grid_m - first_m, m_group)
+            within = remapped % (m_group * n_tiles)
+            expected.append((within // height, first_m + within % height))
+        assert len(set(expected)) == blocks
+        assert output.cpu().tolist() == [list(pair) for pair in expected]

@@ -17,6 +17,7 @@ from .input_mxfp4 import make_mxfp4_input
 from .intermediate_mxfp4 import make_intermediate_store
 from .solutionid import ActivationFunction
 from .weight_mxfp4 import make_w13_resources, make_w13_weight_loads
+from .workgroup import make_grouped_workgroup_mapping
 
 
 @cache
@@ -161,11 +162,14 @@ def make_stage1_kernel(config: MoeConfig):
     BM, BN, WM = config.stage1_tile_m, config.stage1_projection_n, config.stage1_wave_m
     TB = BM // 4
     WORDS, ARENA = config.stage1_lds_words, config.stage1_arena_words
+    SITU = config.activation == ActivationFunction.SITU_V2
     SORTED = config.sorted_intermediate
     SCALE_COLS, BIAS_STRIDE = config.scale_columns, (I + 255) // 256 * 256
     COL_LANES = min(BN // 4, 32)
     ROWS_PER_SLICE = 256 // COL_LANES
     SLICES, SEGMENTS = BM // ROWS_PER_SLICE, (BN + 127) // 128
+    GROUPED = D == 3584 and I == 384 and BM == 64 and BN == 128 and SITU
+    map_workgroup = make_grouped_workgroup_mapping(I // BN, 4, 8)
     prefetch_input, read_input = make_mxfp4_input(config)
     stage1_compute = make_stage1_compute(config, prefetch_input=prefetch_input, read_input=read_input)
     initialize_w13_resources = make_w13_resources(D, I, E, BN, BIAS_STRIDE)
@@ -188,6 +192,8 @@ def make_stage1_kernel(config: MoeConfig):
         route_extent = al.amdgpu.readfirstlane(counts[0])
         num_tokens = al.amdgpu.readfirstlane(counts[1])
         tile, block = al.convert(al.block_id(0), al.u32), al.convert(al.block_id(1), al.u32)
+        if GROUPED and num_tokens >= 4096:
+            tile, block = map_workgroup(block * (I // BN) + tile, capacity // BM)
         tid = al.convert(al.thread_id(0), al.u32)
         lane = tid % 64
         wave = al.amdgpu.readfirstlane(tid // 64)
