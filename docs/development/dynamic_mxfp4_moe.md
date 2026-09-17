@@ -14,6 +14,7 @@ their own commits.
 Implemented optimization steps in this revision:
 
 - epilogue
+- k128 dma
 - k256 lds
 - k256 prefetch
 - native scales

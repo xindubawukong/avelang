@@ -191,10 +191,10 @@ def make_stage2_compute_k128(intermediate, tile_m, scale_columns, weight_cache):
         lds = al.view(storage, al.u32, al.make_layout((BM, 4, 4), (16, 4, 1)))
         for k in al.static_range(KT):
             if wave < BM // 16:
-                row, vector = wave * 16 + lane // 4, lane % 4
+                row = wave * 16 + lane // 4
+                vector = (lane % 4) ^ ((row >> 1) & 3)
                 offset = (block * BM + row) * (I // 2) + k * 64 + vector * 16
-                value = al.amdgpu.raw_buffer_load_x4(act_resource, offset, 0, 0)
-                lds[row, lane % 4] = value
+                al.amdgpu.raw_buffer_load_x4_lds(act_resource, storage, 16, offset, 0, wave * 256 * 4, 0)
             load_w2_values(weight_resource, weights, al.convert(k, al.u32), wave, lane)
             load_w2_scales(scale_resource, scale_cache, weight_scales, al.convert(k, al.u32), wave, lane)
             for n in al.static_range(2):
@@ -207,7 +207,7 @@ def make_stage2_compute_k128(intermediate, tile_m, scale_columns, weight_cache):
             al.syncthreads()
             for m in al.static_range(MR):
                 row = m * 16 + lane % 16
-                fragments[m] = lds[row, lane // 16]
+                fragments[m] = lds[row, (lane // 16) ^ ((row >> 1) & 3)]
             for n in al.static_range(4):
                 for m in al.static_range(MR):
                     accum[n, m] = al.amdgpu.mfma_scale_16x16x128_fp4(
