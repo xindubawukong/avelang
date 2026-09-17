@@ -20,6 +20,7 @@ Implemented optimization steps in this revision:
 - sorted act
 - stage1 dma
 - stage1 pipeline
+- stage2 persistent
 - w13 resources
 
 

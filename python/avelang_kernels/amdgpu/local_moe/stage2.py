@@ -236,6 +236,7 @@ def make_stage2_kernel(config: MoeConfig):
         return _make_stage2_kernel_k128(config)
     D, I, E, TOPK = config.hidden, config.intermediate, config.experts, config.topk
     BIAS = config.solution.bias_dtype == DataType.BF16
+    WORKERS = config.stage2_workers
     WEIGHT_CACHE = config.stage2_weight_load_aux
     RATIO = config.stage1_tile_m // 32
     WORDS, ROW_OFFSETS = STAGE2_K256_LDS_WORDS, STAGE2_K256_ARENA_WORDS
@@ -260,8 +261,10 @@ def make_stage2_kernel(config: MoeConfig):
         lane = tid % 64
         wave = al.amdgpu.readfirstlane(al.convert(tid // 64, al.u32))
         groups = (counts[0] + 31) // 32
-        block = worker
-        if block < groups:
+        quotient, remainder = groups // WORKERS, groups % WORKERS
+        begin = worker * quotient + al.min(worker, remainder)
+        assigned = quotient + al.select(worker < remainder, al.convert(1, al.u32), al.convert(0, al.u32))
+        for block in al.range(begin, begin + assigned):
             experts = al.make_tensor(expert_ptr, al.u32, al.make_layout((capacity // (32 * RATIO),), (1,)))
             expert = al.amdgpu.readfirstlane(experts[block // RATIO])
             if expert < E:
