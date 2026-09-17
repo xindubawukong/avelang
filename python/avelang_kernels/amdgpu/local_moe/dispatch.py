@@ -135,8 +135,8 @@ def _registered_2stage_implementations(hidden, intermediate):
                     bias != DataType.NONE or activation != ActivationFunction.SITU_V2
                 ):
                     continue
-                for p1 in (WeightLoadPolicy.NON_TEMPORAL,):
-                    for p2 in (WeightLoadPolicy.NON_TEMPORAL,):
+                for p1 in WeightLoadPolicy:
+                    for p2 in WeightLoadPolicy:
                         solution = MoeSolutionId(
                             hidden=hidden,
                             intermediate=intermediate,
@@ -222,12 +222,16 @@ def _get_2stage_cfgs_cached(token, requested, arch, policy1, policy2, explicit, 
     else:
         candidates = _matching_solutions(requested)
         if kimi:
-            preferred1 = WeightLoadPolicy.NON_TEMPORAL
-            preferred2 = WeightLoadPolicy.NON_TEMPORAL
+            preferred1 = WeightLoadPolicy.NON_TEMPORAL if token <= 2048 else WeightLoadPolicy.CACHED
+            preferred2 = WeightLoadPolicy.NON_TEMPORAL if 16 < token <= 1024 else WeightLoadPolicy.CACHED
             s1_shape = Stage1TileShape.M64_N256 if token >= 2048 else Stage1TileShape.M32_N128_K2
             s2_shape = Stage2TileShape.M64_N256_K128 if token >= 2048 else Stage2TileShape.M32_N256_K128
         else:
-            preferred1 = preferred2 = WeightLoadPolicy.NON_TEMPORAL
+            preferred1 = preferred2 = (
+                WeightLoadPolicy.NON_TEMPORAL
+                if token * requested.topk // requested.experts < 64
+                else WeightLoadPolicy.CACHED
+            )
             s1_shape, s2_shape = Stage1TileShape.M32_N256, Stage2TileShape.M32_N256_K256
         matches = tuple(
             s

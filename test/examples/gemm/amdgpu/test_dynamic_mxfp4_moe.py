@@ -233,7 +233,7 @@ def test_no_contributing_routes(case):
 
 
 @pytest.mark.skipif(not gfx950, reason="Native MXFP4 requires gfx950")
-@pytest.mark.parametrize("policy", ["non_temporal"])
+@pytest.mark.parametrize("policy", ["cached", "non_temporal"])
 def test_persistent_stage2_reuses_worker_after_invalid_group(policy):
     from avelang_kernels.amdgpu.local_moe.stage2 import make_stage2
 
@@ -316,16 +316,7 @@ def test_k128_tiles_with_known_projection_and_padded_routes(s1, s2):
     # Nonuniform routes cross M32/M64 boundaries; I384 exercises the last
     # K128 tile sharing a scale word with a padded K128 half.
     config = MoeConfig(
-        MoeSolutionId(
-            512,
-            384,
-            ActivationFunction.SITU_V2,
-            DataType.NONE,
-            stage1_tile_shape=s1,
-            stage2_tile_shape=s2,
-            stage1_weight_load_policy=1,
-            stage2_weight_load_policy=1,
-        ),
+        MoeSolutionId(512, 384, ActivationFunction.SITU_V2, DataType.NONE, stage1_tile_shape=s1, stage2_tile_shape=s2),
         3,
         2,
     )

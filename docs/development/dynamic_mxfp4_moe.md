@@ -28,6 +28,7 @@ Implemented optimization steps in this revision:
 - stage1 pipeline
 - stage2 persistent
 - w13 resources
+- weight cache
 
 
 Validation in this reconstructed history is offline gfx950 compilation only.

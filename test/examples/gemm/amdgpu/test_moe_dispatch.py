@@ -19,6 +19,7 @@ from avelang_kernels.amdgpu.local_moe.solutionid import (
     Stage1Buffering,
     Stage1TileShape,
     Stages,
+    WeightLoadPolicy,
     WeightOrdering,
 )
 from avelang_kernels.amdgpu.local_moe.stage1 import make_stage1
@@ -29,6 +30,31 @@ PROBLEM = {"model_dim": 256, "inter_dim": 256, "expert": 16, "topk": 4, "activat
 
 def choose(token=8, **overrides):
     return get_2stage_cfgs(token=token, **(PROBLEM | overrides))
+
+
+@pytest.mark.parametrize("token,policy", [(0, 1), (128, 1), (255, 1), (256, 0), (257, 0), (1024, 0)])
+def test_default_policy_threshold(token, policy):
+    config = choose(token)
+    assert (
+        config.solution.stage1_weight_load_policy
+        == config.solution.stage2_weight_load_policy
+        == WeightLoadPolicy(policy)
+    )
+    assert config.solution.stages == Stages.TWO_STAGE
+    assert config.stage2_workers == 256
+    assert not hasattr(config, "token")
+
+
+def test_available_candidates_and_explicit_policy():
+    candidates = available_2stage_solutions(**PROBLEM)
+    assert {s.stage1_weight_load_policy for s in candidates} == set(WeightLoadPolicy)
+    assert {s.stage2_weight_load_policy for s in candidates} == set(WeightLoadPolicy)
+    assert {s.stage1_tile_shape for s in candidates} == {Stage1TileShape.M32_N256, Stage1TileShape.M64_N512}
+    for solution in candidates:
+        assert choose(1024, solution_id=int(solution)).solution == solution
+    for policy in WeightLoadPolicy:
+        selected = choose(weight_load_policy=policy).solution
+        assert selected.stage1_weight_load_policy == selected.stage2_weight_load_policy == policy
 
 
 def test_selection_cache_normalizes_external_values():
@@ -55,10 +81,10 @@ def test_selection_cache_normalizes_external_values():
 
 
 def test_kernel_factory_cache_uses_experts_and_topk_but_not_token():
-    base = choose(weight_load_policy="non_temporal")
-    other_m = choose(16, weight_load_policy="non_temporal")
-    other_e = choose(expert=32, weight_load_policy="non_temporal")
-    other_k = choose(topk=2, weight_load_policy="non_temporal")
+    base = choose(weight_load_policy="cached")
+    other_m = choose(16, weight_load_policy="cached")
+    other_e = choose(expert=32, weight_load_policy="cached")
+    other_k = choose(topk=2, weight_load_policy="cached")
     assert base.solution == other_e.solution == other_k.solution
     assert base == other_m and base != other_e and base != other_k
     for factory in (make_stage1, make_stage2):
@@ -169,7 +195,7 @@ def test_direct_construction_cannot_bypass_implementation_resolution(changes):
 
 
 def test_dispatch_routes_only_registered_complete_combinations(monkeypatch):
-    base = choose(weight_load_policy="non_temporal")
+    base = choose(weight_load_policy="cached")
     solution = replace(base.solution, stage1_tile_shape=Stage1TileShape.M64_N512)
     config = replace(base, solution=solution)
     stage1, stage2 = object(), object()
