@@ -13,6 +13,7 @@ their own commits.
 
 Implemented optimization steps in this revision:
 
+- native scales
 - stage1 dma
 - stage1 pipeline
 - w13 resources

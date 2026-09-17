@@ -7,7 +7,7 @@ import avelang.language as al
 
 from .config import MoeConfig
 from .dispatch import resolve_2stage_implementation
-from .intermediate_mxfp4 import make_intermediate_scale_load, make_stage2_input_k256
+from .intermediate_mxfp4 import make_stage2_input_k256
 from .solutionid import DataType
 from .weight_mxfp4 import make_w2_k128_weight_loads, make_w2_resources
 
@@ -25,7 +25,7 @@ def output_word_index(row: al.u32, column: al.u32) -> al.u32:
 def make_stage2_compute_k256(intermediate, bias, weight_cache, act_cache=0, words=STAGE2_K256_LDS_WORDS):
     """Write weighted BF16 [32, 256] output into swizzled LDS and synchronize."""
     I, BIAS, K_TILES = intermediate, bias, intermediate // 256
-    prefetch_stage2_input, read_stage2_input = make_stage2_input_k256(words, act_cache, I // 32)
+    prefetch_stage2_input, read_stage2_input = make_stage2_input_k256(words, act_cache)
 
     @avelang.jit
     def stage2_compute_k256(
@@ -113,7 +113,6 @@ def make_stage2_compute_k128(intermediate, tile_m, scale_columns, weight_cache, 
     I, BM, MR, SC = intermediate, tile_m, tile_m // 16, scale_columns
     WORDS, SX, KT = BM * 128, BM // 32, intermediate // 128
     load_w2_values, load_w2_scales = make_w2_k128_weight_loads(I, SC, weight_cache)
-    load_intermediate_scale = make_intermediate_scale_load(SC, 0)
 
     @avelang.jit
     def stage2_compute_k128(
@@ -154,9 +153,8 @@ def make_stage2_compute_k128(intermediate, tile_m, scale_columns, weight_cache, 
             for n in al.static_range(2):
                 weight_scales[k % 2, n] = scale_cache[n] >> (16 * (k % 2))
             for m32 in al.static_range(SX):
-                packed_scale = load_intermediate_scale(
-                    act_resource, block * BM + m32 * 32, al.convert(k // 2, al.u32), lane, act_bytes
-                )
+                offset_s = (block * BM + m32 * 32) * SC + (k // 2) * 256 + lane * 4
+                packed_scale = al.amdgpu.raw_buffer_load_x1(act_resource, offset_s, act_bytes, 0)
                 input_scales[m32] = packed_scale >> (16 * (k % 2))
             al.amdgpu.s_waitcnt(0, 0, 0)
             al.syncthreads()
@@ -217,6 +215,7 @@ def make_stage2_kernel(config: MoeConfig):
     ):
         tile, worker = al.block_id(0), al.block_id(1)
         tid = al.thread_id(0)
+        lane = tid % 64
         groups = (counts[0] + 31) // 32
         block = worker
         if block < groups:
@@ -260,7 +259,7 @@ def make_stage2_kernel(config: MoeConfig):
                     storage,
                     al.convert((token * TOPK + slot) * (I // 2) + vector * 16, al.u32),
                     al.convert(0, al.u32),
-                    al.convert(block * 32, al.u32),
+                    al.convert(block * 32 * (I // 32) + lane * 4, al.u32),
                     al.convert(act_bytes, al.u32),
                     valid,
                     al.convert(32, al.u32),

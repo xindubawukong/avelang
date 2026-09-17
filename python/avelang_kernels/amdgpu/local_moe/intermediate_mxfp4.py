@@ -1,4 +1,4 @@
-"""Row-major-scale MXFP4 intermediate storage: allocation layout, Stage1 stores and Stage2 reads.
+"""MXFP4 intermediate storage: allocation layout, Stage1 stores and Stage2 reads.
 
 Activation and scale row indices are independent. Ordinary local MoE stores
 activations in token/slot order and scales in sorted-route order; Kimi uses sorted
@@ -14,12 +14,12 @@ import avelang.language as al
 import torch
 
 from .quantization import quantize_mxfp4_activation
-from .scale_layout import ceildiv
+from .scale_layout import ceildiv, scale_byte_offset, scale_byte_shape
 
 
 @dataclass(frozen=True)
 class IntermediateLayout:
-    """Row-major scales and either sorted or token/slot-major act."""
+    """Native scale tiles and either sorted or token/slot-major act."""
 
     route_capacity: int
     intermediate: int
@@ -48,7 +48,7 @@ class IntermediateLayout:
             act = flat[: self.scale_offset].view(self.route_capacity, self.intermediate // 2)
         else:
             act = flat[: tokens * topk * self.intermediate // 2].view(tokens, topk, self.intermediate // 2)
-        scales = flat[self.scale_offset : self.nbytes].view(self.scale_shape)
+        scales = flat[self.scale_offset : self.nbytes].view(scale_byte_shape(self.scale_shape[0], self.intermediate))
         return act, scales
 
 
@@ -74,16 +74,15 @@ def make_intermediate_store(intermediate, scale_columns, *, act_aux, scale_aux):
             al.amdgpu.raw_buffer_store_x1(packed | (partner << 16), act_resource, offset, 0, act_aux)
         if col_lane % 8 == 0:
             col = column_base // 32 + col_lane // 8
-            offset = scale_row * SCALE_COLS + col
+            offset = scale_byte_offset(scale_row, col, al.convert(SCALE_COLS, al.u32))
             al.amdgpu.raw_buffer_store_u8(al.convert(exponent, al.u8), act_resource, offset, scale_base, scale_aux)
 
     return store_intermediate
 
 
 @cache
-def make_stage2_input_k256(words, act_aux, scale_columns):
+def make_stage2_input_k256(words, act_aux):
     WORDS = words
-    load_intermediate_scale = make_intermediate_scale_load(scale_columns, act_aux)
 
     @avelang.jit
     def prefetch_stage2_input(
@@ -97,9 +96,7 @@ def make_stage2_input_k256(words, act_aux, scale_columns):
     ) -> (al.Tensor((4,), al.u32), al.u32):
         offset = al.select(valid, act_offset + k * 128, al.convert(0xFFFFFFF0, al.u32))
         act = al.amdgpu.raw_buffer_load_x4(act_resource, offset, act_base, act_aux)
-        scale = load_intermediate_scale(
-            act_resource, scale_offset, k, al.convert(al.thread_id(0) % 64, al.u32), scale_base
-        )
+        scale = al.amdgpu.raw_buffer_load_x1(act_resource, scale_offset + k * 256, scale_base, act_aux)
         return act, scale
 
     @avelang.jit
@@ -116,28 +113,3 @@ def make_stage2_input_k256(words, act_aux, scale_columns):
                 fragments[m, half_k] = lds[k % 2, row, lane // 16 + half_k * 4]
 
     return prefetch_stage2_input, read_stage2_input
-
-
-@cache
-def make_intermediate_scale_load(columns, cache_policy):
-    SC, CACHE = columns, cache_policy
-
-    @avelang.jit
-    def load_intermediate_scale(
-        resource: al.Tensor((4,), al.u32),
-        row: al.u32,
-        k256: al.u32,
-        lane: al.u32,
-        base: al.u32,
-    ) -> al.u32:
-        packed = al.convert(0, al.u32)
-        for byte in al.static_range(4):
-            r = row + lane % 16 + (byte % 2) * 16
-            c = k256 * 8 + lane // 16 + (byte // 2) * 4
-            offset = r * SC + c
-            word = al.amdgpu.raw_buffer_load_x1(resource, (offset // 4) * 4, base, CACHE)
-            value = (word >> ((offset % 4) * 8)) & 255
-            packed = packed | (value << (byte * 8))
-        return packed
-
-    return load_intermediate_scale

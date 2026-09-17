@@ -5,7 +5,7 @@ import torch
 from avelang_kernels.amdgpu.local_moe import get_2stage_cfgs
 from avelang_kernels.amdgpu.local_moe.api import _pack_bias, _pack_weights
 from avelang_kernels.amdgpu.local_moe.intermediate_mxfp4 import IntermediateLayout
-from avelang_kernels.amdgpu.local_moe.scale_layout import unsort_scales
+from avelang_kernels.amdgpu.local_moe.scale_layout import scale_byte_shape, unsort_scales
 from avelang_kernels.amdgpu.local_moe.solutionid import ActivationFunction
 
 
@@ -37,7 +37,7 @@ def test_workspace_layout():
     workspace = torch.full((layout.nbytes,), 173, dtype=torch.uint8)
     act, scales = layout.views(workspace, tokens=8, topk=4)
     assert act.shape == (8, 4, 1536)
-    assert scales.shape == (256, 96)
+    assert scales.shape == scale_byte_shape(256, 3072)
     assert scales.data_ptr() - workspace.data_ptr() == 96 * 1536
     act.fill_(1)
     scales.fill_(2)
