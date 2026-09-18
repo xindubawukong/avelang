@@ -1,4 +1,4 @@
-"""Compute W2 one MFMA cell at a time with one workgroup per expert/tile."""
+"""Compute W2 with reusable M32/N64 wave register tiles."""
 
 from functools import cache
 
@@ -33,19 +33,32 @@ def make_stage2_compute(config):
         wave: al.u32,
         lane: al.u32,
     ):
+        accum = al.full((4, 2, 4), 0, al.f32)
+        fragments = al.make_local((2, 4), al.u32)
+        input_scales = al.make_local((2,), al.u32)
+        weights = al.make_local((4, 4), al.u32)
+        weight_scales = al.make_local((4,), al.u32)
+        for k in al.range(intermediate // 128):
+            ki = al.convert(k, al.u32)
+            for m in al.static_range(2):
+                xv, xs = load_intermediate(
+                    act, routes, intermediate, tokens, block, al.convert(m, al.u32), ki, lane, scale_base
+                )
+                fragments[m], input_scales[m] = xv, xs
+            for n in al.static_range(4):
+                n16 = wave * 4 + n
+                wv, ws = load_weight_fragment(weight, scales, intermediate, n16, ki, lane)
+                weights[n], weight_scales[n] = wv, ws
+            al.amdgpu.s_waitcnt(0, 0, 0)
+            for n in al.static_range(4):
+                for m in al.static_range(2):
+                    accum[n, m] = al.amdgpu.mfma_scale_16x16x128_fp4(
+                        weights[n], weight_scales[n], fragments[m], input_scales[m], accum[n, m], 0, 0
+                    )
         result = al.view(storage, al.bf16, al.make_layout((32, 256), (256, 1)))
         for m in al.static_range(2):
             for n in al.static_range(4):
-                n16 = wave + n * 4
-                accum = al.full((4,), 0, al.f32)
-                for k in al.range(intermediate // 128):
-                    ki = al.convert(k, al.u32)
-                    xv, xs = load_intermediate(
-                        act, routes, intermediate, tokens, block, al.convert(m, al.u32), ki, lane, scale_base
-                    )
-                    wv, ws = load_weight_fragment(weight, scales, intermediate, n16, ki, lane)
-                    al.amdgpu.s_waitcnt(0, 0, 0)
-                    accum = al.amdgpu.mfma_scale_16x16x128_fp4(wv, ws, xv, xs, accum, 0, 0)
+                n16 = wave * 4 + n
                 packed_bias = al.make_local((2,), al.u32)
                 if BIAS:
                     col = tile * 256 + n16 // 4 * 64 + n16 % 4 * 4 + lane // 16 * 16
@@ -54,7 +67,7 @@ def make_stage2_compute(config):
                 bits = al.amdgpu.raw_buffer_load_x1(route_weights, (m * 16 + lane % 16) * 4, 0, 0)
                 rw = al.bitcast(bits, al.f32)
                 for c in al.static_range(4):
-                    value = accum[c]
+                    value = accum[n, m, c]
                     if BIAS:
                         value = value + al.convert(bias_values[c], al.f32)
                     result[m * 16 + lane % 16, n16 * 16 + lane // 16 * 4 + c] = al.convert(value * rw, al.bf16)
