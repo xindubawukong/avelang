@@ -37,7 +37,7 @@ def make_stage1_compute(config, *, prefetch_input, read_input):
     The input callbacks issue loads and read fragments; this pipeline owns
     their waits. The caller must synchronize before consuming the final tile.
     """
-    D, I = config.hidden, config.intermediate
+    D, I = config.compute_hidden, config.intermediate
     BM, BN, WN, WM = config.stage1_tile_m, config.stage1_projection_n, config.stage1_warps_n, config.stage1_wave_m
     NR, MR = config.stage1_wave_n // 16, WM // 16
     NS = NR // 2
