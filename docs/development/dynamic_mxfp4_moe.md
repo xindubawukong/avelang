@@ -11,6 +11,7 @@ Stage1 and Stage2 still support GPT-OSS, DSv3 and DSv4.
 - [moe][rocm] Prefetch stage2 weights before input LDS stores
 - [moe][rocm] Remove redundant stage2 K-loop barriers
 - [moe][rocm] Use partial VMEM waits in the stage1 pipeline
+- [moe][rocm] Prefetch stage2 epilogue inputs into registers
 
 Each commit has numerical, graph-replay and four-scope timing evidence under
 ~/compare/local-moe-two-milestones-20260918.
