@@ -1,6 +1,6 @@
 # Dynamic MXFP4 Local MoE: optimization history
 
-Current step 05: [moe][rocm] Use single buffer LDS input staging.
+Current step 06: [moe][rocm] Use buffer-to-LDS DMA for stage1 input.
 
 This prefix targets Petit dev-megamoe before d97fb857. The public local ID
 has one shared cache policy at bit40 and the Stage1 tile at bit41. Stage2 is

@@ -1,4 +1,4 @@
-"""Cooperative Stage1 input loads through one linear LDS tile."""
+"""Direct buffer-to-LDS copies into one linear Stage1 input tile."""
 
 from functools import cache
 
@@ -27,15 +27,15 @@ def make_mxfp4_input(config):
         row, vector = wave * 8 + lane // 8, lane % 8
         route = al.amdgpu.raw_buffer_load_x1(routes, row * 4, 0, 0)
         token, slot = route & 0xFFFFFF, route >> 24
-        values = al.full((4,), 0, al.u32)
-        if token < tokens and slot < TOPK:
-            offset = token * (D // 2) + k * 128 + vector * 16
-            values = al.amdgpu.raw_buffer_load_x4(act, offset, 0, 0)
-        lds = al.view(storage, al.u32, al.make_layout((BM, 8, 4), (32, 4, 1)))
-        lds[row, vector] = values
+        offset = al.select(
+            token < tokens and slot < TOPK,
+            token * (D // 2) + k * 128 + vector * 16,
+            al.convert(0xFFFFFFF0, al.u32),
+        )
+        al.amdgpu.raw_buffer_load_x4_lds(act, storage, 16, offset, 0, wave * 8 * 32 * 4, 0)
         if wave == 0:
             offset_s = (block * (D // 256) + k) * 256 + lane * 4
-            storage[ACT_WORDS + lane] = al.amdgpu.raw_buffer_load_x1(scales, offset_s, 0, 0)
+            al.amdgpu.raw_buffer_load_x1_lds(scales, storage, 4, offset_s, 0, ACT_WORDS * 4, 0)
 
     @avelang.jit
     def read_input(
