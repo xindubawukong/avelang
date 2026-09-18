@@ -15,7 +15,7 @@ from .weight_mxfp4 import make_w13_resources, make_w13_weight_loads
 
 @cache
 def make_stage1_compute(config):
-    intermediate = config.intermediate
+    BIAS_STRIDE = config.intermediate
     K_TILES = config.hidden // 256
     BM, BN, WORDS = config.stage1_tile_m, config.stage1_projection_n, config.stage1_lds_words
     WM, WN = config.stage1_wave_m, config.stage1_warps_n
@@ -40,7 +40,12 @@ def make_stage1_compute(config):
         lane: al.u32,
     ):
         wave_m, wave_n = wave // WN, wave % WN
-        accum = al.full((2, NR, MR, 4), 0, al.f32)
+        accum = al.make_local((2, NR, MR, 4), al.f32)
+        for projection in al.static_range(2):
+            for n in al.static_range(NR):
+                for m in al.static_range(MR):
+                    for c in al.static_range(4):
+                        accum[projection, n, m, c] = al.convert(0.0, al.f32)
         fragments = al.make_local((MR, 2, 4), al.u32)
         weights = al.make_local((2, 2, NR, 4), al.u32)
         weight_scales = al.make_local((2, NS), al.u32)
@@ -72,24 +77,36 @@ def make_stage1_compute(config):
             al.syncthreads()
             if k + 1 < K_TILES:
                 read_input(storage, fragments, input_scales, next_k, wave, lane)
-        result = al.view(storage, al.f32, al.make_layout((BM, BN), (BN, 1)))
-        for m in al.static_range(MR):
-            for n in al.static_range(NR):
-                n16 = wave_n * NR + n
-                packed_bias = al.make_local((2, 2), al.u32)
-                if BIAS:
-                    col = n16 // 4 * 64 + (n16 % 4) * 4 + lane // 16 * 16
-                    packed_bias[0] = al.amdgpu.raw_buffer_load_x2(bias, col * 2, 0, 0)
-                    packed_bias[1] = al.amdgpu.raw_buffer_load_x2(bias, (intermediate + col) * 2, 0, 0)
-                bias_values = al.view(packed_bias, al.bf16, al.make_layout((2, 4), (4, 1)))
-                for c in al.static_range(4):
-                    gv, uv = accum[0, n, m, c], accum[1, n, m, c]
-                    if BIAS:
-                        gv = gv + al.convert(bias_values[0, c], al.f32)
-                        uv = uv + al.convert(bias_values[1, c], al.f32)
-                    value = openai_swiglu(gv, uv) if SWIGLU else silu_dot(gv, uv)
-                    result[wave_m * WM + m * 16 + lane % 16, n16 * 16 + lane // 16 * 4 + c] = value
-        al.syncthreads()
+        if BIAS:
+            for projection in al.static_range(2):
+                packed_bias = al.make_local((NR, 2), al.u32)
+                for n in al.static_range(NR):
+                    col = wave_n * (NR * 16) + n * 16
+                    offset_b = al.convert(
+                        (projection * BIAS_STRIDE + (col // 64) * 64 + ((col % 64) // 16) * 4 + (lane // 16) * 16) * 2,
+                        al.u32,
+                    )
+                    packed_bias[n] = al.amdgpu.raw_buffer_load_x2(bias, offset_b, 0, 0)
+                bias_values = al.view(packed_bias, al.bf16, al.make_layout((NR, 4), (4, 1)))
+                for n in al.static_range(NR):
+                    for m in al.static_range(MR):
+                        for c in al.static_range(4):
+                            accum[projection, n, m, c] = accum[projection, n, m, c] + al.convert(
+                                bias_values[n, c], al.f32
+                            )
+        hidden = al.view(storage, al.f32, al.make_layout((BM, BN // 4, 4), (BN, 4, 1)))
+        activated = al.make_local((NR, MR, 4), al.f32)
+        for n in al.range(NR):
+            for m in al.range(MR):
+                for c in al.range(4):
+                    gate, up = accum[0, n, m, c], accum[1, n, m, c]
+                    if SWIGLU:
+                        activated[n, m, c] = openai_swiglu(gate, up)
+                    else:
+                        activated[n, m, c] = silu_dot(gate, up)
+        for n in al.static_range(NR):
+            for m in al.static_range(MR):
+                hidden[wave_m * WM + m * 16 + lane % 16, wave_n * (NR * 4) + n * 4 + lane // 16] = activated[n, m]
 
     return stage1_compute
 
@@ -159,6 +176,7 @@ def make_stage1_kernel(config):
             wave,
             lane,
         )
+        al.syncthreads()
         scale_base = capacity * I // 2
         workspace_bytes = scale_base + ((capacity + 255) // 256) * 256 * (I // 32)
         memory = al.make_tensor(workspace_ptr, al.u8, al.make_layout((workspace_bytes,), (1,)))
