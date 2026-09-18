@@ -33,6 +33,7 @@ dependencies = [
 [project.optional-dependencies]
 cuda = ["pycuda>=2021.1"]
 rocm = []
+moe = ["amd-aiter"]
 dev = [
     "pytest",
     "ruff",
