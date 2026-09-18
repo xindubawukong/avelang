@@ -1,4 +1,4 @@
-"""Compute W13 one MFMA cell at a time, then quantize its logical output tile."""
+"""Compute W13 with reusable M32/N32 wave register tiles."""
 
 from functools import cache
 
@@ -16,7 +16,7 @@ from .weight_mxfp4 import load_weight_fragment, make_w13_resources
 @cache
 def make_stage1_compute(config):
     BM, BN, WORDS = config.stage1_tile_m, config.stage1_projection_n, config.stage1_lds_words
-    M_CELLS, N_PASSES = BM // 16, BN // 64
+    MR, NR = BM // 16, BN // 64
     BIAS = config.bias
     SWIGLU = config.activation == ActivationFunction.OPENAI_SWIGLU
     load_input_fragment = make_mxfp4_input(config)
@@ -39,22 +39,41 @@ def make_stage1_compute(config):
         wave: al.u32,
         lane: al.u32,
     ):
+        accum = al.full((2, NR, MR, 4), 0, al.f32)
+        fragments = al.make_local((MR, 4), al.u32)
+        input_scales = al.make_local((MR,), al.u32)
+        weights = al.make_local((2, NR, 4), al.u32)
+        weight_scales = al.make_local((2, NR), al.u32)
+        for k in al.range(hidden // 128):
+            ki = al.convert(k, al.u32)
+            for m in al.static_range(MR):
+                xv, xs = load_input_fragment(
+                    act, scales, routes, hidden, tokens, block, al.convert(m, al.u32), ki, lane
+                )
+                fragments[m], input_scales[m] = xv, xs
+            for n in al.static_range(NR):
+                n16 = wave * NR + n
+                wg, sg = load_weight_fragment(gate, gate_scales, hidden, n16, ki, lane)
+                wu, su = load_weight_fragment(up, up_scales, hidden, n16, ki, lane)
+                weights[0, n], weight_scales[0, n] = wg, sg
+                weights[1, n], weight_scales[1, n] = wu, su
+            al.amdgpu.s_waitcnt(0, 0, 0)
+            for projection in al.static_range(2):
+                for n in al.static_range(NR):
+                    for m in al.static_range(MR):
+                        accum[projection, n, m] = al.amdgpu.mfma_scale_16x16x128_fp4(
+                            weights[projection, n],
+                            weight_scales[projection, n],
+                            fragments[m],
+                            input_scales[m],
+                            accum[projection, n, m],
+                            0,
+                            0,
+                        )
         result = al.view(storage, al.f32, al.make_layout((BM, BN), (BN, 1)))
-        for m in al.static_range(M_CELLS):
-            for n in al.static_range(N_PASSES):
-                n16 = wave + n * 4
-                g = al.full((4,), 0, al.f32)
-                u = al.full((4,), 0, al.f32)
-                for k in al.range(hidden // 128):
-                    ki = al.convert(k, al.u32)
-                    xv, xs = load_input_fragment(
-                        act, scales, routes, hidden, tokens, block, al.convert(m, al.u32), ki, lane
-                    )
-                    wg, sg = load_weight_fragment(gate, gate_scales, hidden, n16, ki, lane)
-                    wu, su = load_weight_fragment(up, up_scales, hidden, n16, ki, lane)
-                    al.amdgpu.s_waitcnt(0, 0, 0)
-                    g = al.amdgpu.mfma_scale_16x16x128_fp4(wg, sg, xv, xs, g, 0, 0)
-                    u = al.amdgpu.mfma_scale_16x16x128_fp4(wu, su, xv, xs, u, 0, 0)
+        for m in al.static_range(MR):
+            for n in al.static_range(NR):
+                n16 = wave * NR + n
                 packed_bias = al.make_local((2, 2), al.u32)
                 if BIAS:
                     col = n16 // 4 * 64 + (n16 % 4) * 4 + lane // 16 * 16
@@ -62,7 +81,7 @@ def make_stage1_compute(config):
                     packed_bias[1] = al.amdgpu.raw_buffer_load_x2(bias, (intermediate + col) * 2, 0, 0)
                 bias_values = al.view(packed_bias, al.bf16, al.make_layout((2, 4), (4, 1)))
                 for c in al.static_range(4):
-                    gv, uv = g[c], u[c]
+                    gv, uv = accum[0, n, m, c], accum[1, n, m, c]
                     if BIAS:
                         gv = gv + al.convert(bias_values[0, c], al.f32)
                         uv = uv + al.convert(bias_values[1, c], al.f32)
