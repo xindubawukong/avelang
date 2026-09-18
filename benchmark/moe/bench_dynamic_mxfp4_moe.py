@@ -96,8 +96,6 @@ def run_case(args, model, tokens):
             routing.counts,
             ws.intermediate,
             routing.capacity,
-            config.hidden,
-            config.intermediate,
             num_warps=config.stage1_num_warps,
         )
 
@@ -114,8 +112,6 @@ def run_case(args, model, tokens):
             routing.counts,
             ws.out,
             routing.capacity,
-            config.hidden,
-            config.intermediate,
             num_warps=config.stage2_num_warps,
         )
         return ws.out

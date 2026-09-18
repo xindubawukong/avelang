@@ -10,16 +10,19 @@ from .dispatch import resolve_2stage_implementation
 from .input_mxfp4 import make_mxfp4_input
 from .intermediate_mxfp4 import make_intermediate_store
 from .solutionid import ActivationFunction
-from .weight_mxfp4 import load_weight_fragment, make_w13_resources
+from .weight_mxfp4 import load_weight_scales, load_weight_values, make_w13_resources
 
 
 @cache
 def make_stage1_compute(config):
+    hidden, intermediate = config.hidden, config.intermediate
+    K_TILES = config.hidden // 256
     BM, BN, WORDS = config.stage1_tile_m, config.stage1_projection_n, config.stage1_lds_words
     MR, NR = BM // 16, BN // 64
+    NS = NR // 2
     BIAS = config.bias
     SWIGLU = config.activation == ActivationFunction.OPENAI_SWIGLU
-    load_input_fragment = make_mxfp4_input(config)
+    load_input = make_mxfp4_input(config)
 
     @avelang.jit
     def stage1_compute(
@@ -32,44 +35,40 @@ def make_stage1_compute(config):
         up_scales: al.Tensor((4,), al.u32),
         bias: al.Tensor((4,), al.u32),
         storage: al.Tensor((WORDS,), al.u32),
-        hidden: al.u32,
-        intermediate: al.u32,
         tokens: al.u32,
         block: al.u32,
         wave: al.u32,
         lane: al.u32,
     ):
         accum = al.full((2, NR, MR, 4), 0, al.f32)
-        fragments = al.make_local((MR, 4), al.u32)
-        input_scales = al.make_local((MR,), al.u32)
-        weights = al.make_local((2, NR, 4), al.u32)
-        weight_scales = al.make_local((2, NR), al.u32)
-        for k in al.range(hidden // 128):
+        fragments = al.make_local((MR, 2, 4), al.u32)
+        weights = al.make_local((2, 2, NR, 4), al.u32)
+        weight_scales = al.make_local((2, NS), al.u32)
+        for k in al.static_range(K_TILES):
             ki = al.convert(k, al.u32)
-            for m in al.static_range(MR):
-                xv, xs = load_input_fragment(
-                    act, scales, routes, hidden, tokens, block, al.convert(m, al.u32), ki, lane
-                )
-                fragments[m], input_scales[m] = xv, xs
-            for n in al.static_range(NR):
-                n16 = wave * NR + n
-                wg, sg = load_weight_fragment(gate, gate_scales, hidden, n16, ki, lane)
-                wu, su = load_weight_fragment(up, up_scales, hidden, n16, ki, lane)
-                weights[0, n], weight_scales[0, n] = wg, sg
-                weights[1, n], weight_scales[1, n] = wu, su
+            input_scale = load_input(act, scales, routes, fragments, tokens, block, ki, lane)
+            for half_k in al.static_range(2):
+                for n in al.static_range(NR):
+                    n16 = wave * NR + n
+                    weights[0, half_k, n] = load_weight_values(gate, hidden, n16, ki * 2 + half_k, lane)
+                    weights[1, half_k, n] = load_weight_values(up, hidden, n16, ki * 2 + half_k, lane)
+            for n in al.static_range(NS):
+                weight_scales[0, n] = load_weight_scales(gate_scales, hidden, wave * NS + n, ki, lane)
+                weight_scales[1, n] = load_weight_scales(up_scales, hidden, wave * NS + n, ki, lane)
             al.amdgpu.s_waitcnt(0, 0, 0)
             for projection in al.static_range(2):
-                for n in al.static_range(NR):
-                    for m in al.static_range(MR):
-                        accum[projection, n, m] = al.amdgpu.mfma_scale_16x16x128_fp4(
-                            weights[projection, n],
-                            weight_scales[projection, n],
-                            fragments[m],
-                            input_scales[m],
-                            accum[projection, n, m],
-                            0,
-                            0,
-                        )
+                for half_k in al.static_range(2):
+                    for n in al.static_range(NR):
+                        for m in al.static_range(MR):
+                            accum[projection, n, m] = al.amdgpu.mfma_scale_16x16x128_fp4(
+                                weights[projection, half_k, n],
+                                weight_scales[projection, n // 2],
+                                fragments[m, half_k],
+                                input_scale,
+                                accum[projection, n, m],
+                                2 * half_k + n % 2,
+                                2 * half_k + m,
+                            )
         result = al.view(storage, al.f32, al.make_layout((BM, BN), (BN, 1)))
         for m in al.static_range(MR):
             for n in al.static_range(NR):
@@ -93,6 +92,7 @@ def make_stage1_compute(config):
 
 
 def make_stage1_kernel(config):
+    D, I = config.hidden, config.intermediate
     E, TOPK = config.experts, config.topk
     BM, BN, WORDS = config.stage1_tile_m, config.stage1_projection_n, config.stage1_lds_words
     SLICES, SEGMENTS = BM // 8, BN // 128
@@ -112,10 +112,7 @@ def make_stage1_kernel(config):
         counts: al.Tensor((2,), al.u32),
         workspace_ptr: al.Pointer(al.u8),
         capacity: al.u32,
-        hidden_dim: al.u32,
-        intermediate_dim: al.u32,
     ):
-        D, I = hidden_dim, intermediate_dim
         extent, tokens = al.amdgpu.readfirstlane(counts[0]), al.amdgpu.readfirstlane(counts[1])
         tile, block = al.convert(al.block_id(0), al.u32), al.convert(al.block_id(1), al.u32)
         tid = al.convert(al.thread_id(0), al.u32)
@@ -137,7 +134,7 @@ def make_stage1_kernel(config):
         wu, su, _ = initialize_w13_resources(weight, ws, bias_ptr, expert, tile, D, I, al.convert(1, al.u32))
         storage = al.make_shared((WORDS,), al.u32)
         stage1_compute(
-            act_resource, scale_resource, route_resource, wg, sg, wu, su, bias, storage, D, I, tokens, block, wave, lane
+            act_resource, scale_resource, route_resource, wg, sg, wu, su, bias, storage, tokens, block, wave, lane
         )
         scale_base = capacity * I // 2
         workspace_bytes = scale_base + ((capacity + 255) // 256) * 256 * (I // 32)

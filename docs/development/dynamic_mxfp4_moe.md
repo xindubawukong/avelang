@@ -1,6 +1,6 @@
 # Dynamic MXFP4 Local MoE: optimization history
 
-Current step 01: [moe][rocm] Use register tiling for stage1 and stage2.
+Current step 04: [moe][rocm] Use K256 tiles and packed scale selectors.
 
 This prefix targets Petit dev-megamoe before d97fb857. The public local ID
 has one shared cache policy at bit40 and the Stage1 tile at bit41. Stage2 is

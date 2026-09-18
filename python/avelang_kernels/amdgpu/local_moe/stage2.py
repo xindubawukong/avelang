@@ -7,11 +7,13 @@ import avelang.language as al
 
 from .dispatch import resolve_2stage_implementation
 from .intermediate_mxfp4 import make_stage2_input
-from .weight_mxfp4 import load_weight_fragment, make_w2_resources
+from .weight_mxfp4 import load_weight_scales, load_weight_values, make_w2_resources
 
 
 @cache
 def make_stage2_compute(config):
+    intermediate = config.intermediate
+    K_TILES = config.intermediate // 256
     BIAS = config.bias
     load_intermediate = make_stage2_input(config)
 
@@ -24,8 +26,6 @@ def make_stage2_compute(config):
         bias: al.Tensor((4,), al.u32),
         route_weights: al.Tensor((4,), al.u32),
         storage: al.Tensor((4096,), al.u32),
-        hidden: al.u32,
-        intermediate: al.u32,
         tokens: al.u32,
         block: al.u32,
         scale_base: al.u32,
@@ -34,27 +34,44 @@ def make_stage2_compute(config):
         lane: al.u32,
     ):
         accum = al.full((4, 2, 4), 0, al.f32)
-        fragments = al.make_local((2, 4), al.u32)
-        input_scales = al.make_local((2,), al.u32)
-        weights = al.make_local((4, 4), al.u32)
-        weight_scales = al.make_local((4,), al.u32)
-        for k in al.range(intermediate // 128):
+        fragments = al.make_local((2, 2, 4), al.u32)
+        weights = al.make_local((2, 4, 4), al.u32)
+        weight_scales = al.make_local((2,), al.u32)
+        for k in al.static_range(K_TILES):
             ki = al.convert(k, al.u32)
-            for m in al.static_range(2):
-                xv, xs = load_intermediate(
-                    act, routes, intermediate, tokens, block, al.convert(m, al.u32), ki, lane, scale_base
-                )
-                fragments[m], input_scales[m] = xv, xs
-            for n in al.static_range(4):
-                n16 = wave * 4 + n
-                wv, ws = load_weight_fragment(weight, scales, intermediate, n16, ki, lane)
-                weights[n], weight_scales[n] = wv, ws
-            al.amdgpu.s_waitcnt(0, 0, 0)
-            for n in al.static_range(4):
+            input_scale = al.convert(0, al.u32)
+            for half_k in al.static_range(2):
                 for m in al.static_range(2):
-                    accum[n, m] = al.amdgpu.mfma_scale_16x16x128_fp4(
-                        weights[n], weight_scales[n], fragments[m], input_scales[m], accum[n, m], 0, 0
+                    xv, xs = load_intermediate(
+                        act,
+                        routes,
+                        intermediate,
+                        tokens,
+                        block,
+                        al.convert(m, al.u32),
+                        ki * 2 + half_k,
+                        lane,
+                        scale_base,
                     )
+                    fragments[m, half_k] = xv
+                    input_scale = input_scale | (xs << ((2 * half_k + m) * 8))
+                for n in al.static_range(4):
+                    weights[half_k, n] = load_weight_values(weight, intermediate, wave * 4 + n, ki * 2 + half_k, lane)
+            for n in al.static_range(2):
+                weight_scales[n] = load_weight_scales(scales, intermediate, wave * 2 + n, ki, lane)
+            al.amdgpu.s_waitcnt(0, 0, 0)
+            for half_k in al.static_range(2):
+                for n in al.static_range(4):
+                    for m in al.static_range(2):
+                        accum[n, m] = al.amdgpu.mfma_scale_16x16x128_fp4(
+                            weights[half_k, n],
+                            weight_scales[n // 2],
+                            fragments[m, half_k],
+                            input_scale,
+                            accum[n, m],
+                            2 * half_k + n % 2,
+                            2 * half_k + m,
+                        )
         result = al.view(storage, al.bf16, al.make_layout((32, 256), (256, 1)))
         for m in al.static_range(2):
             for n in al.static_range(4):
@@ -77,6 +94,7 @@ def make_stage2_compute(config):
 
 
 def make_stage2_kernel(config):
+    D, I = config.hidden, config.intermediate
     TOPK = config.topk
     initialize_w2_resources = make_w2_resources(config)
     stage2_compute = make_stage2_compute(config)
@@ -93,10 +111,7 @@ def make_stage2_kernel(config):
         counts: al.Tensor((2,), al.u32),
         out_ptr: al.Pointer(al.bf16),
         capacity: al.u32,
-        hidden_dim: al.u32,
-        intermediate_dim: al.u32,
     ):
-        D, I = hidden_dim, intermediate_dim
         tile, expert = al.convert(al.block_id(0), al.u32), al.convert(al.block_id(1), al.u32)
         tid = al.convert(al.thread_id(0), al.u32)
         wave, lane = al.amdgpu.readfirstlane(tid // 64), tid % 64
@@ -125,8 +140,6 @@ def make_stage2_kernel(config):
                     br,
                     rw_resource,
                     storage,
-                    D,
-                    I,
                     tokens,
                     group,
                     scale_base,

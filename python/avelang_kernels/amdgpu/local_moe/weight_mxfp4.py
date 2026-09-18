@@ -1,26 +1,33 @@
-"""Native FP4 values, row-major weight scales and separate W13 descriptors."""
+"""Native FP4 values and blocked scales with separate W13 descriptors."""
 
 from functools import cache
 
 import avelang
 import avelang.language as al
 
-from .scale_layout import load_scale_byte
-
 
 @avelang.jit
-def load_weight_fragment(
+def load_weight_values(
     weight: al.Tensor((4,), al.u32),
-    scales: al.Tensor((4,), al.u32),
     columns: al.u32,
     n16: al.u32,
     k128: al.u32,
     lane: al.u32,
-) -> (al.Tensor((4,), al.u32), al.u32):
+) -> al.Tensor((4,), al.u32):
     offset = n16 * 16 * (columns // 2) + k128 * 1024 + lane * 16
-    values = al.amdgpu.raw_buffer_load_x4(weight, offset, 0, 0)
-    scale = load_scale_byte(scales, (n16 * 16 + lane % 16) * (columns // 32) + k128 * 4 + lane // 16)
-    return values, scale
+    return al.amdgpu.raw_buffer_load_x4(weight, offset, 0, 0)
+
+
+@avelang.jit
+def load_weight_scales(
+    scales: al.Tensor((4,), al.u32),
+    columns: al.u32,
+    n32: al.u32,
+    k256: al.u32,
+    lane: al.u32,
+) -> al.u32:
+    offset = n32 * (columns // 256) * 256 + k256 * 256 + lane * 4
+    return al.amdgpu.raw_buffer_load_x1(scales, offset, 0, 0)
 
 
 @cache
