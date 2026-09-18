@@ -56,7 +56,6 @@ def make_stage2_compute_k256(intermediate, bias, weight_cache, words=STAGE2_K256
             )
             # Match dev-megamoe: publish each input tile, issue W2 loads,
             # synchronize, then read LDS and run MFMA.
-            lds[stage, input_row, vector ^ (input_row & 15)] = prefetched
             for half_k in al.static_range(2):
                 for n in al.static_range(4):
                     offset_w = (wave * 64 + n * 16) * (I // 2) + half_k * 1024 + lane * 16
@@ -65,6 +64,7 @@ def make_stage2_compute_k256(intermediate, bias, weight_cache, words=STAGE2_K256
                 weight_scales[n] = al.amdgpu.raw_buffer_load_x1(
                     scale_resource, (wave * 2 + n) * I + lane * 4, k * 256, 0
                 )
+            lds[stage, input_row, vector ^ (input_row & 15)] = prefetched
             al.syncthreads()
             read_stage2_input(storage, fragments, al.convert(k, al.u32), lane)
             for half_k in al.static_range(2):

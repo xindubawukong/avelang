@@ -8,6 +8,7 @@ Stage1 and Stage2 still support GPT-OSS, DSv3 and DSv4.
 
 - [moe][rocm] Use native MXFP4 intermediate scale layout
 - [moe][rocm] Support independent stage1 and stage2 weight policies
+- [moe][rocm] Prefetch stage2 weights before input LDS stores
 
 Each commit has numerical, graph-replay and four-scope timing evidence under
 ~/compare/local-moe-two-milestones-20260918.
