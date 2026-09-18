@@ -14,7 +14,6 @@ class MoeConfig:
 
     # Fixed launch geometry for the current local implementations.
     stage2_workers: ClassVar[int] = 256
-
     stage1_num_warps: ClassVar[int] = 4
     stage2_num_warps: ClassVar[int] = 4
 
@@ -35,10 +34,6 @@ class MoeConfig:
     @property
     def hidden(self) -> int:
         return self.solution.hidden
-
-    @property
-    def compute_hidden(self) -> int:
-        return self.hidden
 
     @property
     def intermediate(self) -> int:

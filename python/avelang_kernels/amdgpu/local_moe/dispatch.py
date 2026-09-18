@@ -196,14 +196,11 @@ def _get_2stage_cfgs_cached(token, requested, arch, policy, explicit):
                 if token * requested.topk // requested.experts < 64
                 else WeightLoadPolicy.CACHED
             )
-        matches = tuple(
+        selected = next(
             s
             for s in _matching_solutions(requested)
             if s.stage1_tile_shape == Stage1TileShape.M32_N256 and s.weight_load_policy == selected_policy
         )
-        if not matches:
-            raise ValueError("no implementation for requested tile/weight_load_policy combination")
-        selected = matches[0]
     return MoeConfig(selected, requested.experts, requested.topk)
 
 

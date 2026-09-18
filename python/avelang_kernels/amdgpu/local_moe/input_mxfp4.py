@@ -13,7 +13,7 @@ def make_mxfp4_input(config):
     LDS act is [stage, row, vector8, word4], with XOR row swizzle.
     Scale words follow each stage's act. Each u32 packs four E8M0 scales.
     """
-    D = config.compute_hidden
+    D = config.hidden
     BM, WN, WM = config.stage1_tile_m, config.stage1_warps_n, config.stage1_wave_m
     MR = WM // 16
     SX, TB = WM // 32, BM // 4

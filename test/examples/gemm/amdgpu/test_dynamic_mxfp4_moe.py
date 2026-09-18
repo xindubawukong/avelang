@@ -237,6 +237,41 @@ def test_no_contributing_routes(case):
 
 
 @pytest.mark.skipif(not gfx950, reason="Native MXFP4 requires gfx950")
+@pytest.mark.parametrize("policy", ["cached", "non_temporal"])
+def test_persistent_stage2_reuses_worker_after_invalid_group(policy):
+    from avelang_kernels.amdgpu.local_moe.stage2 import make_stage2
+
+    # Worker 0 owns groups 0, 1, 2: it must continue past invalid group 0.
+    groups, d, i = 513, 256, 512
+    capacity, tokens = groups * 32, groups * 32 - 7
+    config = get_2stage_cfgs(tokens, d, i, 1, 1, activation="silu", bias_dtype="none", weight_load_policy=policy)
+    layout = IntermediateLayout(capacity, i)
+    workspace = torch.empty(layout.nbytes, device="cuda", dtype=torch.uint8)
+    act, scales = layout.views(workspace, tokens, 1)
+    act.fill_(0x22)  # Two FP4 ones per byte.
+    scales.fill_(127)
+    weight, ws = _pack_weights(
+        torch.full((1, d, i // 2), 0x22, device="cuda", dtype=torch.uint8),
+        torch.full((1, d, i // 32), 127, device="cuda", dtype=torch.uint8),
+    )
+    ids = torch.full((capacity,), tokens, device="cuda", dtype=torch.int32)
+    ids[:tokens] = torch.arange(tokens - 1, -1, -1, device="cuda", dtype=torch.int32)
+    experts = torch.zeros(groups, device="cuda", dtype=torch.int32)
+    experts[0] = -1
+    route_weights = torch.full((capacity,), 0.5, device="cuda")
+    counts = torch.tensor([capacity, tokens], device="cuda", dtype=torch.int32)
+    output = torch.zeros(tokens * d + 16, device="cuda", dtype=torch.bfloat16)
+    output[-16:] = 19
+    make_stage2(config)[lambda: ((1, 256, 1), (256, 1, 1))](
+        workspace, weight, ws, output, ids, experts, route_weights, counts, output, capacity, num_warps=4
+    )
+    expected = torch.full((tokens, d), i * 0.5, device="cuda", dtype=torch.bfloat16)
+    expected[-32:] = 0
+    torch.testing.assert_close(output[:-16].reshape(tokens, d), expected, rtol=0, atol=0)
+    torch.testing.assert_close(output[-16:], torch.full_like(output[-16:], 19), rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not gfx950, reason="Native MXFP4 requires gfx950")
 @pytest.mark.parametrize(
     "tokens,columns,capacity",
     [(7, 256, 64), (7, 3072, 64), (7, 7168, 2112), (1025, 256, 2112), (1025, 3072, 2112), (1025, 7168, 2112)],
@@ -277,41 +312,6 @@ def test_aiter_input_preparation(tokens, columns, capacity):
 
 
 @pytest.mark.skipif(not gfx950, reason="Native MXFP4 requires gfx950")
-@pytest.mark.parametrize("policy", ["cached", "non_temporal"])
-def test_persistent_stage2_reuses_worker_after_invalid_group(policy):
-    from avelang_kernels.amdgpu.local_moe.stage2 import make_stage2
-
-    # Worker 0 owns groups 0, 1, 2: it must continue past invalid group 0.
-    groups, d, i = 513, 256, 512
-    capacity, tokens = groups * 32, groups * 32 - 7
-    config = get_2stage_cfgs(tokens, d, i, 1, 1, activation="silu", bias_dtype="none", weight_load_policy=policy)
-    layout = IntermediateLayout(capacity, i)
-    workspace = torch.empty(layout.nbytes, device="cuda", dtype=torch.uint8)
-    act, scales = layout.views(workspace, tokens, 1)
-    act.fill_(0x22)  # Two FP4 ones per byte.
-    scales.fill_(127)
-    weight, ws = _pack_weights(
-        torch.full((1, d, i // 2), 0x22, device="cuda", dtype=torch.uint8),
-        torch.full((1, d, i // 32), 127, device="cuda", dtype=torch.uint8),
-    )
-    ids = torch.full((capacity,), tokens, device="cuda", dtype=torch.int32)
-    ids[:tokens] = torch.arange(tokens - 1, -1, -1, device="cuda", dtype=torch.int32)
-    experts = torch.zeros(groups, device="cuda", dtype=torch.int32)
-    experts[0] = -1
-    route_weights = torch.full((capacity,), 0.5, device="cuda")
-    counts = torch.tensor([capacity, tokens], device="cuda", dtype=torch.int32)
-    output = torch.zeros(tokens * d + 16, device="cuda", dtype=torch.bfloat16)
-    output[-16:] = 19
-    make_stage2(config)[lambda: ((1, 256, 1), (256, 1, 1))](
-        workspace, weight, ws, output, ids, experts, route_weights, counts, output, capacity, num_warps=4
-    )
-    expected = torch.full((tokens, d), i * 0.5, device="cuda", dtype=torch.bfloat16)
-    expected[-32:] = 0
-    torch.testing.assert_close(output[:-16].reshape(tokens, d), expected, rtol=0, atol=0)
-    torch.testing.assert_close(output[-16:], torch.full_like(output[-16:], 19), rtol=0, atol=0)
-
-
-@pytest.mark.skipif(not gfx950, reason="Native MXFP4 requires gfx950")
 @pytest.mark.parametrize("activation", ["swiglu", "silu"])
 def test_m64_n512_stage1_bias_and_m32_stage2(activation):
     from dataclasses import replace
@@ -325,3 +325,38 @@ def test_m64_n512_stage1_bias_and_m32_stage2(activation):
     actual = dynamic_mxfp4_moe(x, weights, routing, config)
     expected = moe_reference(x, config, raw, routes)
     torch.testing.assert_close(actual.cpu(), expected, rtol=0.02, atol=0.01)
+
+
+@pytest.mark.skipif(not gfx950, reason="Native MXFP4 requires gfx950")
+def test_stage2_row_major_scales_with_routed_rows_and_k_halves():
+    from avelang_kernels.amdgpu.local_moe.stage2 import make_stage2
+
+    tokens, d, i = 32, 256, 512
+    config = get_2stage_cfgs(tokens, d, i, 1, 1, activation="silu", bias_dtype="none")
+    layout = IntermediateLayout(tokens, i)
+    workspace = torch.zeros(layout.nbytes, device="cuda", dtype=torch.uint8)
+    act, scales = layout.views(workspace, tokens, 1)
+    act.fill_(0x22)
+    # Vary scales over every row, K32 block and both K256 tiles. The Stage2
+    # scale consumer must combine bytes from four different lanes correctly.
+    rows = torch.arange(tokens)[:, None]
+    columns = torch.arange(i // 32)[None, :]
+    exponents = (124 + (rows * 3 + columns) % 5).to(torch.uint8)
+    scales[:tokens].copy_(exponents)
+    weight, ws = _pack_weights(
+        torch.full((1, d, i // 2), 0x22, device="cuda", dtype=torch.uint8),
+        torch.full((1, d, i // 32), 127, device="cuda", dtype=torch.uint8),
+    )
+    token_ids = (torch.arange(tokens) * 13 + 7) % tokens
+    ids = token_ids.to(device="cuda", dtype=torch.int32)
+    experts = torch.zeros(1, device="cuda", dtype=torch.int32)
+    route_weights = torch.full((tokens,), 0.5, device="cuda")
+    counts = torch.tensor([tokens, tokens], device="cuda", dtype=torch.int32)
+    output = torch.zeros((tokens, d), device="cuda", dtype=torch.bfloat16)
+    make_stage2(config)[lambda: config.stage2_grid()](
+        workspace, weight, ws, output, ids, experts, route_weights, counts, output, tokens, num_warps=4
+    )
+    expected = torch.empty((tokens, d), dtype=torch.bfloat16)
+    row_sums = 16 * torch.pow(2.0, exponents.float() - 127).sum(dim=1)
+    expected[token_ids] = row_sums[:, None].expand(-1, d).to(torch.bfloat16)
+    torch.testing.assert_close(output.cpu(), expected, rtol=0, atol=0)
