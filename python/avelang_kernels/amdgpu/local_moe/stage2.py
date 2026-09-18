@@ -15,6 +15,7 @@ def make_stage2_compute(config):
     intermediate = config.intermediate
     K_TILES = config.intermediate // 256
     BIAS = config.bias
+    WEIGHT_CACHE = config.weight_load_aux
     prefetch_stage2_input, read_stage2_input = make_stage2_input(config)
 
     @avelang.jit
@@ -58,7 +59,7 @@ def make_stage2_compute(config):
             for half_k in al.static_range(2):
                 for n in al.static_range(4):
                     offset_w = (wave * 64 + n * 16) * (intermediate // 2) + half_k * 1024 + lane * 16
-                    weights[half_k, n] = al.amdgpu.raw_buffer_load_x4(weight, offset_w, k * 2048, 0)
+                    weights[half_k, n] = al.amdgpu.raw_buffer_load_x4(weight, offset_w, k * 2048, WEIGHT_CACHE)
             for n in al.static_range(2):
                 weight_scales[n] = al.amdgpu.raw_buffer_load_x1(
                     scales, (wave * 2 + n) * intermediate + lane * 4, k * 256, 0

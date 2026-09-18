@@ -277,7 +277,7 @@ def test_aiter_input_preparation(tokens, columns, capacity):
 
 
 @pytest.mark.skipif(not gfx950, reason="Native MXFP4 requires gfx950")
-@pytest.mark.parametrize("policy", ["cached"])
+@pytest.mark.parametrize("policy", ["cached", "non_temporal"])
 def test_persistent_stage2_reuses_worker_after_invalid_group(policy):
     from avelang_kernels.amdgpu.local_moe.stage2 import make_stage2
 

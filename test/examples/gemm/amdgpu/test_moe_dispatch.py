@@ -32,8 +32,8 @@ def choose(token=8, **overrides):
     return get_2stage_cfgs(token=token, **(PROBLEM | overrides))
 
 
-@pytest.mark.parametrize("token,policy", [(0, 0), (128, 0), (255, 0), (256, 0), (257, 0), (1024, 0)])
-def test_default_cached_policy(token, policy):
+@pytest.mark.parametrize("token,policy", [(0, 1), (128, 1), (255, 1), (256, 0), (257, 0), (1024, 0)])
+def test_default_policy_threshold(token, policy):
     config = choose(token)
     assert config.solution.weight_load_policy == config.solution.weight_load_policy == WeightLoadPolicy(policy)
     assert config.solution.stages == Stages.TWO_STAGE
@@ -43,12 +43,12 @@ def test_default_cached_policy(token, policy):
 
 def test_available_candidates_and_explicit_policy():
     candidates = available_2stage_solutions(**PROBLEM)
-    assert {s.weight_load_policy for s in candidates} == {WeightLoadPolicy.CACHED}
-    assert {s.weight_load_policy for s in candidates} == {WeightLoadPolicy.CACHED}
+    assert {s.weight_load_policy for s in candidates} == set(WeightLoadPolicy)
+    assert {s.weight_load_policy for s in candidates} == set(WeightLoadPolicy)
     assert {s.stage1_tile_shape for s in candidates} == {Stage1TileShape.M32_N256, Stage1TileShape.M64_N512}
     for solution in candidates:
         assert choose(1024, solution_id=int(solution)).solution == solution
-    for policy in (WeightLoadPolicy.CACHED,):
+    for policy in WeightLoadPolicy:
         selected = choose(weight_load_policy=policy).solution
         assert selected.weight_load_policy == selected.weight_load_policy == policy
 
@@ -155,7 +155,7 @@ def test_explicit_id_must_match_request(field, value):
 def test_explicit_id_policy_conflicts_and_unsupported_stages():
     solution = choose().solution
     with pytest.raises(ValueError, match="weight_load_policy"):
-        choose(solution_id=solution, weight_load_policy="non_temporal")
+        choose(solution_id=solution, weight_load_policy="cached")
     for changed in (replace(solution, stages=Stages.ONE_STAGE),):
         with pytest.raises(ValueError, match="unsupported Ave local MoE solution"):
             choose(solution_id=changed)
@@ -249,7 +249,7 @@ def test_normalization_rejects_objects_that_only_look_like_names(field, name):
 
 
 def test_explicit_names_and_integer_codes_keep_the_same_solution():
-    expected = choose(weight_load_policy="cached")
+    expected = choose(weight_load_policy="non_temporal")
     assert choose(activation="OPENAI_SWIGLU", dtype="torch.bfloat16", bias_dtype="BF16") == expected
-    assert choose(activation=1, bias_dtype=5, weight_load_policy=0) == expected
+    assert choose(activation=1, bias_dtype=5, weight_load_policy=1) == expected
     assert choose(bias_dtype=None) == choose(bias_dtype=DataType.NONE)
