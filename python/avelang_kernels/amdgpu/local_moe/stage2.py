@@ -19,6 +19,19 @@ STAGE2_K256_ARENA_WORDS = 4096
 STAGE2_K256_LDS_WORDS = 4160
 
 
+@avelang.jit
+def _pack_weighted_bf16_pair(first: al.f32, second: al.f32, route_weight: al.f32) -> al.u32:
+    """Pack one pair without passing the complete accumulator through a helper."""
+    values = al.make_local((1, 2), al.f32)
+    values[0, 0] = first * route_weight
+    values[0, 1] = second * route_weight
+    packed = al.make_local((1, 2), al.bf16)
+    packed[0] = al.convert(values[0], al.bf16)
+    # Two BF16 values occupy one u32; a one-element view is scalar.
+    word = al.view(packed, al.u32, al.make_layout((1,), (1,)))
+    return word
+
+
 @cache
 def make_stage2_compute_k256(intermediate, bias, weight_cache, words=STAGE2_K256_LDS_WORDS):
     """Write weighted BF16 [32, 256] output into linear LDS and synchronize."""
@@ -90,16 +103,20 @@ def make_stage2_compute_k256(intermediate, bias, weight_cache, words=STAGE2_K256
 
         al.syncthreads()
         bias_values = al.view(packed_bias, al.bf16, al.make_layout((4, 4), (4, 1)))
-        shared = al.view(storage, al.bf16, al.make_layout((32, 256), (256, 1)))
+        pairs = al.make_local((2,), al.u32)
         for m in al.static_range(2):
+            row = m * 16 + lane % 16
             for n in al.static_range(4):
-                for c in al.static_range(4):
-                    value = accum[n, m, c]
+                for pair in al.static_range(2):
+                    first, second = accum[n, m, pair * 2], accum[n, m, pair * 2 + 1]
                     if BIAS:
-                        value = value + al.convert(bias_values[n, c], al.f32)
-                    shared[m * 16 + lane % 16, wave * 64 + n * 16 + lane // 16 * 4 + c] = al.convert(
-                        value * route_weights[m], al.bf16
-                    )
+                        first = first + al.convert(bias_values[n, pair * 2], al.f32)
+                        second = second + al.convert(bias_values[n, pair * 2 + 1], al.f32)
+                    pairs[pair] = _pack_weighted_bf16_pair(first, second, route_weights[m])
+                index = (row * 256 + wave * 64 + n * 16 + (lane // 16) * 4) // 2
+                storage[index] = pairs[0]
+                storage[index + 1] = pairs[1]
+
         al.syncthreads()
 
     return stage2_compute_k256
