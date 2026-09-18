@@ -1,6 +1,6 @@
 # Dynamic MXFP4 Local MoE: optimization history
 
-Current step 14: [moe][rocm] Use XOR LDS layouts for inputs.
+Current step 15: [moe][rocm] Unify W13 projection resources.
 
 This prefix targets Petit dev-megamoe before d97fb857. The public local ID
 has one shared cache policy at bit40 and the Stage1 tile at bit41. Stage2 is

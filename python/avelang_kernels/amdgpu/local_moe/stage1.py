@@ -31,10 +31,8 @@ def make_stage1_compute(config):
         act: al.Tensor((4,), al.u32),
         scales: al.Tensor((4,), al.u32),
         routes: al.Tensor((4,), al.u32),
-        gate: al.Tensor((4,), al.u32),
-        gate_scales: al.Tensor((4,), al.u32),
-        up: al.Tensor((4,), al.u32),
-        up_scales: al.Tensor((4,), al.u32),
+        resource_w: al.Tensor((4,), al.u32),
+        resource_ws: al.Tensor((4,), al.u32),
         bias: al.Tensor((4,), al.u32),
         storage: al.Tensor((WORDS,), al.u32),
         tokens: al.u32,
@@ -48,7 +46,7 @@ def make_stage1_compute(config):
         weights = al.make_local((2, 2, NR, 4), al.u32)
         weight_scales = al.make_local((2, NS), al.u32)
         prefetch_input(act, scales, routes, storage, tokens, block, al.convert(0, al.u32), wave, lane)
-        load_weights(gate, gate_scales, up, up_scales, weights, weight_scales, al.convert(0, al.u32), wave, lane)
+        load_weights(resource_w, resource_ws, weights, weight_scales, al.convert(0, al.u32), wave, lane)
         al.amdgpu.s_waitcnt(0, 0, 0)
         al.syncthreads()
         input_scale = read_input(storage, fragments, al.convert(0, al.u32), wave, lane)
@@ -68,7 +66,7 @@ def make_stage1_compute(config):
                                 2 * half_k + n % 2,
                                 2 * half_k + m,
                             )
-            load_weights(gate, gate_scales, up, up_scales, weights, weight_scales, next_k, wave, lane)
+            load_weights(resource_w, resource_ws, weights, weight_scales, next_k, wave, lane)
             # Drain the next tile before reuse, including the unused terminal copy.
             al.amdgpu.s_waitcnt(0, 0, 0)
             al.syncthreads()
@@ -101,7 +99,7 @@ def make_stage1_kernel(config):
     E, TOPK = config.experts, config.topk
     BM, BN, WORDS = config.stage1_tile_m, config.stage1_projection_n, config.stage1_lds_words
     SLICES, SEGMENTS = BM // 8, BN // 128
-    initialize_w13_resources = make_w13_resources(config)
+    initialize_w13_resources = make_w13_resources(D, I, E, BN, I)
     stage1_compute = make_stage1_compute(config)
     store_intermediate = make_intermediate_store()
 
@@ -135,11 +133,22 @@ def make_stage1_kernel(config):
         input_scales = al.make_tensor(act_scales, al.u32, al.make_layout((capacity * D // 128,), (1,)))
         act_resource = al.amdgpu.make_rsrc(input_values, tokens * D // 2)
         scale_resource = al.amdgpu.make_rsrc(input_scales, capacity * D // 32)
-        wg, sg, bias = initialize_w13_resources(weight, ws, bias_ptr, expert, tile, D, I, al.convert(0, al.u32))
-        wu, su, _ = initialize_w13_resources(weight, ws, bias_ptr, expert, tile, D, I, al.convert(1, al.u32))
+        resource_w, resource_ws, bias = initialize_w13_resources(
+            weight, ws, bias_ptr, expert, tile, al.convert(1, al.u32)
+        )
         storage = al.make_shared((WORDS,), al.u32)
         stage1_compute(
-            act_resource, scale_resource, route_resource, wg, sg, wu, su, bias, storage, tokens, block, wave, lane
+            act_resource,
+            scale_resource,
+            route_resource,
+            resource_w,
+            resource_ws,
+            bias,
+            storage,
+            tokens,
+            block,
+            wave,
+            lane,
         )
         scale_base = capacity * I // 2
         workspace_bytes = scale_base + ((capacity + 255) // 256) * 256 * (I // 32)
