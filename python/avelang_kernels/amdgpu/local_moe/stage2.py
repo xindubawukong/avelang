@@ -20,6 +20,12 @@ STAGE2_K256_LDS_WORDS = 4160
 
 
 @avelang.jit
+def output_word_index(row: al.u32, column: al.u32) -> al.u32:
+    """Map a BF16 column in the N256 output tile to an XOR-swizzled u32 word."""
+    return ((row * 256 + column) // 2) ^ ((row & 15) * 4)
+
+
+@avelang.jit
 def _pack_weighted_bf16_pair(first: al.f32, second: al.f32, route_weight: al.f32) -> al.u32:
     """Pack one pair without passing the complete accumulator through a helper."""
     values = al.make_local((1, 2), al.f32)
@@ -113,7 +119,7 @@ def make_stage2_compute_k256(intermediate, bias, weight_cache, words=STAGE2_K256
                         first = first + al.convert(bias_values[n, pair * 2], al.f32)
                         second = second + al.convert(bias_values[n, pair * 2 + 1], al.f32)
                     pairs[pair] = _pack_weighted_bf16_pair(first, second, route_weights[m])
-                index = (row * 256 + wave * 64 + n * 16 + (lane // 16) * 4) // 2
+                index = output_word_index(row, wave * 64 + n * 16 + (lane // 16) * 4)
                 storage[index] = pairs[0]
                 storage[index + 1] = pairs[1]
 
@@ -203,12 +209,13 @@ def make_stage2_kernel(config: MoeConfig):
                     al.convert(tid, al.u32),
                 )
                 shared = al.view(storage, al.bf16, al.make_layout((4096, 2), (2, 1)))
+                output_bytes = al.amdgpu.readfirstlane(counts[1]) * D * 2
                 for m in al.static_range(8):
                     row = wave * 8 + m
                     row_offset = al.amdgpu.readfirstlane(row_offsets[row])
-                    if row_offset < counts[1] * D * 2:
+                    if row_offset < output_bytes:
                         offset = al.convert(row_offset + tile * 512 + lane * 4, al.u32)
-                        index = row * 128 + lane
+                        index = output_word_index(row, lane * 2)
                         al.amdgpu.raw_buffer_atomic_add_bf16x2(shared[index], output_resource, offset)
                         al.amdgpu.raw_buffer_atomic_add_bf16x2(shared[index + 64], output_resource, offset + 256)
             # Protect the shared arena before this worker takes its next route tile.
