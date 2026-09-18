@@ -126,4 +126,10 @@ class MoeConfig:
     def stage2_grid(self, tokens: int, capacity: int):
         if self.stage2_tile_k == 256:
             return ((self.hidden // 256, self.stage2_workers, 1), (256, 1, 1))
-        return ((capacity // self.stage2_tile_m * (self.hidden // 256), 1, 1), (256, 1, 1))
+        routes = tokens * self.topk
+        active_experts = min(routes, self.experts)
+        groups = min(
+            (routes + active_experts * (self.stage1_tile_m - 1) + self.stage2_tile_m - 1) // self.stage2_tile_m,
+            capacity // self.stage2_tile_m,
+        )
+        return ((groups * (self.hidden // 256), 1, 1), (256, 1, 1))
