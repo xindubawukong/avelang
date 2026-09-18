@@ -25,7 +25,7 @@ def make_stage2_compute(config):
         scales: al.Tensor((4,), al.u32),
         bias: al.Tensor((4,), al.u32),
         route_weights: al.Tensor((4,), al.u32),
-        storage: al.Tensor((4096,), al.u32),
+        storage: al.Tensor((4160,), al.u32),
         tokens: al.u32,
         block: al.u32,
         scale_base: al.u32,
@@ -111,7 +111,7 @@ def make_stage2_kernel(config):
         tid = al.convert(al.thread_id(0), al.u32)
         wave, lane = al.amdgpu.readfirstlane(tid // 64), tid % 64
         extent, tokens = al.amdgpu.readfirstlane(counts[0]), al.amdgpu.readfirstlane(counts[1])
-        storage = al.make_shared((4096,), al.u32)
+        storage = al.make_shared((4160,), al.u32)
         experts = al.make_tensor(expert_ptr, al.u32, al.make_layout((capacity // 32,), (1,)))
         groups = (extent + 31) // 32
         quotient, remainder = groups // WORKERS, groups % WORKERS
@@ -132,6 +132,15 @@ def make_stage2_kernel(config):
                 memory = al.make_tensor(workspace_ptr, al.u8, al.make_layout((workspace_bytes,), (1,)))
                 act_resource = al.amdgpu.make_rsrc(memory, workspace_bytes)
                 wr, sr, br = initialize_w2_resources(weight, ws, bias_ptr, expert, tile, D, I)
+                row_offsets = al.subview(storage, (4096,), (32,), (1,))
+                if tid < 32:
+                    metadata_route = al.amdgpu.raw_buffer_load_x1(route_resource, tid * 4, 0, 0)
+                    metadata_token, metadata_slot = metadata_route & 0xFFFFFF, metadata_route >> 24
+                    row_offsets[tid] = al.select(
+                        group * 32 + tid < extent and metadata_token < tokens and metadata_slot < TOPK,
+                        metadata_token * D * 2,
+                        tokens * D * 2,
+                    )
                 stage2_compute(
                     act_resource,
                     route_resource,
@@ -153,11 +162,10 @@ def make_stage2_kernel(config):
                 for m in al.static_range(16):
                     pair = m * 256 + tid
                     row, column = pair // 128, pair % 128 * 2
-                    route = al.amdgpu.raw_buffer_load_x1(route_resource, row * 4, 0, 0)
-                    token, slot = route & 0xFFFFFF, route >> 24
-                    if group * 32 + row < extent and token < tokens and slot < TOPK:
-                        offset = (token * D + tile * 256 + column) * 2
-                        al.amdgpu.raw_buffer_atomic_add_bf16x2(pairs[pair], output_resource, offset)
+                    # Invalid rows start at the resource bound, so buffer atomics
+                    # discard them without rereading route IDs or branching per pair.
+                    offset = row_offsets[row] + tile * 512 + column * 2
+                    al.amdgpu.raw_buffer_atomic_add_bf16x2(pairs[pair], output_resource, offset)
             # Protect the shared arena before this worker takes another group.
             al.syncthreads()
 

@@ -79,7 +79,7 @@ def make_stage2_input(config):
     def prefetch_stage2_input(
         act: al.Tensor((4,), al.u32),
         routes: al.Tensor((4,), al.u32),
-        storage: al.Tensor((4096,), al.u32),
+        storage: al.Tensor((4160,), al.u32),
         tokens: al.u32,
         block: al.u32,
         k: al.u32,
@@ -106,7 +106,7 @@ def make_stage2_input(config):
 
     @avelang.jit
     def read_stage2_input(
-        storage: al.Tensor((4096,), al.u32),
+        storage: al.Tensor((4160,), al.u32),
         fragments: al.Tensor((2, 2, 4), al.u32),
         k: al.u32,
         lane: al.u32,
