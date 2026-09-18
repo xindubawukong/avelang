@@ -11,6 +11,7 @@ from .solutionid import (
     DataType,
     MoeSolutionId,
     Stage1TileShape,
+    Stage2TileShape,
     WeightLoadPolicy,
 )
 
@@ -117,21 +118,32 @@ def _registered_2stage_implementations(hidden, intermediate):
     from .stage2 import make_stage2_kernel
 
     implementations = {}
+    shapes = (
+        (Stage1TileShape.M32_N256, Stage2TileShape.M32_N256_K256),
+        (Stage1TileShape.M64_N512, Stage2TileShape.M32_N256_K256),
+    )
     for activation in ActivationFunction:
         for bias in (DataType.NONE, DataType.BF16):
-            for shape in Stage1TileShape:
-                for policy in WeightLoadPolicy:
-                    solution = MoeSolutionId(
-                        hidden=hidden,
-                        intermediate=intermediate,
-                        activation=activation,
-                        bias_dtype=bias,
-                        stage1_tile_shape=shape,
-                        weight_load_policy=policy,
-                    )
-                    if hidden % 256 or intermediate % (solution.stage1_tile_n // 2) or intermediate % 256:
-                        continue
-                    implementations[solution] = (make_stage1_kernel, make_stage2_kernel)
+            for s1_shape, s2_shape in shapes:
+                for p1 in WeightLoadPolicy:
+                    for p2 in WeightLoadPolicy:
+                        solution = MoeSolutionId(
+                            hidden=hidden,
+                            intermediate=intermediate,
+                            activation=activation,
+                            bias_dtype=bias,
+                            stage1_tile_shape=s1_shape,
+                            stage2_tile_shape=s2_shape,
+                            stage1_weight_load_policy=p1,
+                            stage2_weight_load_policy=p2,
+                        )
+                        if (
+                            hidden % 256
+                            or intermediate % (solution.stage1_tile_n // 2)
+                            or intermediate % solution.stage2_tile_k
+                        ):
+                            continue
+                        implementations[solution] = (make_stage1_kernel, make_stage2_kernel)
     return implementations
 
 
@@ -178,28 +190,41 @@ def available_2stage_solutions(
 
 
 @lru_cache(maxsize=2048)
-def _get_2stage_cfgs_cached(token, requested, arch, policy, explicit):
+def _get_2stage_cfgs_cached(token, requested, arch, policy1, policy2, explicit):
     if explicit is not None:
         config = MoeConfig(explicit, requested.experts, requested.topk)
         resolve_2stage_implementation(config)
         for field in _OPERATION_FIELDS:
             if getattr(explicit, field) != getattr(requested.solution, field):
                 raise ValueError(f"solution_id does not match requested {field}")
-        if policy is not None and explicit.weight_load_policy != policy:
-            raise ValueError("solution_id does not match requested weight_load_policy")
+        for stage, policy in ((1, policy1), (2, policy2)):
+            if policy is not None and getattr(explicit, f"stage{stage}_weight_load_policy") != policy:
+                raise ValueError(f"solution_id does not match requested stage{stage}_weight_load_policy")
         selected = explicit
     else:
-        selected_policy = policy
-        if selected_policy is None:
-            selected_policy = (
-                WeightLoadPolicy.NON_TEMPORAL
-                if token * requested.topk // requested.experts < 64
-                else WeightLoadPolicy.CACHED
-            )
-        selected = next(
+        candidates = _matching_solutions(requested)
+        preferred1 = preferred2 = (
+            WeightLoadPolicy.NON_TEMPORAL
+            if token * requested.topk // requested.experts < 64
+            else WeightLoadPolicy.CACHED
+        )
+        s1_shape, s2_shape = Stage1TileShape.M32_N256, Stage2TileShape.M32_N256_K256
+        matches = tuple(
             s
-            for s in _matching_solutions(requested)
-            if s.stage1_tile_shape == Stage1TileShape.M32_N256 and s.weight_load_policy == selected_policy
+            for s in candidates
+            if s.stage1_tile_shape == s1_shape
+            and s.stage2_tile_shape == s2_shape
+            and (policy1 is None or s.stage1_weight_load_policy == policy1)
+            and (policy2 is None or s.stage2_weight_load_policy == policy2)
+        )
+        if not matches:
+            raise ValueError("no implementation for requested tile/weight_load_policy combination")
+        selected = min(
+            matches,
+            key=lambda s: (
+                s.stage1_weight_load_policy != (policy1 if policy1 is not None else preferred1),
+                s.stage2_weight_load_policy != (policy2 if policy2 is not None else preferred2),
+            ),
         )
     return MoeConfig(selected, requested.experts, requested.topk)
 
@@ -219,6 +244,8 @@ def get_2stage_cfgs(
     group_size: int = 32,
     arch: str = "gfx950",
     weight_load_policy: WeightLoadPolicy | str | None = None,
+    stage1_weight_load_policy: WeightLoadPolicy | str | None = None,
+    stage2_weight_load_policy: WeightLoadPolicy | str | None = None,
     solution_id: MoeSolutionId | int | None = None,
 ) -> MoeConfig:
     """Select one supported two-stage configuration for a problem.
@@ -233,13 +260,19 @@ def get_2stage_cfgs(
     requested, arch = _normalize_request(
         model_dim, inter_dim, activation, bias_dtype, dtype, q_dtype_a, q_dtype_w, group_size, arch
     )
-    policy = _normalize_weight_load_policy(weight_load_policy)
+    common_policy = _normalize_weight_load_policy(weight_load_policy)
+    policy1 = _normalize_weight_load_policy(stage1_weight_load_policy)
+    policy2 = _normalize_weight_load_policy(stage2_weight_load_policy)
+    if common_policy is not None:
+        if any(p is not None and p != common_policy for p in (policy1, policy2)):
+            raise ValueError("common and stage-specific weight load policies conflict")
+        policy1 = policy2 = common_policy
     if solution_id is not None and not isinstance(solution_id, MoeSolutionId):
         solution_id = MoeSolutionId.from_int(solution_id)
     # Validate non-encoded parameters before cache lookup too: bool/int keys
     # compare equal in Python, so invalid inputs must not reuse valid entries.
     config = MoeConfig(requested, expert, topk)
-    return _get_2stage_cfgs_cached(token, config, arch, policy, solution_id)
+    return _get_2stage_cfgs_cached(token, config, arch, policy1, policy2, solution_id)
 
 
 get_2stage_cfgs.cache_clear = _get_2stage_cfgs_cached.cache_clear

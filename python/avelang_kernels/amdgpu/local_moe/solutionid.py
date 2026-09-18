@@ -1,4 +1,4 @@
-"""Local MoE solution encoding from Petit dev-megamoe (before Kimi)."""
+"""Petit's 64-bit local MoE solution encoding (not the MegaMoE encoding)."""
 
 from dataclasses import dataclass
 from enum import IntEnum
@@ -51,6 +51,10 @@ class Stage1TileShape(IntEnum):
     M64_N512 = 1
 
 
+class Stage2TileShape(IntEnum):
+    M32_N256_K256 = 0
+
+
 # Field positions match FusedMoESolutionId::Repr/FromRepr in fused_moe.h.
 # MegaMoE reuses these low 24 bits from the local implementation.
 BASE_FIELDS = (
@@ -63,10 +67,13 @@ BASE_FIELDS = (
     ("activation", ActivationFunction, 20, 3),
     ("stage1_buffering", Stage1Buffering, 23, 1),
 )
-_FIELDS = BASE_FIELDS + (("weight_load_policy", WeightLoadPolicy, 40, 1),)
+_FIELDS = BASE_FIELDS + (
+    ("stage1_weight_load_policy", WeightLoadPolicy, 40, 1),
+    ("stage2_weight_load_policy", WeightLoadPolicy, 41, 1),
+)
 _SHAPES = (("hidden", 24), ("intermediate", 32))
-# dev-megamoe encodes the M32/M64 Stage1 tile in bit41; Stage2 is fixed.
-_TILES = (("stage1_tile_shape", Stage1TileShape, (41,)),)
+# The local tile fields occupy interleaved bits in the current Petit ABI.
+_TILES = (("stage1_tile_shape", Stage1TileShape, (42, 44, 46)), ("stage2_tile_shape", Stage2TileShape, (43, 45)))
 
 
 @dataclass(frozen=True, slots=True)
@@ -88,8 +95,10 @@ class MoeSolutionId:
     mfma: MfmaShape = MfmaShape.SCALE_FP4_MXFP4
     stages: Stages = Stages.TWO_STAGE
     stage1_buffering: Stage1Buffering = Stage1Buffering.DOUBLE_BUFFER
-    weight_load_policy: WeightLoadPolicy = WeightLoadPolicy.CACHED
+    stage1_weight_load_policy: WeightLoadPolicy = WeightLoadPolicy.CACHED
+    stage2_weight_load_policy: WeightLoadPolicy = WeightLoadPolicy.CACHED
     stage1_tile_shape: Stage1TileShape = Stage1TileShape.M32_N256
+    stage2_tile_shape: Stage2TileShape = Stage2TileShape.M32_N256_K256
 
     def __post_init__(self):
         enum_fields = [(name, enum) for name, enum, _, _ in _FIELDS] + [(name, enum) for name, enum, _ in _TILES]
@@ -109,8 +118,8 @@ class MoeSolutionId:
     def from_int(cls, value: int) -> "MoeSolutionId":
         if type(value) is not int:
             raise TypeError("solution ID must be an integer")
-        if value < 0 or value >> 42:
-            raise ValueError("local MoE solution ID must be nonnegative with reserved bits [42,63] clear")
+        if value < 0 or value >> 47:
+            raise ValueError("local MoE solution ID must be nonnegative with reserved bits [47,63] clear")
         fields = {name: enum((value >> shift) & ((1 << bits) - 1)) for name, enum, shift, bits in _FIELDS}
         fields.update({name: ((value >> shift) & 255) * 64 for name, shift in _SHAPES})
         fields.update(

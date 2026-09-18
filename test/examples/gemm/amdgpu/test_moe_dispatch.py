@@ -35,7 +35,11 @@ def choose(token=8, **overrides):
 @pytest.mark.parametrize("token,policy", [(0, 1), (128, 1), (255, 1), (256, 0), (257, 0), (1024, 0)])
 def test_default_policy_threshold(token, policy):
     config = choose(token)
-    assert config.solution.weight_load_policy == WeightLoadPolicy(policy)
+    assert (
+        config.solution.stage1_weight_load_policy
+        == config.solution.stage2_weight_load_policy
+        == WeightLoadPolicy(policy)
+    )
     assert config.solution.stages == Stages.TWO_STAGE
     assert config.stage2_workers == 256
     assert not hasattr(config, "token")
@@ -43,13 +47,14 @@ def test_default_policy_threshold(token, policy):
 
 def test_available_candidates_and_explicit_policy():
     candidates = available_2stage_solutions(**PROBLEM)
-    assert {s.weight_load_policy for s in candidates} == set(WeightLoadPolicy)
+    assert {s.stage1_weight_load_policy for s in candidates} == set(WeightLoadPolicy)
+    assert {s.stage2_weight_load_policy for s in candidates} == set(WeightLoadPolicy)
     assert {s.stage1_tile_shape for s in candidates} == {Stage1TileShape.M32_N256, Stage1TileShape.M64_N512}
     for solution in candidates:
         assert choose(1024, solution_id=int(solution)).solution == solution
     for policy in WeightLoadPolicy:
         selected = choose(weight_load_policy=policy).solution
-        assert selected.weight_load_policy == policy
+        assert selected.stage1_weight_load_policy == selected.stage2_weight_load_policy == policy
 
 
 def test_selection_cache_normalizes_external_values():
@@ -254,7 +259,8 @@ def test_explicit_names_and_integer_codes_keep_the_same_solution():
     assert choose(bias_dtype=None) == choose(bias_dtype=DataType.NONE)
 
 
-@pytest.mark.parametrize("stage", [1, 2])
-def test_stage_specific_policy_is_not_part_of_dev_megamoe_api(stage):
-    with pytest.raises(TypeError, match="unexpected keyword"):
-        choose(**{f"stage{stage}_weight_load_policy": "cached"})
+def test_independent_policies():
+    config = choose(stage1_weight_load_policy="cached", stage2_weight_load_policy="non_temporal")
+    assert config.stage1_weight_load_aux == 0 and config.stage2_weight_load_aux == 2
+    with pytest.raises(ValueError, match="conflict"):
+        choose(weight_load_policy="cached", stage2_weight_load_policy="non_temporal")

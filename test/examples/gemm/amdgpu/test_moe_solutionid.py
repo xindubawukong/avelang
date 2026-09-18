@@ -10,6 +10,7 @@ from avelang_kernels.amdgpu.local_moe.solutionid import (
     MfmaShape,
     Stage1Buffering,
     Stage1TileShape,
+    Stage2TileShape,
     Stages,
     WeightLoadPolicy,
     WeightOrdering,
@@ -50,12 +51,13 @@ def test_policy_bias_and_activation_fields():
             config.solution,
             activation=ActivationFunction.SILU_DOT,
             bias_dtype=DataType.NONE,
-            weight_load_policy=WeightLoadPolicy.NON_TEMPORAL,
+            stage1_weight_load_policy=WeightLoadPolicy.NON_TEMPORAL,
+            stage2_weight_load_policy=WeightLoadPolicy.NON_TEMPORAL,
         ),
     )
-    assert int(changed.solution) == 0x13030818011
-    assert changed.weight_load_aux == 2
-    assert config.weight_load_aux == 0
+    assert int(changed.solution) == 0x33030818011
+    assert changed.stage1_weight_load_aux == changed.stage2_weight_load_aux == 2
+    assert config.stage1_weight_load_aux == config.stage2_weight_load_aux == 0
     # Expert count and top-k are not encoded in the local solution ID.
     assert replace(config, experts=32, topk=8).solution == config.solution
 
@@ -74,7 +76,7 @@ def test_unencodable_dimensions(shape):
         replace(GPTOSS, intermediate=shape)
 
 
-@pytest.mark.parametrize("encoded", [-1, (1 << 42) | 0x3030918511, 1 << 63, 1 << 64, 0, 0x303091851F, 0x0638A18011])
+@pytest.mark.parametrize("encoded", [-1, (1 << 47) | 0x3030918511, 1 << 63, 1 << 64, 0, 0x303091851F, 0x0638A18011])
 def test_invalid_ids(encoded):
     with pytest.raises(ValueError):
         MoeSolutionId.from_int(encoded)
@@ -108,27 +110,28 @@ def test_config_preserves_encodable_solutions(field, value):
 
 
 def test_stage1_m64_bit_and_shape():
-    solution = MoeSolutionId.from_int(0x23030918511)
+    solution = MoeSolutionId.from_int(0x43030918511)
     assert solution.stage1_tile_shape == Stage1TileShape.M64_N512
     assert (solution.stage1_tile_m, solution.stage1_tile_n) == (64, 512)
-    assert solution.weight_load_policy == WeightLoadPolicy.CACHED
+    assert solution.stage1_weight_load_policy == solution.stage2_weight_load_policy == WeightLoadPolicy.CACHED
 
 
-@pytest.mark.parametrize("shape", list(Stage1TileShape))
-@pytest.mark.parametrize("policy", list(WeightLoadPolicy))
-def test_dev_megamoe_policy_and_tile_bits(shape, policy):
-    # Petit dev-megamoe fused_moe.h: common weight policy bit40, Stage1 tile bit41.
-    encoded = int(GPTOSS) | (int(policy) << 40) | (int(shape) << 41)
+@pytest.mark.parametrize("s1,bits1", [(0, 0), (1, 1 << 42)])
+@pytest.mark.parametrize("policies", range(4))
+def test_tile_bits_and_independent_policies(s1, bits1, policies):
+    encoded = int(GPTOSS) | bits1 | (policies << 40)
     solution = MoeSolutionId.from_int(encoded)
-    assert solution.stage1_tile_shape == shape
-    assert solution.weight_load_policy == policy
+    assert solution.stage1_tile_shape == Stage1TileShape(s1)
+    assert solution.stage2_tile_shape == Stage2TileShape.M32_N256_K256
+    assert solution.stage1_weight_load_policy == policies & 1
+    assert solution.stage2_weight_load_policy == policies >> 1
     assert int(solution) == encoded
 
 
-@pytest.mark.parametrize("bit", [42, 43, 44, 45, 46, 47, 63])
-def test_post_kimi_tile_bits_are_reserved(bit):
-    with pytest.raises(ValueError, match="reserved"):
-        MoeSolutionId.from_int(int(GPTOSS) | (1 << bit))
+@pytest.mark.parametrize("bits", [1 << 43, 1 << 44, 1 << 45, 1 << 46, (1 << 42) | (1 << 44)])
+def test_reserved_tile_values(bits):
+    with pytest.raises(ValueError):
+        MoeSolutionId.from_int(int(GPTOSS) | bits)
 
 
 def test_config_keeps_shapes_independent_of_kernel_tile_constraints():

@@ -113,7 +113,7 @@ def make_stage2_kernel(config: MoeConfig):
     D, I, E, TOPK = config.hidden, config.intermediate, config.experts, config.topk
     BIAS = config.solution.bias_dtype == DataType.BF16
     WORKERS = config.stage2_workers
-    WEIGHT_CACHE = config.weight_load_aux
+    WEIGHT_CACHE = config.stage2_weight_load_aux
     RATIO = config.stage1_tile_m // 32
     WORDS, ROW_OFFSETS = STAGE2_K256_LDS_WORDS, STAGE2_K256_ARENA_WORDS
     stage2_compute_k256 = make_stage2_compute_k256(I, BIAS, WEIGHT_CACHE)
