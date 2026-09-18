@@ -120,7 +120,7 @@ def _registered_2stage_implementations(hidden, intermediate):
     for activation in ActivationFunction:
         for bias in (DataType.NONE, DataType.BF16):
             for shape in Stage1TileShape:
-                for policy in (WeightLoadPolicy.CACHED,):
+                for policy in WeightLoadPolicy:
                     solution = MoeSolutionId(
                         hidden=hidden,
                         intermediate=intermediate,
@@ -191,7 +191,11 @@ def _get_2stage_cfgs_cached(token, requested, arch, policy, explicit):
     else:
         selected_policy = policy
         if selected_policy is None:
-            selected_policy = WeightLoadPolicy.CACHED
+            selected_policy = (
+                WeightLoadPolicy.NON_TEMPORAL
+                if token * requested.topk // requested.experts < 64
+                else WeightLoadPolicy.CACHED
+            )
         matches = tuple(
             s
             for s in _matching_solutions(requested)

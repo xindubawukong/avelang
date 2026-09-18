@@ -1,6 +1,6 @@
 # Dynamic MXFP4 Local MoE: optimization history
 
-Current step 19: [moe][rocm] Strength-reduce K-loop weight addressing.
+Current step 21: [moe][rocm] Skip terminal stage1 prefetch.
 
 This prefix targets Petit dev-megamoe before d97fb857. The public local ID
 has one shared cache policy at bit40 and the Stage1 tile at bit41. Stage2 is

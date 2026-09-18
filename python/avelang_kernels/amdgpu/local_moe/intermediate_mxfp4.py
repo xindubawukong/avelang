@@ -63,7 +63,7 @@ def make_intermediate_store():
         partner = al.amdgpu.get_dpp(packed, packed, 0xB1, 15, 15, 0)
         if col_lane % 2 == 0:
             offset = act_row * (intermediate // 2) + column_base // 2 + col_lane * 2
-            al.amdgpu.raw_buffer_store_x1(packed | (partner << 16), resource, offset, 0, 0)
+            al.amdgpu.raw_buffer_store_x1(packed | (partner << 16), resource, offset, 0, 2)
         if col_lane % 8 == 0:
             offset = scale_row * (intermediate // 32) + column_base // 32 + col_lane // 8
             al.amdgpu.raw_buffer_store_u8(al.convert(exponent, al.u8), resource, offset, scale_base, 0)

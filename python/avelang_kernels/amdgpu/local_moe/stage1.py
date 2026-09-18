@@ -13,6 +13,17 @@ from .solutionid import ActivationFunction
 from .weight_mxfp4 import make_w13_resources, make_w13_weight_loads
 
 
+@avelang.jit
+def _schedule_stage1_instructions():
+    for _ in al.static_range(6):
+        al.amdgpu.sched_group_barrier(0x20, 1, 0)
+        al.amdgpu.sched_group_barrier(0x8, 4, 0)
+    for _ in al.static_range(2):
+        al.amdgpu.sched_group_barrier(0x1, 1, 0)
+        al.amdgpu.sched_group_barrier(0x8, 4, 0)
+    al.amdgpu.sched_barrier(0)
+
+
 @cache
 def make_stage1_compute(config):
     BIAS_STRIDE = config.intermediate
@@ -56,8 +67,10 @@ def make_stage1_compute(config):
         al.syncthreads()
         read_input(storage, fragments, input_scales, al.convert(0, al.u32), wave, lane)
         for k in al.static_range(K_TILES):
+            _schedule_stage1_instructions()
             next_k = al.convert(k + 1, al.u32)
-            prefetch_input(act, scales, storage, input_offsets, block, next_k, wave, lane)
+            if k + 1 < K_TILES:
+                prefetch_input(act, scales, storage, input_offsets, block, next_k, wave, lane)
             for projection in al.static_range(2):
                 for half_k in al.static_range(2):
                     for n in al.static_range(NR):
@@ -72,10 +85,9 @@ def make_stage1_compute(config):
                                 2 * half_k + m,
                             )
             load_weights(resource_w, resource_ws, weights, weight_scales, next_k, wave, lane)
-            # Drain the next tile before reuse, including the unused terminal copy.
-            al.amdgpu.s_waitcnt(0, 0, 0)
-            al.syncthreads()
             if k + 1 < K_TILES:
+                al.amdgpu.s_waitcnt(0, 0, 0)
+                al.syncthreads()
                 read_input(storage, fragments, input_scales, next_k, wave, lane)
         if BIAS:
             for projection in al.static_range(2):
@@ -104,6 +116,7 @@ def make_stage1_compute(config):
                         activated[n, m, c] = openai_swiglu(gate, up)
                     else:
                         activated[n, m, c] = silu_dot(gate, up)
+        al.syncthreads()
         for n in al.static_range(NR):
             for m in al.static_range(MR):
                 hidden[wave_m * WM + m * 16 + lane % 16, wave_n * (NR * 4) + n * 4 + lane // 16] = activated[n, m]
