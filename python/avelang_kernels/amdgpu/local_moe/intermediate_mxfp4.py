@@ -116,27 +116,26 @@ def make_stage2_input_k256(words, act_aux):
 def make_stage2_input_k128(intermediate, tile_m, scale_columns):
     I, BM, SC = (intermediate, tile_m, scale_columns)
     KT, MR, SX = (I // 128, BM // 16, BM // 32)
-    WORDS = BM * 128
+    DMA_WARPS, WORDS = (BM // 16, BM * 128)
 
     @avelang.jit
-    def prefetch_input(
+    def prefetch_resident_input(
         act_resource: al.Tensor((4,), al.u32),
         storage: al.Tensor((WORDS,), al.u32),
         block: al.u32,
-        k: al.u32,
         wave: al.u32,
         lane: al.u32,
     ):
-        if wave < BM // 16:
-            row = wave * 16 + lane // 4
-            vector = lane % 4 ^ row >> 1 & 3
-            offset = (block * BM + row) * (I // 2) + k * 64 + vector * 16
-            values = al.amdgpu.raw_buffer_load_x4(act_resource, offset, 0, 0)
-            lds = al.view(storage, al.u32, al.make_layout((KT, BM, 4, 4), (BM * 16, 16, 4, 1)))
-            lds[k, row, lane % 4] = values
+        for k in al.static_range(KT):
+            if wave < DMA_WARPS:
+                row = wave * 16 + lane // 4
+                source_vector = lane % 4 ^ row >> 1 & 3
+                offset = (block * BM + row) * (I // 2) + k * 64 + source_vector * 16
+                destination = (k * BM * 16 + wave * 256) * 4
+                al.amdgpu.raw_buffer_load_x4_lds(act_resource, storage, 16, offset, 0, destination, 0)
 
     @avelang.jit
-    def read_input(
+    def read_resident_input(
         storage: al.Tensor((WORDS,), al.u32), fragments: al.Tensor((MR, 4), al.u32), k: al.u32, lane: al.u32
     ):
         lds = al.view(storage, al.u32, al.make_layout((KT, BM, 4, 4), (BM * 16, 16, 4, 1)))
@@ -157,4 +156,4 @@ def make_stage2_input_k128(intermediate, tile_m, scale_columns):
             offset = (block * BM + m32 * 32) * SC + k // 2 * 256 + lane * 4
             cached[m32] = al.amdgpu.raw_buffer_load_x1(act_resource, offset, scale_base, 0)
 
-    return (prefetch_input, read_input, load_input_scales)
+    return (prefetch_resident_input, read_resident_input, load_input_scales)

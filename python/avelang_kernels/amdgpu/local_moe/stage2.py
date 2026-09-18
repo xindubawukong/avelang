@@ -161,7 +161,7 @@ def make_stage2_compute_k128(intermediate, tile_m, scale_columns, weight_cache):
     I, BM, MR = (intermediate, tile_m, tile_m // 16)
     KT, SC, SX, WORDS = (intermediate // 128, scale_columns, tile_m // 32, tile_m * 128)
     write_fragment = _make_weighted_fragment_store(BM, WORDS)
-    prefetch_input, read_input, load_input_scales = make_stage2_input_k128(I, BM, SC)
+    prefetch_resident_input, read_resident_input, load_input_scales = make_stage2_input_k128(I, BM, SC)
     load_w2_values, load_w2_scales = make_w2_k128_weight_loads(I, SC, weight_cache)
 
     @avelang.jit
@@ -188,9 +188,11 @@ def make_stage2_compute_k128(intermediate, tile_m, scale_columns, weight_cache):
         input_scales = al.make_local((2,), al.u32)
         fragments = al.make_local((MR, 4), al.u32)
         route_weights = al.make_local((MR,), al.f32)
+        prefetch_resident_input(act_resource, storage, block, wave, lane)
+        al.amdgpu.s_waitcnt(0, 0, 0)
+        al.syncthreads()
         for k in al.static_range(KT):
             stage = k % 2
-            prefetch_input(act_resource, storage, block, al.convert(k, al.u32), wave, lane)
             load_w2_values(weight_resource, weights, al.convert(k, al.u32), wave, lane)
             load_w2_scales(scale_resource, weight_scale_cache, weight_scales, al.convert(k, al.u32), wave, lane)
             for n in al.static_range(2):
@@ -198,8 +200,7 @@ def make_stage2_compute_k128(intermediate, tile_m, scale_columns, weight_cache):
             if k % 2 == 0:
                 load_input_scales(act_resource, input_scale_cache, block, act_bytes, al.convert(k, al.u32), lane)
             al.amdgpu.s_waitcnt(0, 0, 0)
-            al.syncthreads()
-            read_input(storage, fragments, al.convert(k, al.u32), lane)
+            read_resident_input(storage, fragments, al.convert(k, al.u32), lane)
             for m32 in al.static_range(SX):
                 input_scales[m32] = input_scale_cache[m32] >> 16 * (k % 2)
             for n in al.static_range(4):
