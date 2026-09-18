@@ -1,6 +1,6 @@
 # Dynamic MXFP4 Local MoE: optimization history
 
-Current step 16: [moe][rocm] Cache stage1 token metadata and input offsets.
+Current step 17: [moe][rocm] Cache stage2 input offsets and validity.
 
 This prefix targets Petit dev-megamoe before d97fb857. The public local ID
 has one shared cache policy at bit40 and the Stage1 tile at bit41. Stage2 is
