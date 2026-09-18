@@ -13,9 +13,9 @@ import avelang.language as al
 @cache
 def make_w13_weight_loads(config):
     """Fill [projection, half_k, n_fragment, word4] registers; caller owns waits."""
-    D, I = (config.compute_hidden, config.intermediate)
-    WN, KG, NR = (config.stage1_warps_n, config.stage1_k_groups, config.stage1_wave_n // 16)
-    NS, CACHE = (NR // 2, config.stage1_weight_load_aux)
+    D, I = config.compute_hidden, config.intermediate
+    WN, KG, NR = config.stage1_warps_n, config.stage1_k_groups, config.stage1_wave_n // 16
+    NS, CACHE = NR // 2, config.stage1_weight_load_aux
 
     @avelang.jit
     def load_weights(
@@ -64,7 +64,7 @@ def make_w13_weight_loads(config):
         else:
             for load in al.static_range(8):
                 if load // 3 + 1 == phase:
-                    projection, n, half_k = (load % 2, load // 2 % 2, load // 4)
+                    projection, n, half_k = load % 2, (load // 2) % 2, load // 4
                     offset = (
                         (wave_n * 32 + n * 16) * (D // 2)
                         + group * (D // KG) * 8
@@ -74,12 +74,12 @@ def make_w13_weight_loads(config):
                     )
                     values[projection, half_k, n] = al.amdgpu.raw_buffer_load_x4(w, offset, k * 2048, CACHE)
 
-    return (load_weights, prefetch_weight_phase)
+    return load_weights, prefetch_weight_phase
 
 
 @cache
 def make_w13_resources(hidden, intermediate, experts, projection_n, bias_stride):
-    D, I, E, BN, BIAS_STRIDE = (hidden, intermediate, experts, projection_n, bias_stride)
+    D, I, E, BN, BIAS_STRIDE = hidden, intermediate, experts, projection_n, bias_stride
 
     @avelang.jit
     def initialize_w13_resources(
@@ -101,14 +101,14 @@ def make_w13_resources(hidden, intermediate, experts, projection_n, bias_stride)
         bias_resource = al.amdgpu.make_rsrc(
             bias_view, al.select(bias_enabled != 0, (2 * BIAS_STRIDE - tile * BN) * 2, al.convert(0, al.u32))
         )
-        return (weight_resource, scale_resource, bias_resource)
+        return weight_resource, scale_resource, bias_resource
 
     return initialize_w13_resources
 
 
 @cache
 def make_w2_resources(hidden, intermediate, experts, scale_columns, *, limit_to_tile=False):
-    D, I, E, SC = (hidden, intermediate, experts, scale_columns)
+    D, I, E, SC = hidden, intermediate, experts, scale_columns
 
     @avelang.jit
     def initialize_w2_resources(
@@ -131,22 +131,26 @@ def make_w2_resources(hidden, intermediate, experts, scale_columns, *, limit_to_
         bias_resource = al.amdgpu.make_rsrc(
             bias_view, al.select(bias_enabled != 0, al.convert(D * 2, al.u32), al.convert(0, al.u32))
         )
-        return (weight_resource, scale_resource, bias_resource)
+        return weight_resource, scale_resource, bias_resource
 
     return initialize_w2_resources
 
 
 @cache
 def make_w2_k128_weight_loads(intermediate, scale_columns, weight_cache):
-    I, SC, CACHE = (intermediate, scale_columns, weight_cache)
+    I, SC, CACHE = intermediate, scale_columns, weight_cache
 
     @avelang.jit
     def load_w2_values(
-        resource: al.Tensor((4,), al.u32), values: al.Tensor((2, 4, 4), al.u32), k: al.u32, wave: al.u32, lane: al.u32
+        resource: al.Tensor((4,), al.u32),
+        values: al.Tensor((2, 4, 4), al.u32),
+        k: al.u32,
+        wave: al.u32,
+        lane: al.u32,
     ):
         for n in al.static_range(4):
-            offset = (wave * 64 + n * 16) * (I // 2) + k % 2 * 1024 + lane * 16
-            values[k % 2, n] = al.amdgpu.raw_buffer_load_x4(resource, offset, k // 2 * 2048, CACHE)
+            offset = (wave * 64 + n * 16) * (I // 2) + (k % 2) * 1024 + lane * 16
+            values[k % 2, n] = al.amdgpu.raw_buffer_load_x4(resource, offset, (k // 2) * 2048, CACHE)
 
     @avelang.jit
     def load_w2_scales(
@@ -159,7 +163,7 @@ def make_w2_k128_weight_loads(intermediate, scale_columns, weight_cache):
     ):
         for n in al.static_range(2):
             offset = (wave * 2 + n) * (SC * 32) + lane * 4
-            cached[n] = al.amdgpu.raw_buffer_load_x1(resource, offset, k // 2 * 256, 0)
+            cached[n] = al.amdgpu.raw_buffer_load_x1(resource, offset, (k // 2) * 256, 0)
             stages[k % 2, n] = cached[n]
 
-    return (load_w2_values, load_w2_scales)
+    return load_w2_values, load_w2_scales

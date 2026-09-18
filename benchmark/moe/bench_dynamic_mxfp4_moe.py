@@ -37,7 +37,7 @@ BENCH_CASES = {
 
 def make_inputs(config, tokens, seed):
     torch.manual_seed(seed)
-    e, d, i, k = (config.experts, config.hidden, config.intermediate, config.topk)
+    e, d, i, k = config.experts, config.hidden, config.intermediate, config.topk
     x = torch.randn((tokens, d), dtype=torch.bfloat16, device="cuda")
     w13 = torch.randint(0, 256, (e, 2 * i, d // 2), dtype=torch.uint8, device="cuda")
     w2 = torch.randint(0, 256, (e, d, i // 2), dtype=torch.uint8, device="cuda")
@@ -49,15 +49,15 @@ def make_inputs(config, tokens, seed):
     top_ids = torch.rand((tokens, e)).topk(k, dim=1).indices
     top_weights = torch.rand((tokens, k)).softmax(-1)
     bm = config.stage1_tile_m
-    capacity = (tokens * k + e * bm - k + bm - 1) // bm * bm
-    ids = torch.full((capacity,), k << 24 | tokens, dtype=torch.int32)
+    capacity = ((tokens * k + e * bm - k + bm - 1) // bm) * bm
+    ids = torch.full((capacity,), (k << 24) | tokens, dtype=torch.int32)
     rw = torch.zeros(capacity, dtype=torch.float32)
     experts = torch.full((capacity // bm,), -1, dtype=torch.int32)
     begin = 0
     for expert in range(e):
         matches = (top_ids == expert).nonzero()
         count = len(matches)
-        ids[begin : begin + count] = matches[:, 0].int() | matches[:, 1].int() << 24
+        ids[begin : begin + count] = matches[:, 0].int() | (matches[:, 1].int() << 24)
         rw[begin : begin + count] = top_weights[matches[:, 0], matches[:, 1]]
         blocks = (count + bm - 1) // bm
         experts[begin // bm : begin // bm + blocks] = expert
@@ -65,7 +65,7 @@ def make_inputs(config, tokens, seed):
     routing = Routing(
         ids.cuda(), rw.cuda(), experts.cuda(), torch.tensor([begin, tokens], dtype=torch.int32, device="cuda")
     )
-    return (x, weights, routing)
+    return x, weights, routing
 
 
 def measure(fn, warmup, repeat, graph_iters):
@@ -78,7 +78,7 @@ def measure(fn, warmup, repeat, graph_iters):
             fn()
     samples = []
     for _ in range(repeat):
-        start, end = (torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True))
+        start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
         start.record()
         graph.replay()
         end.record()
@@ -92,7 +92,7 @@ def run_case(args, model, tokens):
     x, weights, routing = make_inputs(config, tokens, args.seed)
     ws = MoeWorkspace.allocate(x, routing, config)
     d = config.hidden
-    stage1_kernel, stage2_kernel = (make_stage1(config), make_stage2(config))
+    stage1_kernel, stage2_kernel = make_stage1(config), make_stage2(config)
 
     def stage1():
         stage1_kernel[lambda: config.stage1_grid(routing.capacity)](
@@ -127,7 +127,10 @@ def run_case(args, model, tokens):
         )
         if config.use_route_reduce:
             make_route_reduce(d, config.topk)[lambda: ((tokens, (d // 8 + 511) // 512, 1), (512, 1, 1))](
-                ws.route_output, ws.out, tokens, num_warps=8
+                ws.route_output,
+                ws.out,
+                tokens,
+                num_warps=8,
             )
         return ws.out
 
