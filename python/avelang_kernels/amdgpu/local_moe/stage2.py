@@ -7,7 +7,7 @@ import avelang.language as al
 
 from .dispatch import resolve_2stage_implementation
 from .intermediate_mxfp4 import make_stage2_input
-from .weight_mxfp4 import load_weight_scales, load_weight_values, make_w2_resources
+from .weight_mxfp4 import make_w2_resources
 
 
 @cache
@@ -57,9 +57,12 @@ def make_stage2_compute(config):
             read_stage2_input(storage, fragments, ki, lane)
             for half_k in al.static_range(2):
                 for n in al.static_range(4):
-                    weights[half_k, n] = load_weight_values(weight, intermediate, wave * 4 + n, ki * 2 + half_k, lane)
+                    offset_w = (wave * 64 + n * 16) * (intermediate // 2) + half_k * 1024 + lane * 16
+                    weights[half_k, n] = al.amdgpu.raw_buffer_load_x4(weight, offset_w, k * 2048, 0)
             for n in al.static_range(2):
-                weight_scales[n] = load_weight_scales(scales, intermediate, wave * 2 + n, ki, lane)
+                weight_scales[n] = al.amdgpu.raw_buffer_load_x1(
+                    scales, (wave * 2 + n) * intermediate + lane * 4, k * 256, 0
+                )
             al.amdgpu.s_waitcnt(0, 0, 0)
             for half_k in al.static_range(2):
                 for n in al.static_range(4):
@@ -98,7 +101,7 @@ def make_stage2_kernel(config):
     E, TOPK = config.experts, config.topk
     WORKERS = config.stage2_workers
     RATIO = config.stage1_tile_m // 32
-    initialize_w2_resources = make_w2_resources(config)
+    initialize_w2_resources = make_w2_resources(D, I, E, I // 32)
     stage2_compute = make_stage2_compute(config)
 
     @avelang.jit
@@ -138,7 +141,7 @@ def make_stage2_kernel(config):
                 workspace_bytes = scale_base + ((capacity + 255) // 256) * 256 * (I // 32)
                 memory = al.make_tensor(workspace_ptr, al.u8, al.make_layout((workspace_bytes,), (1,)))
                 act_resource = al.amdgpu.make_rsrc(memory, workspace_bytes)
-                wr, sr, br = initialize_w2_resources(weight, ws, bias_ptr, expert, tile, D, I)
+                wr, sr, br = initialize_w2_resources(weight, ws, bias_ptr, expert, tile, al.convert(1, al.u32))
                 row_offsets = al.subview(storage, (4096,), (32,), (1,))
                 if tid < 32:
                     metadata_route = al.amdgpu.raw_buffer_load_x1(route_resource, tid * 4, 0, 0)
