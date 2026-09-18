@@ -209,10 +209,11 @@ def make_stage2_kernel(config: MoeConfig):
                     al.convert(tid, al.u32),
                 )
                 shared = al.view(storage, al.bf16, al.make_layout((4096, 2), (2, 1)))
+                output_bytes = al.amdgpu.readfirstlane(counts[1]) * D * 2
                 for m in al.static_range(8):
                     row = wave * 8 + m
                     row_offset = al.amdgpu.readfirstlane(row_offsets[row])
-                    if row_offset < counts[1] * D * 2:
+                    if row_offset < output_bytes:
                         offset = al.convert(row_offset + tile * 512 + lane * 4, al.u32)
                         index = output_word_index(row, lane * 2)
                         al.amdgpu.raw_buffer_atomic_add_bf16x2(shared[index], output_resource, offset)
