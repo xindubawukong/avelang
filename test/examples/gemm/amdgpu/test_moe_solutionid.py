@@ -115,19 +115,22 @@ def test_stage1_m64_bit_and_shape():
     assert solution.stage1_weight_load_policy == solution.stage2_weight_load_policy == WeightLoadPolicy.CACHED
 
 
-@pytest.mark.parametrize("s1,bits1", [(0, 0), (1, 1 << 42)])
+@pytest.mark.parametrize("s1,bits1", [(0, 0), (1, 1 << 42), (2, 1 << 44), (4, 1 << 46)])
+@pytest.mark.parametrize("s2,bits2", [(0, 0), (1, 1 << 43), (2, 1 << 45)])
 @pytest.mark.parametrize("policies", range(4))
-def test_tile_bits_and_independent_policies(s1, bits1, policies):
-    encoded = int(GPTOSS) | bits1 | policies << 40
+def test_interleaved_tile_bits_and_independent_policies(s1, bits1, s2, bits2, policies):
+    base = MoeSolutionId(3584, 384, ActivationFunction.SITU_V2, DataType.NONE)
+    assert int(base) == 26719911953
+    encoded = int(base) | bits1 | bits2 | policies << 40
     solution = MoeSolutionId.from_int(encoded)
     assert solution.stage1_tile_shape == Stage1TileShape(s1)
-    assert solution.stage2_tile_shape == Stage2TileShape.M32_N256_K256
+    assert solution.stage2_tile_shape == Stage2TileShape(s2)
     assert solution.stage1_weight_load_policy == policies & 1
     assert solution.stage2_weight_load_policy == policies >> 1
     assert int(solution) == encoded
 
 
-@pytest.mark.parametrize("bits", [1 << 42 | 1 << 44])
+@pytest.mark.parametrize("bits", [1 << 42 | 1 << 44, 1 << 43 | 1 << 45])
 def test_reserved_tile_values(bits):
     with pytest.raises(ValueError):
         MoeSolutionId.from_int(int(GPTOSS) | bits)

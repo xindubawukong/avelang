@@ -18,6 +18,7 @@ from avelang_kernels.amdgpu.local_moe.solutionid import (
     MfmaShape,
     Stage1Buffering,
     Stage1TileShape,
+    Stage2TileShape,
     Stages,
     WeightLoadPolicy,
     WeightOrdering,
@@ -250,6 +251,32 @@ def test_explicit_names_and_integer_codes_keep_the_same_solution():
     assert choose(bias_dtype=None) == choose(bias_dtype=DataType.NONE)
 
 
+@pytest.mark.parametrize("tokens", [0, 8, 12, 16, 17, 128, 1024, 1025, 2047, 2048, 2049, 4096, 8191, 8192, 16384])
+def test_kimi_selection_boundaries(tokens):
+    config = get_2stage_cfgs(tokens, 3584, 384, 896, 16, activation="situ", bias_dtype="none")
+    solution = config.solution
+    assert solution.stage1_weight_load_policy == (tokens <= 2048)
+    assert solution.stage2_weight_load_policy == (16 < tokens <= 1024)
+    assert solution.stage1_tile_shape == (Stage1TileShape.M64_N256 if tokens >= 2048 else Stage1TileShape.M32_N128_K2)
+    assert solution.stage2_tile_shape == (
+        Stage2TileShape.M64_N256_K128 if tokens >= 2048 else Stage2TileShape.M32_N256_K128
+    )
+    assert config.use_route_reduce == (tokens >= 8192)
+    ep = get_2stage_cfgs(tokens, 3584, 384, 896, 16, activation="situ", bias_dtype="none", is_ep=True)
+    assert ep.solution == solution and (not ep.use_route_reduce)
+
+
+def test_independent_policies_and_reduction_require_complete_routes():
+    config = choose(stage1_weight_load_policy="cached", stage2_weight_load_policy="non_temporal")
+    assert config.stage1_weight_load_aux == 0 and config.stage2_weight_load_aux == 2
+    with pytest.raises(ValueError, match="conflict"):
+        choose(weight_load_policy="cached", stage2_weight_load_policy="non_temporal")
+    with pytest.raises(ValueError, match="complete local"):
+        get_2stage_cfgs(
+            8192, 3584, 384, 896, 16, activation="situ", bias_dtype="none", is_ep=True, use_route_reduce=True
+        )
+
+
 def mapping_kernel(n_tiles, m_group, groups):
     import avelang
     import avelang.language as al
@@ -287,10 +314,3 @@ def test_grouped_mapping_is_a_permutation_including_partial_groups(n_tiles, m_gr
             expected.append((within // height, first_m + within % height))
         assert len(set(expected)) == blocks
         assert output.cpu().tolist() == [list(pair) for pair in expected]
-
-
-def test_kimi_basic_configuration():
-    cfg = get_2stage_cfgs(8, 3584, 384, 896, 16, activation="situ", bias_dtype="none")
-    assert cfg.activation == ActivationFunction.SITU_V2
-    assert cfg.stage2_tile_k == 128
-    assert cfg.hidden == 3584 and cfg.intermediate == 384

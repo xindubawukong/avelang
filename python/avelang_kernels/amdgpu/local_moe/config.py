@@ -11,11 +11,14 @@ class MoeConfig:
     solution: MoeSolutionId
     experts: int
     topk: int
+    use_route_reduce: bool = False
     stage2_workers: ClassVar[int] = 256
     stage1_num_warps: ClassVar[int] = 4
     stage2_num_warps: ClassVar[int] = 4
 
     def __post_init__(self):
+        if type(self.use_route_reduce) is not bool:
+            raise TypeError("use_route_reduce must be a boolean")
         if not isinstance(self.solution, MoeSolutionId):
             raise TypeError("solution must be a MoeSolutionId; use from_solution for integer IDs")
         if type(self.experts) is not int or type(self.topk) is not int:
@@ -24,10 +27,12 @@ class MoeConfig:
             raise ValueError("experts and topk must be positive; topk must not exceed experts or 255")
 
     @classmethod
-    def from_solution(cls, solution: MoeSolutionId | int, *, experts: int, topk: int) -> "MoeConfig":
+    def from_solution(
+        cls, solution: MoeSolutionId | int, *, experts: int, topk: int, use_route_reduce: bool = False
+    ) -> "MoeConfig":
         if not isinstance(solution, MoeSolutionId):
             solution = MoeSolutionId.from_int(solution)
-        return cls(solution, experts, topk)
+        return cls(solution, experts, topk, use_route_reduce)
 
     @property
     def hidden(self) -> int:

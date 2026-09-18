@@ -333,7 +333,7 @@ def test_k128_tiles_with_known_projection_and_padded_routes(s1, s2):
 
 @pytest.mark.skipif(not gfx950, reason="Native MXFP4 requires gfx950")
 @pytest.mark.parametrize("tile_m", [32, 64])
-@pytest.mark.parametrize("route_output", [False])
+@pytest.mark.parametrize("route_output", [False, True])
 def test_k128_stage2_nonuniform_rows_and_columns(tile_m, route_output):
     from avelang_kernels.amdgpu.local_moe import MoeConfig, MoeSolutionId
     from avelang_kernels.amdgpu.local_moe.solutionid import DataType, Stage1TileShape, Stage2TileShape
@@ -351,6 +351,7 @@ def test_k128_stage2_nonuniform_rows_and_columns(tile_m, route_output):
         ),
         3,
         topk,
+        route_output,
     )
     _, _, routing, raw, _ = make_problem(config, tokens)
     capacity = routing.capacity
@@ -399,6 +400,26 @@ def test_k128_stage2_nonuniform_rows_and_columns(tile_m, route_output):
 
 
 @pytest.mark.skipif(not gfx950, reason="Native MXFP4 requires gfx950")
+def test_route_reduction_uses_fp32_and_large_buffer_addresses():
+    from avelang_kernels.amdgpu.local_moe.route_reduce import make_route_reduce
+
+    tokens, topk, hidden = (38000, 16, 3584)
+    required = tokens * topk * hidden * 2
+    if torch.cuda.mem_get_info()[0] < required * 2:
+        pytest.skip("large-address check requires 9 GiB free GPU memory")
+    src = torch.empty((tokens, topk, hidden), dtype=torch.bfloat16, device="cuda")
+    src.fill_(1)
+    src[:, 0].fill_(256)
+    src[:, -1].fill_(-256)
+    src[-1, 1].fill_(3)
+    dst = torch.empty((tokens, hidden), dtype=torch.bfloat16, device="cuda")
+    make_route_reduce(hidden, topk)[lambda: ((tokens, 1, 1), (512, 1, 1))](src, dst, tokens, num_warps=8)
+    expected = torch.full_like(dst, 14)
+    expected[-1].fill_(16)
+    torch.testing.assert_close(dst, expected, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not gfx950, reason="Native MXFP4 requires gfx950")
 @pytest.mark.parametrize("activation", ["swiglu", "situ"])
 def test_m64_n512_stage1_bias_and_m32_stage2(activation):
     from dataclasses import replace
@@ -412,3 +433,23 @@ def test_m64_n512_stage1_bias_and_m32_stage2(activation):
     actual = dynamic_mxfp4_moe(x, weights, routing, config)
     expected = moe_reference(x, config, raw, routes)
     torch.testing.assert_close(actual.cpu(), expected, rtol=0.02, atol=0.01)
+
+
+@pytest.mark.skipif(not gfx950, reason="Native MXFP4 requires gfx950")
+def test_kimi_route_output_graph_replay():
+    from avelang_kernels.amdgpu.local_moe import MoeWorkspace, dynamic_mxfp4_moe
+
+    config = get_2stage_cfgs(8192, 3584, 384, 16, 16, activation="situ", bias_dtype="none")
+    x, weights, routing, _, _ = make_problem(config, 3)
+    workspace = MoeWorkspace.allocate(x, routing, config)
+    dynamic_mxfp4_moe(x, weights, routing, config, workspace=workspace)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        dynamic_mxfp4_moe(x, weights, routing, config, workspace=workspace)
+    x.mul_(2)
+    graph.replay()
+    expected = dynamic_mxfp4_moe(x, weights, routing, config)
+    torch.testing.assert_close(workspace.out, expected, rtol=0, atol=0)
+    routing.weights.zero_()
+    graph.replay()
+    assert torch.count_nonzero(workspace.out) == 0
