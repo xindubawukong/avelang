@@ -86,9 +86,6 @@ def make_stage2_compute_k256(intermediate, bias, weight_cache, words=STAGE2_K256
                     for n in al.static_range(4):
                         offset = (tile * 256 + wave * 64 + n * 4 + (lane // 16) * 16) * 2
                         packed_bias[n] = al.amdgpu.raw_buffer_load_x2(bias_resource, offset, 0, 0)
-            else:
-                # Local dev-megamoe retains the trailing barrier between K tiles.
-                al.syncthreads()
 
         al.syncthreads()
         al.amdgpu.s_setprio(0)
@@ -172,7 +169,6 @@ def make_stage2_kernel(config: MoeConfig):
                         metadata_token < num_tokens and metadata_slot < TOPK, metadata_token * D * 2, num_tokens * D * 2
                     )
                     storage[4128 + tid] = al.amdgpu.raw_buffer_load_x1(rw_resource, al.convert(tid * 4, al.u32), 0, 0)
-                al.syncthreads()
                 stage2_compute_k256(
                     act_resource,
                     weight_resource,
