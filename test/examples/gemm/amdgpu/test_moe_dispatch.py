@@ -181,7 +181,7 @@ def test_config_stores_solution_and_has_derived_readonly_fields():
         {"weight_ordering": WeightOrdering.PETIT_MXFP4},
         {"mfma": MfmaShape.BF16_MXFP4},
         {"stages": Stages.ONE_STAGE},
-        {"stage1_buffering": Stage1Buffering.DOUBLE_BUFFER},
+        {"stage1_buffering": Stage1Buffering.SINGLE_BUFFER},
         {"hidden": 320},
     ],
 )

@@ -92,7 +92,7 @@ class MoeConfig:
 
     @property
     def stage1_arena_words(self) -> int:
-        return self.stage1_tile_m * self.stage1_projection_n
+        return max(2 * self.stage1_input_stage_words, self.stage1_tile_m * self.stage1_projection_n)
 
     @property
     def stage1_lds_words(self) -> int:

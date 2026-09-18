@@ -10,12 +10,12 @@ from .dispatch import resolve_2stage_implementation
 from .input_mxfp4 import make_mxfp4_input
 from .intermediate_mxfp4 import make_intermediate_store
 from .solutionid import ActivationFunction
-from .weight_mxfp4 import load_weight_scales, load_weight_values, make_w13_resources
+from .weight_mxfp4 import make_w13_resources, make_w13_weight_loads
 
 
 @cache
 def make_stage1_compute(config):
-    hidden, intermediate = config.hidden, config.intermediate
+    intermediate = config.intermediate
     K_TILES = config.hidden // 256
     BM, BN, WORDS = config.stage1_tile_m, config.stage1_projection_n, config.stage1_lds_words
     MR, NR = BM // 16, BN // 64
@@ -23,6 +23,7 @@ def make_stage1_compute(config):
     BIAS = config.bias
     SWIGLU = config.activation == ActivationFunction.OPENAI_SWIGLU
     prefetch_input, read_input = make_mxfp4_input(config)
+    load_weights = make_w13_weight_loads(config)
 
     @avelang.jit
     def stage1_compute(
@@ -44,21 +45,14 @@ def make_stage1_compute(config):
         fragments = al.make_local((MR, 2, 4), al.u32)
         weights = al.make_local((2, 2, NR, 4), al.u32)
         weight_scales = al.make_local((2, NS), al.u32)
+        prefetch_input(act, scales, routes, storage, tokens, block, al.convert(0, al.u32), wave, lane)
+        load_weights(gate, gate_scales, up, up_scales, weights, weight_scales, al.convert(0, al.u32), wave, lane)
+        al.amdgpu.s_waitcnt(0, 0, 0)
+        al.syncthreads()
+        input_scale = read_input(storage, fragments, al.convert(0, al.u32), lane)
         for k in al.static_range(K_TILES):
-            ki = al.convert(k, al.u32)
-            prefetch_input(act, scales, routes, storage, tokens, block, ki, wave, lane)
-            al.amdgpu.s_waitcnt(0, 0, 0)
-            al.syncthreads()
-            input_scale = read_input(storage, fragments, lane)
-            for half_k in al.static_range(2):
-                for n in al.static_range(NR):
-                    n16 = wave * NR + n
-                    weights[0, half_k, n] = load_weight_values(gate, hidden, n16, ki * 2 + half_k, lane)
-                    weights[1, half_k, n] = load_weight_values(up, hidden, n16, ki * 2 + half_k, lane)
-            for n in al.static_range(NS):
-                weight_scales[0, n] = load_weight_scales(gate_scales, hidden, wave * NS + n, ki, lane)
-                weight_scales[1, n] = load_weight_scales(up_scales, hidden, wave * NS + n, ki, lane)
-            al.amdgpu.s_waitcnt(0, 0, 0)
+            next_k = al.convert(k + 1, al.u32)
+            prefetch_input(act, scales, routes, storage, tokens, block, next_k, wave, lane)
             for projection in al.static_range(2):
                 for half_k in al.static_range(2):
                     for n in al.static_range(NR):
@@ -72,7 +66,12 @@ def make_stage1_compute(config):
                                 2 * half_k + n % 2,
                                 2 * half_k + m,
                             )
+            load_weights(gate, gate_scales, up, up_scales, weights, weight_scales, next_k, wave, lane)
+            # Drain the next tile before reuse, including the unused terminal copy.
+            al.amdgpu.s_waitcnt(0, 0, 0)
             al.syncthreads()
+            if k + 1 < K_TILES:
+                input_scale = read_input(storage, fragments, next_k, lane)
         result = al.view(storage, al.f32, al.make_layout((BM, BN), (BN, 1)))
         for m in al.static_range(MR):
             for n in al.static_range(NR):

@@ -10,7 +10,6 @@ from .solutionid import (
     ActivationFunction,
     DataType,
     MoeSolutionId,
-    Stage1Buffering,
     Stage1TileShape,
     WeightLoadPolicy,
 )
@@ -88,7 +87,6 @@ def _normalize_request(model_dim, inter_dim, activation, bias_dtype, dtype, q_dt
     if type(group_size) is not int or group_size != 32:
         raise ValueError("dynamic MXFP4 MoE requires group_size=32")
     solution = MoeSolutionId(
-        stage1_buffering=Stage1Buffering.SINGLE_BUFFER,
         hidden=model_dim,
         intermediate=inter_dim,
         activation=_normalize_activation(activation),
@@ -124,7 +122,6 @@ def _registered_2stage_implementations(hidden, intermediate):
             for shape in (Stage1TileShape.M32_N256,):
                 for policy in (WeightLoadPolicy.CACHED,):
                     solution = MoeSolutionId(
-                        stage1_buffering=Stage1Buffering.SINGLE_BUFFER,
                         hidden=hidden,
                         intermediate=intermediate,
                         activation=activation,
