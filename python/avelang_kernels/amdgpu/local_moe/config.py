@@ -36,6 +36,10 @@ class MoeConfig:
         return self.solution.hidden
 
     @property
+    def compute_hidden(self) -> int:
+        return self.hidden
+
+    @property
     def intermediate(self) -> int:
         return self.solution.intermediate
 
@@ -48,8 +52,12 @@ class MoeConfig:
         return self.solution.bias_dtype != DataType.NONE
 
     @property
-    def weight_load_aux(self) -> int:
-        return 2 if self.solution.weight_load_policy == WeightLoadPolicy.NON_TEMPORAL else 0
+    def stage1_weight_load_aux(self) -> int:
+        return 2 if self.solution.stage1_weight_load_policy == WeightLoadPolicy.NON_TEMPORAL else 0
+
+    @property
+    def stage2_weight_load_aux(self) -> int:
+        return 2 if self.solution.stage2_weight_load_policy == WeightLoadPolicy.NON_TEMPORAL else 0
 
     @property
     def stage1_tile_m(self) -> int:
