@@ -1,6 +1,6 @@
 # Dynamic MXFP4 Local MoE: optimization history
 
-Current step 12: [moe][rocm] Prefetch stage2 epilogue inputs.
+Current step 14: [moe][rocm] Use XOR LDS layouts for inputs.
 
 This prefix targets Petit dev-megamoe before d97fb857. The public local ID
 has one shared cache policy at bit40 and the Stage1 tile at bit41. Stage2 is

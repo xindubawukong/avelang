@@ -96,7 +96,8 @@ def make_w2_resources(config):
 
 @cache
 def make_w13_weight_loads(config):
-    D, NR = config.hidden, config.stage1_projection_n // 64
+    D, NR = config.hidden, config.stage1_wave_n // 16
+    WN = config.stage1_warps_n
     NS = NR // 2
 
     @avelang.jit
@@ -113,11 +114,11 @@ def make_w13_weight_loads(config):
     ):
         for half_k in al.static_range(2):
             for n in al.static_range(NR):
-                n16 = wave * NR + n
+                n16 = wave % WN * NR + n
                 weights[0, half_k, n] = load_weight_values(gate, D, n16, k * 2 + half_k, lane)
                 weights[1, half_k, n] = load_weight_values(up, D, n16, k * 2 + half_k, lane)
         for n in al.static_range(NS):
-            scales[0, n] = load_weight_scales(gate_scales, D, wave * NS + n, k, lane)
-            scales[1, n] = load_weight_scales(up_scales, D, wave * NS + n, k, lane)
+            scales[0, n] = load_weight_scales(gate_scales, D, wave % WN * NS + n, k, lane)
+            scales[1, n] = load_weight_scales(up_scales, D, wave % WN * NS + n, k, lane)
 
     return load_weights
