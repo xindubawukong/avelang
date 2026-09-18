@@ -7,20 +7,27 @@ import avelang.language as al
 
 
 @avelang.jit
-def load_weight_fragment(
+def load_weight_values(
     weight: al.Tensor((4,), al.u32),
-    scales: al.Tensor((4,), al.u32),
     columns: al.u32,
     n16: al.u32,
     k128: al.u32,
     lane: al.u32,
-) -> (al.Tensor((4,), al.u32), al.u32):
+) -> al.Tensor((4,), al.u32):
     offset = n16 * 16 * (columns // 2) + k128 * 1024 + lane * 16
-    values = al.amdgpu.raw_buffer_load_x4(weight, offset, 0, 0)
-    offset_s = n16 // 2 * (columns // 256) * 256 + k128 // 2 * 256 + lane * 4
-    word = al.amdgpu.raw_buffer_load_x1(scales, offset_s, 0, 0)
-    scale = (word >> ((2 * (k128 % 2) + n16 % 2) * 8)) & 255
-    return values, scale
+    return al.amdgpu.raw_buffer_load_x4(weight, offset, 0, 0)
+
+
+@avelang.jit
+def load_weight_scales(
+    scales: al.Tensor((4,), al.u32),
+    columns: al.u32,
+    n32: al.u32,
+    k256: al.u32,
+    lane: al.u32,
+) -> al.u32:
+    offset = n32 * (columns // 256) * 256 + k256 * 256 + lane * 4
+    return al.amdgpu.raw_buffer_load_x1(scales, offset, 0, 0)
 
 
 @cache
