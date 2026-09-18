@@ -12,12 +12,12 @@ import avelang.language as al
 import torch
 
 from .quantization import quantize_mxfp4_activation
-from .scale_layout import ceildiv
+from .scale_layout import ceildiv, scale_byte_offset, scale_byte_shape
 
 
 @dataclass(frozen=True)
 class IntermediateLayout:
-    """Row-major scales and token/slot-major act."""
+    """Native scale tiles and token/slot-major act."""
 
     route_capacity: int
     intermediate: int
@@ -42,70 +42,60 @@ class IntermediateLayout:
             raise ValueError("workspace route capacity is smaller than tokens * topk")
         flat = buffer.view(-1)
         act = flat[: tokens * topk * self.intermediate // 2].view(tokens, topk, self.intermediate // 2)
-        scales = flat[self.scale_offset : self.nbytes].view(self.scale_shape)
+        scales = flat[self.scale_offset : self.nbytes].view(scale_byte_shape(self.scale_shape[0], self.intermediate))
         return act, scales
 
 
 @cache
-def make_intermediate_store():
+def make_intermediate_store(intermediate, scale_columns, *, act_aux, scale_aux):
+    I, SCALE_COLS = intermediate, scale_columns
+
     @avelang.jit
     def store_intermediate(
         act: al.Tensor((4,), al.f32),
-        resource: al.Tensor((4,), al.u32),
+        act_resource: al.Tensor((4,), al.u32),
         act_row: al.u32,
         scale_row: al.u32,
         column_base: al.u32,
         col_lane: al.u32,
+        act_base: al.u32,
         scale_base: al.u32,
-        intermediate: al.u32,
     ):
         packed, exponent = quantize_mxfp4_activation(act)
         partner = al.amdgpu.get_dpp(packed, packed, 0xB1, 15, 15, 0)
         if col_lane % 2 == 0:
-            offset = act_row * (intermediate // 2) + column_base // 2 + col_lane * 2
-            al.amdgpu.raw_buffer_store_x1(packed | (partner << 16), resource, offset, 0, 2)
-        scale0 = al.shuffle(exponent, 0, 32)
-        scale1 = al.shuffle(exponent, 8, 32)
-        scale2 = al.shuffle(exponent, 16, 32)
-        scale3 = al.shuffle(exponent, 24, 32)
-        if col_lane % 32 == 0:
-            scales = scale0 | (scale1 << 8) | (scale2 << 16) | (scale3 << 24)
-            offset = scale_row * (intermediate // 32) + column_base // 32 + col_lane // 8
-            al.amdgpu.raw_buffer_store_x1(scales, resource, offset, scale_base, 0)
+            offset = act_base + act_row * (I // 2) + column_base // 2 + col_lane * 2
+            al.amdgpu.raw_buffer_store_x1(packed | (partner << 16), act_resource, offset, 0, act_aux)
+        if col_lane % 8 == 0:
+            col = column_base // 32 + col_lane // 8
+            offset = scale_byte_offset(scale_row, col, al.convert(SCALE_COLS, al.u32))
+            al.amdgpu.raw_buffer_store_u8(al.convert(exponent, al.u8), act_resource, offset, scale_base, scale_aux)
 
     return store_intermediate
 
 
 @cache
-def make_stage2_input(config):
-    I = config.intermediate
+def make_stage2_input_k256(words, act_aux):
+    WORDS = words
 
     @avelang.jit
     def prefetch_stage2_input(
-        act: al.Tensor((4,), al.u32),
+        act_resource: al.Tensor((4,), al.u32),
         act_offset: al.u32,
-        input_valid: al.u1,
-        block: al.u32,
-        k: al.u32,
-        lane: al.u32,
+        act_base: al.u32,
+        scale_offset: al.u32,
         scale_base: al.u32,
+        valid: al.u1,
+        k: al.u32,
     ) -> (al.Tensor((4,), al.u32), al.u32):
-        offset = al.select(input_valid, act_offset + k * 128, al.convert(0xFFFFFFF0, al.u32))
-        values = al.amdgpu.raw_buffer_load_x4(act, offset, 0, 0)
-        load_row, load_col = lane % 32, k * 8 + (lane // 32) * 4
-        loaded = al.amdgpu.raw_buffer_load_x1(act, (block * 32 + load_row) * (I // 32) + load_col, scale_base, 0)
-        row, shift = lane % 16, (lane // 16) * 8
-        scale = (
-            ((al.shuffle(loaded, row, 64) >> shift) & 255)
-            | (((al.shuffle(loaded, row + 16, 64) >> shift) & 255) << 8)
-            | (((al.shuffle(loaded, row + 32, 64) >> shift) & 255) << 16)
-            | (((al.shuffle(loaded, row + 48, 64) >> shift) & 255) << 24)
-        )
-        return values, scale
+        offset = al.select(valid, act_offset + k * 128, al.convert(0xFFFFFFF0, al.u32))
+        act = al.amdgpu.raw_buffer_load_x4(act_resource, offset, act_base, act_aux)
+        scale = al.amdgpu.raw_buffer_load_x1(act_resource, scale_offset + k * 256, scale_base, act_aux)
+        return act, scale
 
     @avelang.jit
     def read_stage2_input(
-        storage: al.Tensor((4160,), al.u32),
+        storage: al.Tensor((WORDS,), al.u32),
         fragments: al.Tensor((2, 2, 4), al.u32),
         k: al.u32,
         lane: al.u32,
@@ -113,6 +103,7 @@ def make_stage2_input(config):
         lds = al.view(storage, al.u32, al.make_layout((2, 32, 16, 4), (2048, 64, 4, 1)))
         for m in al.static_range(2):
             for half_k in al.static_range(2):
-                fragments[m, half_k] = lds[k % 2, m * 16 + lane % 16, (lane // 16 + half_k * 4) ^ (lane & 15)]
+                row = m * 16 + lane % 16
+                fragments[m, half_k] = lds[k % 2, row, (lane // 16 + half_k * 4) ^ (row & 15)]
 
     return prefetch_stage2_input, read_stage2_input

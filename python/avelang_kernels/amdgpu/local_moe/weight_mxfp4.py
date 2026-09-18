@@ -72,7 +72,7 @@ def make_w13_resources(hidden, intermediate, experts, projection_n, bias_stride)
 
 
 @cache
-def make_w2_resources(hidden, intermediate, experts, scale_columns, *, limit_to_tile=False):
+def make_w2_resources(hidden, intermediate, experts, scale_columns):
     D, I, E, SC = hidden, intermediate, experts, scale_columns
 
     @avelang.jit
@@ -86,7 +86,7 @@ def make_w2_resources(hidden, intermediate, experts, scale_columns, *, limit_to_
     ) -> (al.Tensor((4,), al.u32), al.Tensor((4,), al.u32), al.Tensor((4,), al.u32)):
         weights = al.make_tensor(weight, al.u32, al.make_layout((E * D * I // 8,), (1,)))
         scales = al.make_tensor(ws, al.u32, al.make_layout((E * D * SC // 4,), (1,)))
-        columns = al.convert(256, al.u32) if limit_to_tile else D - tile * 256
+        columns = D - tile * 256
         weight_view = al.subview(weights, ((expert * D + tile * 256) * I // 8,), (columns * I // 8,), (1,))
         scale_view = al.subview(scales, ((expert * D + tile * 256) * SC // 4,), (columns * SC // 4,), (1,))
         weight_resource = al.amdgpu.make_rsrc(weight_view, columns * I // 2)
