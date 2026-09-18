@@ -37,6 +37,15 @@ def make_stage2_compute(config):
         fragments = al.make_local((2, 2, 4), al.u32)
         weights = al.make_local((2, 4, 4), al.u32)
         weight_scales = al.make_local((2,), al.u32)
+        packed_bias = al.make_local((4, 2), al.u32)
+        cached_route_weights = al.make_local((2,), al.f32)
+        for m in al.static_range(2):
+            bits = al.amdgpu.raw_buffer_load_x1(route_weights, (m * 16 + lane % 16) * 4, 0, 0)
+            cached_route_weights[m] = al.bitcast(bits, al.f32)
+        if BIAS:
+            for n in al.static_range(4):
+                col = tile * 256 + wave * 64 + n * 4 + lane // 16 * 16
+                packed_bias[n] = al.amdgpu.raw_buffer_load_x2(bias, col * 2, 0, 0)
         for k in al.static_range(K_TILES):
             ki = al.convert(k, al.u32)
             input_scale = prefetch_stage2_input(
@@ -67,21 +76,17 @@ def make_stage2_compute(config):
                 al.syncthreads()
         al.syncthreads()
         result = al.view(storage, al.bf16, al.make_layout((32, 256), (256, 1)))
+        bias_values = al.view(packed_bias, al.bf16, al.make_layout((4, 4), (4, 1)))
         for m in al.static_range(2):
             for n in al.static_range(4):
                 n16 = wave * 4 + n
-                packed_bias = al.make_local((2,), al.u32)
-                if BIAS:
-                    col = tile * 256 + n16 // 4 * 64 + n16 % 4 * 4 + lane // 16 * 16
-                    packed_bias = al.amdgpu.raw_buffer_load_x2(bias, col * 2, 0, 0)
-                bias_values = al.view(packed_bias, al.bf16, al.make_layout((4,), (1,)))
-                bits = al.amdgpu.raw_buffer_load_x1(route_weights, (m * 16 + lane % 16) * 4, 0, 0)
-                rw = al.bitcast(bits, al.f32)
                 for c in al.static_range(4):
                     value = accum[n, m, c]
                     if BIAS:
-                        value = value + al.convert(bias_values[c], al.f32)
-                    result[m * 16 + lane % 16, n16 * 16 + lane // 16 * 4 + c] = al.convert(value * rw, al.bf16)
+                        value = value + al.convert(bias_values[n, c], al.f32)
+                    result[m * 16 + lane % 16, n16 * 16 + lane // 16 * 4 + c] = al.convert(
+                        value * cached_route_weights[m], al.bf16
+                    )
         al.syncthreads()
 
     return stage2_compute

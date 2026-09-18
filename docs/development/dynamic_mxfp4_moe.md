@@ -1,6 +1,6 @@
 # Dynamic MXFP4 Local MoE: optimization history
 
-Current step 11: [moe][rocm] Cache output row offsets and use branchless buffer atomics.
+Current step 12: [moe][rocm] Prefetch stage2 epilogue inputs.
 
 This prefix targets Petit dev-megamoe before d97fb857. The public local ID
 has one shared cache policy at bit40 and the Stage1 tile at bit41. Stage2 is
