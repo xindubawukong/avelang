@@ -54,7 +54,9 @@ def test_native_weight_layout(k):
     unpacked = packed.view(torch.int32).reshape(e * n // 256, 4, 4, k // 128, 4, 16, 4)
     unpacked = unpacked.permute(0, 1, 2, 5, 3, 4, 6).contiguous().view(torch.uint8).reshape_as(data)
     assert torch.equal(unpacked, data)
-    assert torch.equal(ps, scales)
+    flat = ps.reshape(e * n // 32, k // 256, 4, 16, 2, 2)
+    unpacked_scales = flat.permute(0, 5, 3, 1, 4, 2).contiguous().reshape(e, n, k // 32)
+    assert torch.equal(unpacked_scales, scales)
 
 
 @pytest.mark.parametrize("k", [128, 384])

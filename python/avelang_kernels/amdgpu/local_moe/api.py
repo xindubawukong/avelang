@@ -45,7 +45,9 @@ def _pack_weights(values: torch.Tensor, scales: torch.Tensor):
     words = values.view(torch.int32).reshape(experts, n // 16, 16, k // 128, 4, 4)
     # [expert, N16 tile, K128 tile, K32 lane group, N lane, register]
     words = words.permute(0, 1, 3, 4, 2, 5).contiguous().view(experts, n // 16, k // 128, 4, 16, 4)
-    return words.view(torch.uint8).reshape_as(values), scales
+    tiled_scales = scales.reshape(experts, n // 32, 2, 16, (k // 256), 2, 4)
+    tiled_scales = tiled_scales.permute(0, 1, 4, 6, 3, 5, 2).contiguous()
+    return words.view(torch.uint8).reshape_as(values), tiled_scales.reshape_as(scales)
 
 
 def _pack_bias(bias: torch.Tensor) -> torch.Tensor:
