@@ -25,7 +25,7 @@ def make_stage2_compute(config):
         scales: al.Tensor((4,), al.u32),
         bias: al.Tensor((4,), al.u32),
         route_weights: al.Tensor((4,), al.u32),
-        storage: al.Tensor((4096,), al.u32),
+        storage: al.Tensor((4160,), al.u32),
         tokens: al.u32,
         block: al.u32,
         scale_base: al.u32,
@@ -37,6 +37,15 @@ def make_stage2_compute(config):
         fragments = al.make_local((2, 2, 4), al.u32)
         weights = al.make_local((2, 4, 4), al.u32)
         weight_scales = al.make_local((2,), al.u32)
+        packed_bias = al.make_local((4, 2), al.u32)
+        cached_route_weights = al.make_local((2,), al.f32)
+        for m in al.static_range(2):
+            bits = al.amdgpu.raw_buffer_load_x1(route_weights, (m * 16 + lane % 16) * 4, 0, 0)
+            cached_route_weights[m] = al.bitcast(bits, al.f32)
+        if BIAS:
+            for n in al.static_range(4):
+                col = tile * 256 + wave * 64 + n * 4 + lane // 16 * 16
+                packed_bias[n] = al.amdgpu.raw_buffer_load_x2(bias, col * 2, 0, 0)
         for k in al.static_range(K_TILES):
             ki = al.convert(k, al.u32)
             input_scale = prefetch_stage2_input(
@@ -67,21 +76,17 @@ def make_stage2_compute(config):
                 al.syncthreads()
         al.syncthreads()
         result = al.view(storage, al.bf16, al.make_layout((32, 256), (256, 1)))
+        bias_values = al.view(packed_bias, al.bf16, al.make_layout((4, 4), (4, 1)))
         for m in al.static_range(2):
             for n in al.static_range(4):
                 n16 = wave * 4 + n
-                packed_bias = al.make_local((2,), al.u32)
-                if BIAS:
-                    col = tile * 256 + n16 // 4 * 64 + n16 % 4 * 4 + lane // 16 * 16
-                    packed_bias = al.amdgpu.raw_buffer_load_x2(bias, col * 2, 0, 0)
-                bias_values = al.view(packed_bias, al.bf16, al.make_layout((4,), (1,)))
-                bits = al.amdgpu.raw_buffer_load_x1(route_weights, (m * 16 + lane % 16) * 4, 0, 0)
-                rw = al.bitcast(bits, al.f32)
                 for c in al.static_range(4):
                     value = accum[n, m, c]
                     if BIAS:
-                        value = value + al.convert(bias_values[c], al.f32)
-                    result[m * 16 + lane % 16, n16 * 16 + lane // 16 * 4 + c] = al.convert(value * rw, al.bf16)
+                        value = value + al.convert(bias_values[n, c], al.f32)
+                    result[m * 16 + lane % 16, n16 * 16 + lane // 16 * 4 + c] = al.convert(
+                        value * cached_route_weights[m], al.bf16
+                    )
         al.syncthreads()
 
     return stage2_compute
@@ -89,7 +94,8 @@ def make_stage2_compute(config):
 
 def make_stage2_kernel(config):
     D, I = config.hidden, config.intermediate
-    TOPK = config.topk
+    E, TOPK = config.experts, config.topk
+    WORKERS = config.stage2_workers
     initialize_w2_resources = make_w2_resources(config)
     stage2_compute = make_stage2_compute(config)
 
@@ -106,15 +112,20 @@ def make_stage2_kernel(config):
         out_ptr: al.Pointer(al.bf16),
         capacity: al.u32,
     ):
-        tile, expert = al.convert(al.block_id(0), al.u32), al.convert(al.block_id(1), al.u32)
+        tile, worker = al.convert(al.block_id(0), al.u32), al.convert(al.block_id(1), al.u32)
         tid = al.convert(al.thread_id(0), al.u32)
         wave, lane = al.amdgpu.readfirstlane(tid // 64), tid % 64
         extent, tokens = al.amdgpu.readfirstlane(counts[0]), al.amdgpu.readfirstlane(counts[1])
-        storage = al.make_shared((4096,), al.u32)
+        storage = al.make_shared((4160,), al.u32)
         experts = al.make_tensor(expert_ptr, al.u32, al.make_layout((capacity // 32,), (1,)))
-        for block in al.range((extent + 31) // 32):
+        groups = (extent + 31) // 32
+        quotient, remainder = groups // WORKERS, groups % WORKERS
+        begin = worker * quotient + al.min(worker, remainder)
+        assigned = quotient + al.select(worker < remainder, al.convert(1, al.u32), al.convert(0, al.u32))
+        for block in al.range(begin, begin + assigned):
             group = al.convert(block, al.u32)
-            if al.amdgpu.readfirstlane(experts[group]) == expert:
+            expert = al.amdgpu.readfirstlane(experts[group])
+            if expert < E:
                 routes = al.make_tensor(ids_ptr, al.u32, al.make_layout((capacity,), (1,)))
                 route_weights = al.make_tensor(route_weight_ptr, al.f32, al.make_layout((capacity,), (1,)))
                 route_view = al.subview(routes, (group * 32,), (32,), (1,))
@@ -126,6 +137,15 @@ def make_stage2_kernel(config):
                 memory = al.make_tensor(workspace_ptr, al.u8, al.make_layout((workspace_bytes,), (1,)))
                 act_resource = al.amdgpu.make_rsrc(memory, workspace_bytes)
                 wr, sr, br = initialize_w2_resources(weight, ws, bias_ptr, expert, tile, D, I)
+                row_offsets = al.subview(storage, (4096,), (32,), (1,))
+                if tid < 32:
+                    metadata_route = al.amdgpu.raw_buffer_load_x1(route_resource, tid * 4, 0, 0)
+                    metadata_token, metadata_slot = metadata_route & 0xFFFFFF, metadata_route >> 24
+                    row_offsets[tid] = al.select(
+                        group * 32 + tid < extent and metadata_token < tokens and metadata_slot < TOPK,
+                        metadata_token * D * 2,
+                        tokens * D * 2,
+                    )
                 stage2_compute(
                     act_resource,
                     route_resource,
@@ -147,12 +167,12 @@ def make_stage2_kernel(config):
                 for m in al.static_range(16):
                     pair = m * 256 + tid
                     row, column = pair // 128, pair % 128 * 2
-                    route = al.amdgpu.raw_buffer_load_x1(route_resource, row * 4, 0, 0)
-                    token, slot = route & 0xFFFFFF, route >> 24
-                    if group * 32 + row < extent and token < tokens and slot < TOPK:
-                        offset = (token * D + tile * 256 + column) * 2
-                        al.amdgpu.raw_buffer_atomic_add_bf16x2(pairs[pair], output_resource, offset)
-                al.syncthreads()
+                    # Invalid rows start at the resource bound, so buffer atomics
+                    # discard them without rereading route IDs or branching per pair.
+                    offset = row_offsets[row] + tile * 512 + column * 2
+                    al.amdgpu.raw_buffer_atomic_add_bf16x2(pairs[pair], output_resource, offset)
+            # Protect the shared arena before this worker takes another group.
+            al.syncthreads()
 
     return stage2
 
