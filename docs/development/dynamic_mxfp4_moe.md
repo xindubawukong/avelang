@@ -1,6 +1,6 @@
 # Dynamic MXFP4 Local MoE: optimization history
 
-Current step 07: [moe][rocm] Add stage1 double buffer pipeline.
+Current step 08: [moe][rocm] Add stage2 double buffer and remove redundant barriers.
 
 This prefix targets Petit dev-megamoe before d97fb857. The public local ID
 has one shared cache policy at bit40 and the Stage1 tile at bit41. Stage2 is
