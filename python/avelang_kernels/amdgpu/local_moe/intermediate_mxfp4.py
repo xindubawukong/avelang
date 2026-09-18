@@ -73,29 +73,46 @@ def make_intermediate_store():
 
 @cache
 def make_stage2_input(config):
-    TOPK = config.topk
+    I, TOPK = config.intermediate, config.topk
 
     @avelang.jit
-    def load_intermediate(
+    def prefetch_stage2_input(
         act: al.Tensor((4,), al.u32),
         routes: al.Tensor((4,), al.u32),
-        intermediate: al.u32,
+        storage: al.Tensor((4096,), al.u32),
         tokens: al.u32,
         block: al.u32,
-        m16: al.u32,
-        k128: al.u32,
+        k: al.u32,
         lane: al.u32,
+        tid: al.u32,
         scale_base: al.u32,
-    ) -> (al.Tensor((4,), al.u32), al.u32):
-        row = m16 * 16 + lane % 16
+    ) -> al.u32:
+        row, vector = tid // 8, tid % 8
         route = al.amdgpu.raw_buffer_load_x1(routes, row * 4, 0, 0)
         token, slot = route & 0xFFFFFF, route >> 24
         values = al.full((4,), 0, al.u32)
-        scale = al.convert(0, al.u32)
         if token < tokens and slot < TOPK:
-            offset = (token * TOPK + slot) * (intermediate // 2) + k128 * 64 + lane // 16 * 16
+            offset = (token * TOPK + slot) * (I // 2) + k * 128 + vector * 16
             values = al.amdgpu.raw_buffer_load_x4(act, offset, 0, 0)
-            scale = load_scale_byte(act, scale_base + (block * 32 + row) * (intermediate // 32) + k128 * 4 + lane // 16)
-        return values, scale
+        lds = al.view(storage, al.u32, al.make_layout((32, 8, 4), (32, 4, 1)))
+        lds[row, vector] = values
+        scale = al.convert(0, al.u32)
+        for byte in al.static_range(4):
+            scale_row = block * 32 + lane % 16 + (byte % 2) * 16
+            col = k * 8 + lane // 16 + (byte // 2) * 4
+            value = load_scale_byte(act, scale_base + scale_row * (I // 32) + col)
+            scale = scale | (value << (byte * 8))
+        return scale
 
-    return load_intermediate
+    @avelang.jit
+    def read_stage2_input(
+        storage: al.Tensor((4096,), al.u32),
+        fragments: al.Tensor((2, 2, 4), al.u32),
+        lane: al.u32,
+    ):
+        lds = al.view(storage, al.u32, al.make_layout((32, 8, 4), (32, 4, 1)))
+        for m in al.static_range(2):
+            for half_k in al.static_range(2):
+                fragments[m, half_k] = lds[m * 16 + lane % 16, lane // 16 + half_k * 4]
+
+    return prefetch_stage2_input, read_stage2_input

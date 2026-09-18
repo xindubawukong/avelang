@@ -1,6 +1,6 @@
 # Dynamic MXFP4 Local MoE: optimization history
 
-Current step 04: [moe][rocm] Use K256 tiles and packed scale selectors.
+Current step 05: [moe][rocm] Use single buffer LDS input staging.
 
 This prefix targets Petit dev-megamoe before d97fb857. The public local ID
 has one shared cache policy at bit40 and the Stage1 tile at bit41. Stage2 is
