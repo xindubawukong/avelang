@@ -11,8 +11,6 @@ class MoeConfig:
     solution: MoeSolutionId
     experts: int
     topk: int
-
-    # Fixed launch geometry for the current local implementations.
     stage2_workers: ClassVar[int] = 256
     stage1_num_warps: ClassVar[int] = 4
     stage2_num_warps: ClassVar[int] = 4
@@ -72,6 +70,10 @@ class MoeConfig:
         return 256
 
     @property
+    def stage1_k_groups(self) -> int:
+        return 1
+
+    @property
     def stage1_wave_m(self) -> int:
         return 32
 
@@ -81,7 +83,7 @@ class MoeConfig:
 
     @property
     def stage1_warps_n(self) -> int:
-        return self.stage1_num_warps // self.stage1_warps_m
+        return self.stage1_num_warps // (self.stage1_warps_m * 1)
 
     @property
     def stage1_wave_n(self) -> int:
@@ -89,11 +91,12 @@ class MoeConfig:
 
     @property
     def stage1_input_stage_words(self) -> int:
-        return self.stage1_tile_m * 32 + self.stage1_tile_m // 32 * 64
+        return 1 * (self.stage1_tile_m * 32 + self.stage1_tile_m // 32 * 64)
 
     @property
     def stage1_arena_words(self) -> int:
-        return max(2 * self.stage1_input_stage_words, self.stage1_tile_m * self.stage1_projection_n)
+        partial = 0
+        return max(2 * self.stage1_input_stage_words, self.stage1_tile_m * self.stage1_projection_n, partial)
 
     @property
     def stage1_lds_words(self) -> int:
@@ -108,11 +111,17 @@ class MoeConfig:
         return self.solution.stage2_tile_k
 
     @property
+    def sorted_intermediate(self) -> bool:
+        return self.stage2_tile_k == 128
+
+    @property
     def scale_columns(self) -> int:
-        return self.intermediate // 32
+        return (self.intermediate + 255) // 256 * 8
 
     def stage1_grid(self, capacity: int):
         return ((self.intermediate // self.stage1_projection_n, capacity // self.stage1_tile_m, 1), (256, 1, 1))
 
-    def stage2_grid(self):
-        return ((self.hidden // 256, self.stage2_workers, 1), (256, 1, 1))
+    def stage2_grid(self, tokens: int, capacity: int):
+        if self.stage2_tile_k == 256:
+            return ((self.hidden // 256, self.stage2_workers, 1), (256, 1, 1))
+        return ((capacity // self.stage2_tile_m * (self.hidden // 256), 1, 1), (256, 1, 1))

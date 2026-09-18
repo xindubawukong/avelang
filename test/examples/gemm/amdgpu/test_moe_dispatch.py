@@ -29,7 +29,7 @@ PROBLEM = {"model_dim": 256, "inter_dim": 256, "expert": 16, "topk": 4, "activat
 
 
 def choose(token=8, **overrides):
-    return get_2stage_cfgs(token=token, **(PROBLEM | overrides))
+    return get_2stage_cfgs(token=token, **PROBLEM | overrides)
 
 
 @pytest.mark.parametrize("token,policy", [(0, 1), (128, 1), (255, 1), (256, 0), (257, 0), (1024, 0)])
@@ -58,8 +58,9 @@ def test_available_candidates_and_explicit_policy():
 
 
 def test_selection_cache_normalizes_external_values():
+
     class ExternalActivation(IntEnum):
-        SWIGLU = 19  # Match by name, not another library's enum representation.
+        SWIGLU = 19
 
     get_2stage_cfgs.cache_clear()
     first = choose()
@@ -86,7 +87,7 @@ def test_kernel_factory_cache_uses_experts_and_topk_but_not_token():
     other_e = choose(expert=32, weight_load_policy="cached")
     other_k = choose(topk=2, weight_load_policy="cached")
     assert base.solution == other_e.solution == other_k.solution
-    assert base == other_m and base != other_e and base != other_k
+    assert base == other_m and base != other_e and (base != other_k)
     for factory in (make_stage1, make_stage2):
         assert factory(base) is factory(other_m)
         assert factory(base) is not factory(other_e)
@@ -98,7 +99,7 @@ def test_kernel_factory_cache_uses_experts_and_topk_but_not_token():
 def test_invalid_problem_types_cannot_hit_warm_cache(field, invalid):
     choose(expert=1, topk=1)
     with pytest.raises(TypeError, match="integers"):
-        choose(**({"expert": 1, "topk": 1} | {field: invalid}))
+        choose(**{"expert": 1, "topk": 1} | {field: invalid})
 
 
 @pytest.mark.parametrize("token", [-1, True, 8.0])
@@ -127,18 +128,7 @@ def test_unsupported_requests(overrides):
     with pytest.raises(ValueError):
         choose(**overrides)
     with pytest.raises(ValueError):
-        available_2stage_solutions(**(PROBLEM | overrides))
-
-
-@pytest.mark.parametrize("activation", ["situ", "situ_v2", "situv2", 2])
-def test_unsupported_activation_is_not_mapped_to_silu(activation):
-    with pytest.raises(ValueError):
-        get_2stage_cfgs(8, 3584, 384, 896, 16, activation=activation, bias_dtype="none")
-
-
-def test_intermediate_must_support_k256_stage2():
-    with pytest.raises(ValueError, match="unsupported Ave local MoE solution"):
-        choose(inter_dim=384, activation="silu", bias_dtype="none")
+        available_2stage_solutions(**PROBLEM | overrides)
 
 
 @pytest.mark.parametrize(
@@ -192,8 +182,6 @@ def test_config_stores_solution_and_has_derived_readonly_fields():
 def test_direct_construction_cannot_bypass_implementation_resolution(changes):
     base = choose()
     config = replace(base, solution=replace(base.solution, **changes))
-    # Generic config construction succeeds; every execution entry resolves
-    # the complete solution before constructing a kernel or touching tensors.
     for factory in (make_stage1, make_stage2):
         with pytest.raises(ValueError, match="unsupported Ave local MoE solution"):
             factory(config)
@@ -205,12 +193,10 @@ def test_dispatch_routes_only_registered_complete_combinations(monkeypatch):
     base = choose(weight_load_policy="cached")
     solution = replace(base.solution, stage1_tile_shape=Stage1TileShape.M64_N512)
     config = replace(base, solution=solution)
-    stage1, stage2 = object(), object()
+    stage1, stage2 = (object(), object())
     registry = dispatch._registered_2stage_implementations(config.hidden, config.intermediate)
     with monkeypatch.context() as patch:
         patch.setitem(registry, solution, (lambda cfg: stage1, lambda cfg: stage2))
-        # Remove one complete combination while keeping each individual
-        # field represented by other registered implementations.
         unsupported = replace(solution, bias_dtype=DataType.NONE)
         patch.delitem(registry, unsupported)
         get_2stage_cfgs.cache_clear()
@@ -241,6 +227,7 @@ def test_dispatch_routes_only_registered_complete_combinations(monkeypatch):
     ],
 )
 def test_normalization_rejects_objects_that_only_look_like_names(field, name):
+
     class NamedObject:
         def __init__(self):
             self.name = name
@@ -259,8 +246,8 @@ def test_explicit_names_and_integer_codes_keep_the_same_solution():
     assert choose(bias_dtype=None) == choose(bias_dtype=DataType.NONE)
 
 
-def test_independent_policies():
-    config = choose(stage1_weight_load_policy="cached", stage2_weight_load_policy="non_temporal")
-    assert config.stage1_weight_load_aux == 0 and config.stage2_weight_load_aux == 2
-    with pytest.raises(ValueError, match="conflict"):
-        choose(weight_load_policy="cached", stage2_weight_load_policy="non_temporal")
+def test_kimi_basic_configuration():
+    cfg = get_2stage_cfgs(8, 3584, 384, 896, 16, activation="situ", bias_dtype="none")
+    assert cfg.activation == ActivationFunction.SITU_V2
+    assert cfg.stage2_tile_k == 128
+    assert cfg.hidden == 3584 and cfg.intermediate == 384

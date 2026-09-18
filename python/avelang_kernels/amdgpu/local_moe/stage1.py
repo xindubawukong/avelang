@@ -10,7 +10,7 @@ from functools import cache
 import avelang
 import avelang.language as al
 
-from .activation import openai_swiglu, silu_dot
+from .activation import openai_swiglu, silu_dot, situ_v2
 from .config import MoeConfig
 from .dispatch import resolve_2stage_implementation
 from .input_mxfp4 import make_mxfp4_input
@@ -22,11 +22,11 @@ from .weight_mxfp4 import make_w13_resources, make_w13_weight_loads
 @avelang.jit
 def _schedule_stage1_instructions():
     for _ in al.static_range(6):
-        al.amdgpu.sched_group_barrier(0x20, 1, 0)
-        al.amdgpu.sched_group_barrier(0x8, 4, 0)
+        al.amdgpu.sched_group_barrier(32, 1, 0)
+        al.amdgpu.sched_group_barrier(8, 4, 0)
     for _ in al.static_range(2):
-        al.amdgpu.sched_group_barrier(0x1, 1, 0)
-        al.amdgpu.sched_group_barrier(0x8, 4, 0)
+        al.amdgpu.sched_group_barrier(1, 1, 0)
+        al.amdgpu.sched_group_barrier(8, 4, 0)
     al.amdgpu.sched_barrier(0)
 
 
@@ -37,17 +37,18 @@ def make_stage1_compute(config, *, prefetch_input, read_input):
     The input callbacks issue loads and read fragments; this pipeline owns
     their waits. The caller must synchronize before consuming the final tile.
     """
-    D, I = config.compute_hidden, config.intermediate
-    BM, BN, WN, WM = config.stage1_tile_m, config.stage1_projection_n, config.stage1_warps_n, config.stage1_wave_m
-    NR, MR = config.stage1_wave_n // 16, WM // 16
+    D, I = (config.compute_hidden, config.intermediate)
+    BM, BN, WN, WM = (config.stage1_tile_m, config.stage1_projection_n, config.stage1_warps_n, config.stage1_wave_m)
+    NR, MR = (config.stage1_wave_n // 16, WM // 16)
     NS = NR // 2
     WORDS = config.stage1_lds_words
     BIAS = config.bias
     SWIGLU = config.activation == ActivationFunction.OPENAI_SWIGLU
-    K_TILES = D // 256
-    FOUR_PHASE = NR == 2
+    SITU = config.activation == ActivationFunction.SITU_V2
+    K_TILES = D // 1 // 256
+    FOUR_PHASE = NR == 2 and (WM == 32 or config.stage1_num_warps == 4)
     VMEM = 2 * (2 * NR + NS)
-    BIAS_STRIDE = I
+    BIAS_STRIDE = (I + 255) // 256 * 256
     load_weights, prefetch_weight_phase = make_w13_weight_loads(config)
 
     @avelang.jit
@@ -62,6 +63,7 @@ def make_stage1_compute(config, *, prefetch_input, read_input):
         block: al.u32,
         wave: al.u32,
         lane: al.u32,
+        tid: al.u32,
     ):
         wave_n = wave % WN
         wave_m = wave // WN
@@ -158,8 +160,7 @@ def make_stage1_compute(config, *, prefetch_input, read_input):
                 for n in al.static_range(NR):
                     col = wave_n * (NR * 16) + n * 16
                     offset_b = al.convert(
-                        (projection * BIAS_STRIDE + (col // 64) * 64 + ((col % 64) // 16) * 4 + (lane // 16) * 16) * 2,
-                        al.u32,
+                        (projection * BIAS_STRIDE + col // 64 * 64 + col % 64 // 16 * 4 + lane // 16 * 16) * 2, al.u32
                     )
                     packed_bias[n] = al.amdgpu.raw_buffer_load_x2(bias_resource, offset_b, 0, 0)
                 bias_values = al.view(packed_bias, al.bf16, al.make_layout((NR, 4), (4, 1)))
@@ -174,8 +175,10 @@ def make_stage1_compute(config, *, prefetch_input, read_input):
         for n in al.range(NR):
             for m in al.range(MR):
                 for c in al.range(4):
-                    gate, up = accum[0, n, m, c], accum[1, n, m, c]
-                    if SWIGLU:
+                    gate, up = (accum[0, n, m, c], accum[1, n, m, c])
+                    if SITU:
+                        activated[n, m, c] = situ_v2(gate, up)
+                    elif SWIGLU:
                         activated[n, m, c] = openai_swiglu(gate, up)
                     else:
                         activated[n, m, c] = silu_dot(gate, up)
@@ -189,14 +192,15 @@ def make_stage1_compute(config, *, prefetch_input, read_input):
 
 def make_stage1_kernel(config: MoeConfig):
     """Build the local Stage1 kernel with routing and intermediate stores."""
-    D, I, E, TOPK = config.hidden, config.intermediate, config.experts, config.topk
-    BM, BN = config.stage1_tile_m, config.stage1_projection_n
+    D, I, E, TOPK = (config.hidden, config.intermediate, config.experts, config.topk)
+    BM, BN, WM = (config.stage1_tile_m, config.stage1_projection_n, config.stage1_wave_m)
     TB = BM // 4
-    WORDS, ARENA = config.stage1_lds_words, config.stage1_arena_words
-    SCALE_COLS, BIAS_STRIDE = config.scale_columns, I
+    WORDS, ARENA = (config.stage1_lds_words, config.stage1_arena_words)
+    SORTED = config.sorted_intermediate
+    SCALE_COLS, BIAS_STRIDE = (config.scale_columns, (I + 255) // 256 * 256)
     COL_LANES = min(BN // 4, 32)
     ROWS_PER_SLICE = 256 // COL_LANES
-    SLICES, SEGMENTS = BM // ROWS_PER_SLICE, (BN + 127) // 128
+    SLICES, SEGMENTS = (BM // ROWS_PER_SLICE, (BN + 127) // 128)
     prefetch_input, read_input = make_mxfp4_input(config)
     stage1_compute = make_stage1_compute(config, prefetch_input=prefetch_input, read_input=read_input)
     initialize_w13_resources = make_w13_resources(D, I, E, BN, BIAS_STRIDE)
@@ -218,7 +222,7 @@ def make_stage1_kernel(config: MoeConfig):
     ):
         route_extent = al.amdgpu.readfirstlane(counts[0])
         num_tokens = al.amdgpu.readfirstlane(counts[1])
-        tile, block = al.convert(al.block_id(0), al.u32), al.convert(al.block_id(1), al.u32)
+        tile, block = (al.convert(al.block_id(0), al.u32), al.convert(al.block_id(1), al.u32))
         tid = al.convert(al.thread_id(0), al.u32)
         lane = tid % 64
         wave = al.amdgpu.readfirstlane(tid // 64)
@@ -235,21 +239,19 @@ def make_stage1_kernel(config: MoeConfig):
             weight, ws, bias_ptr, expert, tile, al.convert(1, al.u32)
         )
         scale_base = capacity * I // 2
-        workspace_bytes = scale_base + ((capacity + 255) // 256) * 256 * SCALE_COLS
+        workspace_bytes = scale_base + (capacity + 255) // 256 * 256 * SCALE_COLS
         workspace = al.make_tensor(workspace_ptr, al.u8, al.make_layout((workspace_bytes,), (1,)))
         output_resource = al.amdgpu.make_rsrc(workspace, workspace_bytes)
         storage = al.make_shared((WORDS,), al.u32)
         route_view = al.subview(routes, (block * BM,), (BM,), (1,))
         route_resource = al.amdgpu.make_rsrc(route_view, BM * 4)
-        metadata_row = lane % TB + wave * TB + (lane // TB) * BM
+        metadata_row = lane % TB + wave * TB + lane // TB * BM
         storage[ARENA + metadata_row] = al.amdgpu.raw_buffer_load_x1(route_resource, metadata_row * 4, 0, 0)
         input_offsets = al.make_local((2,), al.u32)
-        # Routing is invariant over the K loop. Keep the source row offsets
-        # in registers so async copies do not reread the LDS metadata tail.
         for load in al.static_range(INPUT_LOADS):
             row = wave * TB + load * 8 + lane // 8
-            token = storage[ARENA + row] & 0xFFFFFF
-            input_offsets[load] = al.min(token, num_tokens) * (D // 2) + ((lane % 8) ^ (row & 7)) * 16
+            token = storage[ARENA + row] & 16777215
+            input_offsets[load] = al.min(token, num_tokens) * (D // 2) + (lane % 8 ^ row & 7) * 16
         act_resource = al.amdgpu.make_rsrc(ACT, num_tokens * D // 2)
         act_scale_resource = al.amdgpu.make_rsrc(ACT_SCALES, capacity * D // 32)
         stage1_compute(
@@ -263,21 +265,26 @@ def make_stage1_kernel(config: MoeConfig):
             block,
             wave,
             lane,
+            tid,
         )
         hidden = al.view(storage, al.f32, al.make_layout((BM, BN // 4, 4), (BN, 4, 1)))
+        output_routes = al.make_local((SLICES,), al.u32)
+        if WM == 64:
+            for batch in al.static_range(SLICES):
+                output_routes[batch] = storage[ARENA + batch * ROWS_PER_SLICE + tid // COL_LANES]
         al.syncthreads()
         for batch in al.static_range(SLICES):
             row = batch * ROWS_PER_SLICE + tid // COL_LANES
-            route = storage[ARENA + row]
-            token, slot = route & 0xFFFFFF, route >> 24
+            route = output_routes[batch] if WM == 64 else storage[ARENA + row]
+            token, slot = (route & 16777215, route >> 24)
             sorted_row = block * BM + row
-            if sorted_row < route_extent and token < num_tokens and slot < TOPK:
+            if sorted_row < route_extent and token < num_tokens and (slot < TOPK):
                 for segment in al.static_range(SEGMENTS):
                     col_lane = segment * 32 + tid % COL_LANES
                     values = al.make_local((4,), al.f32)
                     for c in al.static_range(4):
                         values[c] = hidden[row, col_lane, c]
-                    act_row = token * TOPK + slot
+                    act_row = sorted_row if SORTED else token * TOPK + slot
                     store_intermediate(
                         values,
                         output_resource,
