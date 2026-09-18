@@ -302,7 +302,7 @@ def test_aiter_input_preparation(tokens, columns, capacity):
 
 
 @pytest.mark.skipif(not gfx950, reason="Native MXFP4 requires gfx950")
-@pytest.mark.parametrize("s1,s2", [(0, 1)])
+@pytest.mark.parametrize("s1,s2", [(0, 1), (4, 1)])
 def test_k128_tiles_with_known_projection_and_padded_routes(s1, s2):
     from avelang_kernels.amdgpu.local_moe import ExpertWeights, MoeConfig, MoeSolutionId, dynamic_mxfp4_moe
     from avelang_kernels.amdgpu.local_moe.solutionid import DataType
