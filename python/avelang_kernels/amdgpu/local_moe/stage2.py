@@ -44,7 +44,7 @@ def make_stage2_compute(config):
             )
             al.amdgpu.s_waitcnt(0, 0, 0)
             al.syncthreads()
-            read_stage2_input(storage, fragments, lane)
+            read_stage2_input(storage, fragments, ki, lane)
             for half_k in al.static_range(2):
                 for n in al.static_range(4):
                     weights[half_k, n] = load_weight_values(weight, intermediate, wave * 4 + n, ki * 2 + half_k, lane)
@@ -63,7 +63,9 @@ def make_stage2_compute(config):
                             2 * half_k + n % 2,
                             2 * half_k + m,
                         )
-            al.syncthreads()
+            if k + 1 < K_TILES:
+                al.syncthreads()
+        al.syncthreads()
         result = al.view(storage, al.bf16, al.make_layout((32, 256), (256, 1)))
         for m in al.static_range(2):
             for n in al.static_range(4):
