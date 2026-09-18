@@ -40,10 +40,3 @@ def unsort_scales(scales: torch.Tensor, rows: int, columns: int) -> torch.Tensor
         .permute(0, 5, 3, 1, 4, 2)
         .reshape(ceildiv(rows, 32) * 32, ceildiv(columns, 256) * 8)[:rows, : columns // 32]
     )
-
-
-@avelang.jit
-def load_scale_byte(resource: al.Tensor((4,), al.u32), offset: al.u32) -> al.u32:
-    """Read one row-major E8M0 byte through an aligned buffer load."""
-    word = al.amdgpu.raw_buffer_load_x1(resource, offset // 4 * 4, 0, 0)
-    return (word >> ((offset % 4) * 8)) & 255

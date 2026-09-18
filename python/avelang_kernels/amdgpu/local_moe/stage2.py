@@ -40,13 +40,6 @@ def make_stage2_compute(config):
         weight_scales = al.make_local((2,), al.u32)
         packed_bias = al.make_local((4, 2), al.u32)
         cached_route_weights = al.make_local((2,), al.f32)
-        for m in al.static_range(2):
-            bits = al.amdgpu.raw_buffer_load_x1(route_weights, (m * 16 + lane % 16) * 4, 0, 0)
-            cached_route_weights[m] = al.bitcast(bits, al.f32)
-        if BIAS:
-            for n in al.static_range(4):
-                col = tile * 256 + wave * 64 + n * 4 + lane // 16 * 16
-                packed_bias[n] = al.amdgpu.raw_buffer_load_x2(bias, col * 2, 0, 0)
         input_row, vector = wave * 8 + lane // 8, lane % 8
         lds = al.view(storage, al.u32, al.make_layout((2, 32, 16, 4), (2048, 64, 4, 1)))
         for k in al.static_range(K_TILES):
@@ -77,9 +70,17 @@ def make_stage2_compute(config):
                             2 * half_k + n % 2,
                             2 * half_k + m,
                         )
+            if k + 1 == K_TILES:
+                for m in al.static_range(2):
+                    cached_route_weights[m] = al.bitcast(storage[4128 + m * 16 + lane % 16], al.f32)
+                if BIAS:
+                    for n in al.static_range(4):
+                        col = tile * 256 + wave * 64 + n * 4 + lane // 16 * 16
+                        packed_bias[n] = al.amdgpu.raw_buffer_load_x2(bias, col * 2, 0, 0)
             if k + 1 < K_TILES:
                 al.syncthreads()
         al.syncthreads()
+        al.amdgpu.s_setprio(0)
         result = al.view(storage, al.bf16, al.make_layout((32, 256), (256, 1)))
         bias_values = al.view(packed_bias, al.bf16, al.make_layout((4, 4), (4, 1)))
         for m in al.static_range(2):
@@ -152,6 +153,8 @@ def make_stage2_kernel(config):
                         metadata_token * D * 2,
                         tokens * D * 2,
                     )
+                    storage[4128 + tid] = al.amdgpu.raw_buffer_load_x1(rw_resource, tid * 4, 0, 0)
+                al.syncthreads()
                 input_row, vector = tid // 8, tid % 8
                 input_route = al.amdgpu.raw_buffer_load_x1(route_resource, input_row * 4, 0, 0)
                 input_token, input_slot = input_route & 0xFFFFFF, input_route >> 24
