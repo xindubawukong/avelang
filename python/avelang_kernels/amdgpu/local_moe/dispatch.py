@@ -119,7 +119,7 @@ def _registered_2stage_implementations(hidden, intermediate):
     implementations = {}
     for activation in ActivationFunction:
         for bias in (DataType.NONE, DataType.BF16):
-            for shape in (Stage1TileShape.M32_N256,):
+            for shape in Stage1TileShape:
                 for policy in (WeightLoadPolicy.CACHED,):
                     solution = MoeSolutionId(
                         hidden=hidden,

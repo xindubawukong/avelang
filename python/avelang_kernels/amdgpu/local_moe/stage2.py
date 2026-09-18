@@ -96,6 +96,7 @@ def make_stage2_kernel(config):
     D, I = config.hidden, config.intermediate
     E, TOPK = config.experts, config.topk
     WORKERS = config.stage2_workers
+    RATIO = config.stage1_tile_m // 32
     initialize_w2_resources = make_w2_resources(config)
     stage2_compute = make_stage2_compute(config)
 
@@ -117,14 +118,14 @@ def make_stage2_kernel(config):
         wave, lane = al.amdgpu.readfirstlane(tid // 64), tid % 64
         extent, tokens = al.amdgpu.readfirstlane(counts[0]), al.amdgpu.readfirstlane(counts[1])
         storage = al.make_shared((4160,), al.u32)
-        experts = al.make_tensor(expert_ptr, al.u32, al.make_layout((capacity // 32,), (1,)))
+        experts = al.make_tensor(expert_ptr, al.u32, al.make_layout((capacity // (32 * RATIO),), (1,)))
         groups = (extent + 31) // 32
         quotient, remainder = groups // WORKERS, groups % WORKERS
         begin = worker * quotient + al.min(worker, remainder)
         assigned = quotient + al.select(worker < remainder, al.convert(1, al.u32), al.convert(0, al.u32))
         for block in al.range(begin, begin + assigned):
             group = al.convert(block, al.u32)
-            expert = al.amdgpu.readfirstlane(experts[group])
+            expert = al.amdgpu.readfirstlane(experts[group // RATIO])
             if expert < E:
                 routes = al.make_tensor(ids_ptr, al.u32, al.make_layout((capacity,), (1,)))
                 route_weights = al.make_tensor(route_weight_ptr, al.f32, al.make_layout((capacity,), (1,)))

@@ -18,7 +18,8 @@ def make_stage1_compute(config):
     intermediate = config.intermediate
     K_TILES = config.hidden // 256
     BM, BN, WORDS = config.stage1_tile_m, config.stage1_projection_n, config.stage1_lds_words
-    MR, NR = BM // 16, BN // 64
+    WM, WN = config.stage1_wave_m, config.stage1_warps_n
+    MR, NR = WM // 16, config.stage1_wave_n // 16
     NS = NR // 2
     BIAS = config.bias
     SWIGLU = config.activation == ActivationFunction.OPENAI_SWIGLU
@@ -41,6 +42,7 @@ def make_stage1_compute(config):
         wave: al.u32,
         lane: al.u32,
     ):
+        wave_m, wave_n = wave // WN, wave % WN
         accum = al.full((2, NR, MR, 4), 0, al.f32)
         fragments = al.make_local((MR, 2, 4), al.u32)
         weights = al.make_local((2, 2, NR, 4), al.u32)
@@ -49,7 +51,7 @@ def make_stage1_compute(config):
         load_weights(gate, gate_scales, up, up_scales, weights, weight_scales, al.convert(0, al.u32), wave, lane)
         al.amdgpu.s_waitcnt(0, 0, 0)
         al.syncthreads()
-        input_scale = read_input(storage, fragments, al.convert(0, al.u32), lane)
+        input_scale = read_input(storage, fragments, al.convert(0, al.u32), wave, lane)
         for k in al.static_range(K_TILES):
             next_k = al.convert(k + 1, al.u32)
             prefetch_input(act, scales, routes, storage, tokens, block, next_k, wave, lane)
@@ -71,11 +73,11 @@ def make_stage1_compute(config):
             al.amdgpu.s_waitcnt(0, 0, 0)
             al.syncthreads()
             if k + 1 < K_TILES:
-                input_scale = read_input(storage, fragments, next_k, lane)
+                input_scale = read_input(storage, fragments, next_k, wave, lane)
         result = al.view(storage, al.f32, al.make_layout((BM, BN), (BN, 1)))
         for m in al.static_range(MR):
             for n in al.static_range(NR):
-                n16 = wave * NR + n
+                n16 = wave_n * NR + n
                 packed_bias = al.make_local((2, 2), al.u32)
                 if BIAS:
                     col = n16 // 4 * 64 + (n16 % 4) * 4 + lane // 16 * 16
@@ -88,7 +90,7 @@ def make_stage1_compute(config):
                         gv = gv + al.convert(bias_values[0, c], al.f32)
                         uv = uv + al.convert(bias_values[1, c], al.f32)
                     value = openai_swiglu(gv, uv) if SWIGLU else silu_dot(gv, uv)
-                    result[m * 16 + lane % 16, n16 * 16 + lane // 16 * 4 + c] = value
+                    result[wave_m * WM + m * 16 + lane % 16, n16 * 16 + lane // 16 * 4 + c] = value
         al.syncthreads()
 
     return stage1_compute
