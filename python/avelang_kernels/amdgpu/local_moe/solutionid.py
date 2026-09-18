@@ -49,12 +49,14 @@ class WeightLoadPolicy(IntEnum):
 class Stage1TileShape(IntEnum):
     M32_N256 = 0
     M64_N512 = 1
+    M64_N256 = 2
     M32_N128_K2 = 4
 
 
 class Stage2TileShape(IntEnum):
     M32_N256_K256 = 0
     M32_N256_K128 = 1
+    M64_N256_K128 = 2
 
 
 BASE_FIELDS = (
@@ -143,7 +145,7 @@ class MoeSolutionId:
 
     @property
     def stage1_tile_m(self) -> int:
-        return 64 if self.stage1_tile_shape in (Stage1TileShape.M64_N512,) else 32
+        return 64 if self.stage1_tile_shape in (Stage1TileShape.M64_N512, Stage1TileShape.M64_N256) else 32
 
     @property
     def stage1_tile_n(self) -> int:
@@ -158,7 +160,7 @@ class MoeSolutionId:
 
     @property
     def stage2_tile_m(self) -> int:
-        return 32
+        return 64 if self.stage2_tile_shape == Stage2TileShape.M64_N256_K128 else 32
 
     @property
     def stage2_tile_k(self) -> int:

@@ -3,7 +3,7 @@
 from dataclasses import dataclass
 from typing import ClassVar
 
-from .solutionid import ActivationFunction, DataType, MoeSolutionId, WeightLoadPolicy
+from .solutionid import ActivationFunction, DataType, MoeSolutionId, Stage1TileShape, WeightLoadPolicy
 
 
 @dataclass(frozen=True, slots=True)
@@ -75,7 +75,7 @@ class MoeConfig:
 
     @property
     def stage1_wave_m(self) -> int:
-        return 32
+        return 64 if self.solution.stage1_tile_shape == Stage1TileShape.M64_N256 else 32
 
     @property
     def stage1_warps_m(self) -> int:
