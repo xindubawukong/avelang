@@ -13,9 +13,7 @@ class MoeConfig:
     topk: int
 
     # Fixed launch geometry for the current local implementations.
-    @property
-    def stage2_workers(self) -> int:
-        return self.experts
+    stage2_workers: ClassVar[int] = 256
 
     stage1_num_warps: ClassVar[int] = 4
     stage2_num_warps: ClassVar[int] = 4

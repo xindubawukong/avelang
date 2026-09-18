@@ -1,6 +1,6 @@
 # Dynamic MXFP4 Local MoE: optimization history
 
-Current step 09: [moe][rocm] Use hardware instructions to quantize intermediates.
+Current step 10: [moe][rocm] Use persistent stage2 scheduling.
 
 This prefix targets Petit dev-megamoe before d97fb857. The public local ID
 has one shared cache policy at bit40 and the Stage1 tile at bit41. Stage2 is

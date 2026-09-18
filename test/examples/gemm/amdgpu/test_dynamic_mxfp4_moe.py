@@ -274,3 +274,38 @@ def test_aiter_input_preparation(tokens, columns, capacity):
     valid = (ids.cpu() & 0xFFFFFF) < tokens
     token_ids = (ids.cpu()[valid] & 0xFFFFFF).long()
     torch.testing.assert_close(logical_scales[valid], expected_scales[token_ids], rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not gfx950, reason="Native MXFP4 requires gfx950")
+@pytest.mark.parametrize("policy", ["cached"])
+def test_persistent_stage2_reuses_worker_after_invalid_group(policy):
+    from avelang_kernels.amdgpu.local_moe.stage2 import make_stage2
+
+    # Worker 0 owns groups 0, 1, 2: it must continue past invalid group 0.
+    groups, d, i = 513, 256, 512
+    capacity, tokens = groups * 32, groups * 32 - 7
+    config = get_2stage_cfgs(tokens, d, i, 1, 1, activation="silu", bias_dtype="none", weight_load_policy=policy)
+    layout = IntermediateLayout(capacity, i)
+    workspace = torch.empty(layout.nbytes, device="cuda", dtype=torch.uint8)
+    act, scales = layout.views(workspace, tokens, 1)
+    act.fill_(0x22)  # Two FP4 ones per byte.
+    scales.fill_(127)
+    weight, ws = _pack_weights(
+        torch.full((1, d, i // 2), 0x22, device="cuda", dtype=torch.uint8),
+        torch.full((1, d, i // 32), 127, device="cuda", dtype=torch.uint8),
+    )
+    ids = torch.full((capacity,), tokens, device="cuda", dtype=torch.int32)
+    ids[:tokens] = torch.arange(tokens - 1, -1, -1, device="cuda", dtype=torch.int32)
+    experts = torch.zeros(groups, device="cuda", dtype=torch.int32)
+    experts[0] = -1
+    route_weights = torch.full((capacity,), 0.5, device="cuda")
+    counts = torch.tensor([capacity, tokens], device="cuda", dtype=torch.int32)
+    output = torch.zeros(tokens * d + 16, device="cuda", dtype=torch.bfloat16)
+    output[-16:] = 19
+    make_stage2(config)[lambda: ((1, 256, 1), (256, 1, 1))](
+        workspace, weight, ws, output, ids, experts, route_weights, counts, output, capacity, num_warps=4
+    )
+    expected = torch.full((tokens, d), i * 0.5, device="cuda", dtype=torch.bfloat16)
+    expected[-32:] = 0
+    torch.testing.assert_close(output[:-16].reshape(tokens, d), expected, rtol=0, atol=0)
+    torch.testing.assert_close(output[-16:], torch.full_like(output[-16:], 19), rtol=0, atol=0)

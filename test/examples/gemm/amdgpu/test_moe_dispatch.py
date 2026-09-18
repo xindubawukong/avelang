@@ -37,7 +37,7 @@ def test_default_cached_policy(token, policy):
     config = choose(token)
     assert config.solution.weight_load_policy == config.solution.weight_load_policy == WeightLoadPolicy(policy)
     assert config.solution.stages == Stages.TWO_STAGE
-    assert config.stage2_workers == config.experts
+    assert config.stage2_workers == 256
     assert not hasattr(config, "token")
 
 
