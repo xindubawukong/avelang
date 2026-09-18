@@ -12,7 +12,7 @@ import avelang.language as al
 import torch
 
 from .quantization import quantize_mxfp4_activation
-from .scale_layout import ceildiv, load_scale_byte
+from .scale_layout import ceildiv
 
 
 @dataclass(frozen=True)
@@ -64,9 +64,14 @@ def make_intermediate_store():
         if col_lane % 2 == 0:
             offset = act_row * (intermediate // 2) + column_base // 2 + col_lane * 2
             al.amdgpu.raw_buffer_store_x1(packed | (partner << 16), resource, offset, 0, 2)
-        if col_lane % 8 == 0:
+        scale0 = al.shuffle(exponent, 0, 32)
+        scale1 = al.shuffle(exponent, 8, 32)
+        scale2 = al.shuffle(exponent, 16, 32)
+        scale3 = al.shuffle(exponent, 24, 32)
+        if col_lane % 32 == 0:
+            scales = scale0 | (scale1 << 8) | (scale2 << 16) | (scale3 << 24)
             offset = scale_row * (intermediate // 32) + column_base // 32 + col_lane // 8
-            al.amdgpu.raw_buffer_store_u8(al.convert(exponent, al.u8), resource, offset, scale_base, 0)
+            al.amdgpu.raw_buffer_store_x1(scales, resource, offset, scale_base, 0)
 
     return store_intermediate
 
@@ -87,12 +92,15 @@ def make_stage2_input(config):
     ) -> (al.Tensor((4,), al.u32), al.u32):
         offset = al.select(input_valid, act_offset + k * 128, al.convert(0xFFFFFFF0, al.u32))
         values = al.amdgpu.raw_buffer_load_x4(act, offset, 0, 0)
-        scale = al.convert(0, al.u32)
-        for byte in al.static_range(4):
-            scale_row = block * 32 + lane % 16 + (byte % 2) * 16
-            col = k * 8 + lane // 16 + (byte // 2) * 4
-            value = load_scale_byte(act, scale_base + scale_row * (I // 32) + col)
-            scale = scale | (value << (byte * 8))
+        load_row, load_col = lane % 32, k * 8 + (lane // 32) * 4
+        loaded = al.amdgpu.raw_buffer_load_x1(act, (block * 32 + load_row) * (I // 32) + load_col, scale_base, 0)
+        row, shift = lane % 16, (lane // 16) * 8
+        scale = (
+            ((al.shuffle(loaded, row, 64) >> shift) & 255)
+            | (((al.shuffle(loaded, row + 16, 64) >> shift) & 255) << 8)
+            | (((al.shuffle(loaded, row + 32, 64) >> shift) & 255) << 16)
+            | (((al.shuffle(loaded, row + 48, 64) >> shift) & 255) << 24)
+        )
         return values, scale
 
     @avelang.jit
