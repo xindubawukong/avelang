@@ -23,7 +23,7 @@ STAGE2_K256_LDS_WORDS = 4160
 def make_stage2_compute_k256(intermediate, bias, weight_cache, words=STAGE2_K256_LDS_WORDS):
     """Write weighted BF16 [32, 256] output into linear LDS and synchronize."""
     I, BIAS, K_TILES = intermediate, bias, intermediate // 256
-    prefetch_stage2_input, read_stage2_input = make_stage2_input_k256(intermediate, words)
+    prefetch_stage2_input, read_stage2_input = make_stage2_input_k256(words, 0)
 
     @avelang.jit
     def stage2_compute_k256(
@@ -52,7 +52,7 @@ def make_stage2_compute_k256(intermediate, bias, weight_cache, words=STAGE2_K256
         for k in al.static_range(K_TILES):
             stage = k % 2
             prefetched, scale = prefetch_stage2_input(
-                act_resource, act_offset, act_base, scale_offset, scale_base, input_valid, al.convert(k, al.u32), lane
+                act_resource, act_offset, act_base, scale_offset, scale_base, input_valid, al.convert(k, al.u32)
             )
             # Match dev-megamoe: publish each input tile, issue W2 loads,
             # synchronize, then read LDS and run MFMA.
@@ -181,7 +181,7 @@ def make_stage2_kernel(config: MoeConfig):
                     storage,
                     al.convert((token * TOPK + slot) * (I // 2) + vector * 16, al.u32),
                     al.convert(0, al.u32),
-                    al.convert(block * 32 * (I // 32), al.u32),
+                    al.convert(block * 32 * (I // 32) + (tid % 64) * 4, al.u32),
                     al.convert(act_bytes, al.u32),
                     valid,
                     al.convert(tile, al.u32),

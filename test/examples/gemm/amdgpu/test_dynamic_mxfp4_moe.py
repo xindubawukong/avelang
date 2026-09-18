@@ -5,7 +5,7 @@ import torch
 from avelang_kernels.amdgpu.local_moe import get_2stage_cfgs
 from avelang_kernels.amdgpu.local_moe.api import _pack_bias, _pack_weights
 from avelang_kernels.amdgpu.local_moe.intermediate_mxfp4 import IntermediateLayout
-from avelang_kernels.amdgpu.local_moe.scale_layout import unsort_scales
+from avelang_kernels.amdgpu.local_moe.scale_layout import scale_byte_shape, unsort_scales
 from avelang_kernels.amdgpu.local_moe.solutionid import ActivationFunction
 
 
@@ -37,7 +37,7 @@ def test_workspace_layout():
     workspace = torch.full((layout.nbytes,), 173, dtype=torch.uint8)
     act, scales = layout.views(workspace, tokens=8, topk=4)
     assert act.shape == (8, 4, 1536)
-    assert scales.shape == (256, 96)
+    assert scales.shape == scale_byte_shape(256, 3072)
     assert scales.data_ptr() - workspace.data_ptr() == 96 * 1536
     act.fill_(1)
     scales.fill_(2)
@@ -328,7 +328,7 @@ def test_m64_n512_stage1_bias_and_m32_stage2(activation):
 
 
 @pytest.mark.skipif(not gfx950, reason="Native MXFP4 requires gfx950")
-def test_stage2_row_major_scales_with_routed_rows_and_k_halves():
+def test_stage2_native_scales_with_routed_rows_and_k_halves():
     from avelang_kernels.amdgpu.local_moe.stage2 import make_stage2
 
     tokens, d, i = 32, 256, 512
@@ -342,7 +342,9 @@ def test_stage2_row_major_scales_with_routed_rows_and_k_halves():
     rows = torch.arange(tokens)[:, None]
     columns = torch.arange(i // 32)[None, :]
     exponents = (124 + (rows * 3 + columns) % 5).to(torch.uint8)
-    scales[:tokens].copy_(exponents)
+    padded = torch.zeros((256, i // 32), dtype=torch.uint8)
+    padded[:tokens] = exponents
+    scales.copy_(padded.reshape(8, 2, 16, i // 256, 2, 4).permute(0, 3, 5, 2, 4, 1))
     weight, ws = _pack_weights(
         torch.full((1, d, i // 2), 0x22, device="cuda", dtype=torch.uint8),
         torch.full((1, d, i // 32), 127, device="cuda", dtype=torch.uint8),
