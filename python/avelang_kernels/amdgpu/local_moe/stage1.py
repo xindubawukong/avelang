@@ -22,7 +22,7 @@ def make_stage1_compute(config):
     NS = NR // 2
     BIAS = config.bias
     SWIGLU = config.activation == ActivationFunction.OPENAI_SWIGLU
-    load_input = make_mxfp4_input(config)
+    prefetch_input, read_input = make_mxfp4_input(config)
 
     @avelang.jit
     def stage1_compute(
@@ -46,7 +46,10 @@ def make_stage1_compute(config):
         weight_scales = al.make_local((2, NS), al.u32)
         for k in al.static_range(K_TILES):
             ki = al.convert(k, al.u32)
-            input_scale = load_input(act, scales, routes, fragments, tokens, block, ki, lane)
+            prefetch_input(act, scales, routes, storage, tokens, block, ki, wave, lane)
+            al.amdgpu.s_waitcnt(0, 0, 0)
+            al.syncthreads()
+            input_scale = read_input(storage, fragments, lane)
             for half_k in al.static_range(2):
                 for n in al.static_range(NR):
                     n16 = wave * NR + n
@@ -69,6 +72,7 @@ def make_stage1_compute(config):
                                 2 * half_k + n % 2,
                                 2 * half_k + m,
                             )
+            al.syncthreads()
         result = al.view(storage, al.f32, al.make_layout((BM, BN), (BN, 1)))
         for m in al.static_range(MR):
             for n in al.static_range(NR):

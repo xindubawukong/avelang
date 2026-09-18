@@ -15,7 +15,7 @@ def make_stage2_compute(config):
     intermediate = config.intermediate
     K_TILES = config.intermediate // 256
     BIAS = config.bias
-    load_intermediate = make_stage2_input(config)
+    prefetch_stage2_input, read_stage2_input = make_stage2_input(config)
 
     @avelang.jit
     def stage2_compute(
@@ -39,22 +39,13 @@ def make_stage2_compute(config):
         weight_scales = al.make_local((2,), al.u32)
         for k in al.static_range(K_TILES):
             ki = al.convert(k, al.u32)
-            input_scale = al.convert(0, al.u32)
+            input_scale = prefetch_stage2_input(
+                act, routes, storage, tokens, block, ki, lane, wave * 64 + lane, scale_base
+            )
+            al.amdgpu.s_waitcnt(0, 0, 0)
+            al.syncthreads()
+            read_stage2_input(storage, fragments, lane)
             for half_k in al.static_range(2):
-                for m in al.static_range(2):
-                    xv, xs = load_intermediate(
-                        act,
-                        routes,
-                        intermediate,
-                        tokens,
-                        block,
-                        al.convert(m, al.u32),
-                        ki * 2 + half_k,
-                        lane,
-                        scale_base,
-                    )
-                    fragments[m, half_k] = xv
-                    input_scale = input_scale | (xs << ((2 * half_k + m) * 8))
                 for n in al.static_range(4):
                     weights[half_k, n] = load_weight_values(weight, intermediate, wave * 4 + n, ki * 2 + half_k, lane)
             for n in al.static_range(2):
@@ -72,6 +63,7 @@ def make_stage2_compute(config):
                             2 * half_k + n % 2,
                             2 * half_k + m,
                         )
+            al.syncthreads()
         result = al.view(storage, al.bf16, al.make_layout((32, 256), (256, 1)))
         for m in al.static_range(2):
             for n in al.static_range(4):
