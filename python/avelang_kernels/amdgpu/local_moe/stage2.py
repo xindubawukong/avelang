@@ -31,6 +31,7 @@ def make_stage2_compute_k256(intermediate, bias, weight_cache, words=STAGE2_K256
         weight_resource: al.Tensor((4,), al.u32),
         scale_resource: al.Tensor((4,), al.u32),
         bias_resource: al.Tensor((4,), al.u32),
+        rw_resource: al.Tensor((4,), al.u32),
         storage: al.Tensor((words,), al.u32),
         act_offset: al.u32,
         act_base: al.u32,
@@ -49,6 +50,13 @@ def make_stage2_compute_k256(intermediate, bias, weight_cache, words=STAGE2_K256
         fragments = al.make_local((2, 2, 4), al.u32)
         packed_bias = al.make_local((4, 2), al.u32)
         route_weights = al.make_local((2,), al.f32)
+        for m in al.static_range(2):
+            bits = al.amdgpu.raw_buffer_load_x1(rw_resource, (m * 16 + lane % 16) * 4, 0, 0)
+            route_weights[m] = al.bitcast(bits, al.f32)
+        if BIAS:
+            for n in al.static_range(4):
+                offset = (tile * 256 + wave * 64 + n * 4 + (lane // 16) * 16) * 2
+                packed_bias[n] = al.amdgpu.raw_buffer_load_x2(bias_resource, offset, 0, 0)
         for k in al.static_range(K_TILES):
             stage = k % 2
             prefetched, scale = prefetch_stage2_input(
@@ -79,16 +87,8 @@ def make_stage2_compute_k256(intermediate, bias, weight_cache, words=STAGE2_K256
                             2 * half_k + n % 2,
                             2 * half_k + m,
                         )
-            if k + 1 == K_TILES:
-                for m in al.static_range(2):
-                    route_weights[m] = al.bitcast(storage[4128 + m * 16 + lane % 16], al.f32)
-                if BIAS:
-                    for n in al.static_range(4):
-                        offset = (tile * 256 + wave * 64 + n * 4 + (lane // 16) * 16) * 2
-                        packed_bias[n] = al.amdgpu.raw_buffer_load_x2(bias_resource, offset, 0, 0)
 
         al.syncthreads()
-        al.amdgpu.s_setprio(0)
         bias_values = al.view(packed_bias, al.bf16, al.make_layout((4, 4), (4, 1)))
         shared = al.view(storage, al.bf16, al.make_layout((32, 256), (256, 1)))
         for m in al.static_range(2):
@@ -168,12 +168,12 @@ def make_stage2_kernel(config: MoeConfig):
                     row_offsets[tid] = al.select(
                         metadata_token < num_tokens and metadata_slot < TOPK, metadata_token * D * 2, num_tokens * D * 2
                     )
-                    storage[4128 + tid] = al.amdgpu.raw_buffer_load_x1(rw_resource, al.convert(tid * 4, al.u32), 0, 0)
                 stage2_compute_k256(
                     act_resource,
                     weight_resource,
                     scale_resource,
                     bias_resource,
+                    rw_resource,
                     storage,
                     al.convert((token * TOPK + slot) * (I // 2) + vector * 16, al.u32),
                     al.convert(0, al.u32),

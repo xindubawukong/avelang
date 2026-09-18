@@ -12,6 +12,7 @@ Stage1 and Stage2 still support GPT-OSS, DSv3 and DSv4.
 - [moe][rocm] Remove redundant stage2 K-loop barriers
 - [moe][rocm] Interleave stage1 W13 prefetch in four phases
 - [moe][rocm] Use partial VMEM waits in the stage1 pipeline
+- [moe][rocm] Prefetch stage2 epilogue inputs into registers
 
 Each commit has numerical, graph-replay and four-scope timing evidence under
 ~/compare/local-moe-two-milestones-20260918.
