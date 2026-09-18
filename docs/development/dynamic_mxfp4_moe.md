@@ -14,6 +14,7 @@ Stage1 and Stage2 still support GPT-OSS, DSv3 and DSv4.
 - [moe][rocm] Use partial VMEM waits in the stage1 pipeline
 - [moe][rocm] Prefetch stage2 epilogue inputs into registers
 - [moe][rocm] Use packed BF16 stores in the stage2 epilogue
+- [moe][rocm] Use wave-uniform stage2 output writeback
 
 Each commit has numerical, graph-replay and four-scope timing evidence under
 ~/compare/local-moe-two-milestones-20260918.

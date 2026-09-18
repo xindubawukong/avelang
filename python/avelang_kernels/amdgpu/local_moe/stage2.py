@@ -148,6 +148,8 @@ def make_stage2_kernel(config: MoeConfig):
     ):
         tile, worker = al.block_id(0), al.block_id(1)
         tid = al.thread_id(0)
+        lane = tid % 64
+        wave = al.amdgpu.readfirstlane(al.convert(tid // 64, al.u32))
         extent, num_tokens = al.amdgpu.readfirstlane(counts[0]), al.amdgpu.readfirstlane(counts[1])
         groups = (extent + 31) // 32
         quotient, remainder = groups // WORKERS, groups % WORKERS
@@ -201,15 +203,14 @@ def make_stage2_kernel(config: MoeConfig):
                     al.convert(tid, al.u32),
                 )
                 shared = al.view(storage, al.bf16, al.make_layout((4096, 2), (2, 1)))
-                m_lane, n_lane = tid // 32, tid % 32
-                for mr in al.static_range(4):
-                    row = m_lane + mr * 8
-                    row_offset = row_offsets[row]
-                    for nr in al.static_range(4):
-                        column = nr * 64 + n_lane * 2
-                        pair = row * 128 + column // 2
-                        offset = al.convert(row_offset + (tile * 256 + column) * 2, al.u32)
-                        al.amdgpu.raw_buffer_atomic_add_bf16x2(shared[pair], output_resource, offset)
+                for m in al.static_range(8):
+                    row = wave * 8 + m
+                    row_offset = al.amdgpu.readfirstlane(row_offsets[row])
+                    if row_offset < counts[1] * D * 2:
+                        offset = al.convert(row_offset + tile * 512 + lane * 4, al.u32)
+                        index = row * 128 + lane
+                        al.amdgpu.raw_buffer_atomic_add_bf16x2(shared[index], output_resource, offset)
+                        al.amdgpu.raw_buffer_atomic_add_bf16x2(shared[index + 64], output_resource, offset + 256)
             # Protect the shared arena before this worker takes its next route tile.
             al.syncthreads()
 
