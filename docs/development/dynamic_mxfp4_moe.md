@@ -16,6 +16,7 @@ Stage1 and Stage2 still support GPT-OSS, DSv3 and DSv4.
 - [moe][rocm] Use wave-uniform stage2 output writeback
 - [moe][rocm] Use an XOR LDS layout for stage2 C-shuffle
 - [moe][rocm] Cache the stage2 output bound after GEMM
+- [moe][python] Fuse AITER input quantization and scale sorting
 
 Each commit has numerical, graph-replay and four-scope timing evidence under
 ~/compare/local-moe-two-milestones-20260918.
