@@ -46,9 +46,6 @@ def make_stage2_compute(config):
             ki = al.convert(k, al.u32)
             prefetched, input_scale = prefetch_stage2_input(act, act_offset, input_valid, block, ki, lane, scale_base)
             lds[k % 2, input_row, vector ^ (input_row & 15)] = prefetched
-            al.amdgpu.s_waitcnt(0, 0, 0)
-            al.syncthreads()
-            read_stage2_input(storage, fragments, ki, lane)
             for half_k in al.static_range(2):
                 for n in al.static_range(4):
                     offset_w = (wave * 64 + n * 16) * (intermediate // 2) + half_k * 1024 + lane * 16
@@ -57,7 +54,8 @@ def make_stage2_compute(config):
                 weight_scales[n] = al.amdgpu.raw_buffer_load_x1(
                     scales, (wave * 2 + n) * intermediate + lane * 4, k * 256, 0
                 )
-            al.amdgpu.s_waitcnt(0, 0, 0)
+            al.syncthreads()
+            read_stage2_input(storage, fragments, ki, lane)
             for half_k in al.static_range(2):
                 for n in al.static_range(4):
                     for m in al.static_range(2):
@@ -178,13 +176,15 @@ def make_stage2_kernel(config):
                 output = al.make_tensor(out_ptr, al.bf16, al.make_layout((tokens * D,), (1,)))
                 output_resource = al.amdgpu.make_rsrc(output, tokens * D * 2)
                 pairs = al.view(storage, al.bf16, al.make_layout((4096, 2), (2, 1)))
-                for m in al.static_range(16):
-                    pair = m * 256 + tid
-                    row, column = pair // 128, pair % 128 * 2
-                    # Invalid rows start at the resource bound, so buffer atomics
-                    # discard them without rereading route IDs or branching per pair.
-                    offset = row_offsets[row] + tile * 512 + column * 2
-                    al.amdgpu.raw_buffer_atomic_add_bf16x2(pairs[pair], output_resource, offset)
+                m_lane, n_lane = tid // 32, tid % 32
+                for mr in al.static_range(4):
+                    row = m_lane + mr * 8
+                    row_offset = row_offsets[row]
+                    for nr in al.static_range(4):
+                        column = nr * 64 + n_lane * 2
+                        pair = row * 128 + column // 2
+                        offset = row_offset + (tile * 256 + column) * 2
+                        al.amdgpu.raw_buffer_atomic_add_bf16x2(pairs[pair], output_resource, offset)
             # Protect the shared arena before this worker takes another group.
             al.syncthreads()
 
