@@ -39,7 +39,30 @@ def make_w13_weight_loads(config):
                 offset_s = (wave_n * NS + n) * D + lane * 4 + projection * I * D // 32
                 scales[projection, n] = al.amdgpu.raw_buffer_load_x1(ws, offset_s, k * 256, 0)
 
-    return load_weights
+    @avelang.jit
+    def prefetch_weight_phase(
+        w: al.Tensor((4,), al.u32),
+        ws: al.Tensor((4,), al.u32),
+        values: al.Tensor((2, 2, NR, 4), al.u32),
+        scales: al.Tensor((2, NS), al.u32),
+        k: al.u32,
+        wave: al.u32,
+        lane: al.u32,
+        phase: al.u32,
+    ):
+        wave_n = wave % WN
+        if phase == 0:
+            for projection in al.static_range(2):
+                offset = wave_n * D + lane * 4 + projection * I * D // 32
+                scales[projection, 0] = al.amdgpu.raw_buffer_load_x1(ws, offset, k * 256, 0)
+        else:
+            for load in al.static_range(8):
+                if load // 3 + 1 == phase:
+                    projection, n, half_k = load % 2, (load // 2) % 2, load // 4
+                    offset = (wave_n * 32 + n * 16) * (D // 2) + lane * 16 + half_k * 1024 + projection * I * D // 2
+                    values[projection, half_k, n] = al.amdgpu.raw_buffer_load_x4(w, offset, k * 2048, CACHE)
+
+    return load_weights, prefetch_weight_phase
 
 
 @cache
