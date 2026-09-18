@@ -149,6 +149,14 @@ def _registered_2stage_implementations(hidden, intermediate):
 def resolve_2stage_implementation(config: MoeConfig):
     """Resolve a complete solution to its registered pair of kernel factories."""
     implementations = _registered_2stage_implementations(config.hidden, config.intermediate)
+    if config.use_route_reduce and (
+        config.hidden,
+        config.intermediate,
+        config.activation,
+        config.solution.bias_dtype,
+        config.stage2_tile_k,
+    ) != (3584, 384, ActivationFunction.SITU_V2, DataType.NONE, 128):
+        raise ValueError("route reduction requires the local Kimi K3 K128 implementation")
     try:
         return implementations[config.solution]
     except KeyError:
@@ -189,7 +197,7 @@ def available_2stage_solutions(
 
 
 @lru_cache(maxsize=2048)
-def _get_2stage_cfgs_cached(token, requested, arch, policy1, policy2, explicit):
+def _get_2stage_cfgs_cached(token, requested, arch, policy1, policy2, explicit, is_ep, route_reduce):
     kimi = (requested.hidden, requested.intermediate, requested.topk, requested.activation) == (
         3584,
         384,
@@ -237,7 +245,10 @@ def _get_2stage_cfgs_cached(token, requested, arch, policy1, policy2, explicit):
                 s.stage2_weight_load_policy != (policy2 if policy2 is not None else preferred2),
             ),
         )
-    return MoeConfig(selected, requested.experts, requested.topk)
+    reduce = kimi and token >= 8192 and (not is_ep) if route_reduce is None else route_reduce
+    if reduce and (is_ep or not kimi or selected.stage2_tile_k != 128):
+        raise ValueError("route reduction requires complete local Kimi K3 routing and K128 stage2")
+    return MoeConfig(selected, requested.experts, requested.topk, reduce)
 
 
 def get_2stage_cfgs(
@@ -257,6 +268,8 @@ def get_2stage_cfgs(
     weight_load_policy: WeightLoadPolicy | str | None = None,
     stage1_weight_load_policy: WeightLoadPolicy | str | None = None,
     stage2_weight_load_policy: WeightLoadPolicy | str | None = None,
+    is_ep: bool = False,
+    use_route_reduce: bool | None = None,
     solution_id: MoeSolutionId | int | None = None,
 ) -> MoeConfig:
     """Select one supported two-stage configuration for a problem.
@@ -278,10 +291,12 @@ def get_2stage_cfgs(
         if any(p is not None and p != common_policy for p in (policy1, policy2)):
             raise ValueError("common and stage-specific weight load policies conflict")
         policy1 = policy2 = common_policy
+    if type(is_ep) is not bool or (use_route_reduce is not None and type(use_route_reduce) is not bool):
+        raise TypeError("is_ep and use_route_reduce must be booleans")
     if solution_id is not None and (not isinstance(solution_id, MoeSolutionId)):
         solution_id = MoeSolutionId.from_int(solution_id)
     config = MoeConfig(requested, expert, topk)
-    return _get_2stage_cfgs_cached(token, config, arch, policy1, policy2, solution_id)
+    return _get_2stage_cfgs_cached(token, config, arch, policy1, policy2, solution_id, is_ep, use_route_reduce)
 
 
 get_2stage_cfgs.cache_clear = _get_2stage_cfgs_cached.cache_clear
