@@ -12,6 +12,8 @@ from .weight_mxfp4 import load_weight_fragment, make_w2_resources
 
 @cache
 def make_stage2_compute(config):
+    intermediate = config.intermediate
+    K_TILES = config.intermediate // 128
     BIAS = config.bias
     load_intermediate = make_stage2_input(config)
 
@@ -24,8 +26,6 @@ def make_stage2_compute(config):
         bias: al.Tensor((4,), al.u32),
         route_weights: al.Tensor((4,), al.u32),
         storage: al.Tensor((4096,), al.u32),
-        hidden: al.u32,
-        intermediate: al.u32,
         tokens: al.u32,
         block: al.u32,
         scale_base: al.u32,
@@ -38,7 +38,7 @@ def make_stage2_compute(config):
         input_scales = al.make_local((2,), al.u32)
         weights = al.make_local((4, 4), al.u32)
         weight_scales = al.make_local((4,), al.u32)
-        for k in al.range(intermediate // 128):
+        for k in al.static_range(K_TILES):
             ki = al.convert(k, al.u32)
             for m in al.static_range(2):
                 xv, xs = load_intermediate(
@@ -77,6 +77,7 @@ def make_stage2_compute(config):
 
 
 def make_stage2_kernel(config):
+    D, I = config.hidden, config.intermediate
     TOPK = config.topk
     initialize_w2_resources = make_w2_resources(config)
     stage2_compute = make_stage2_compute(config)
@@ -93,10 +94,7 @@ def make_stage2_kernel(config):
         counts: al.Tensor((2,), al.u32),
         out_ptr: al.Pointer(al.bf16),
         capacity: al.u32,
-        hidden_dim: al.u32,
-        intermediate_dim: al.u32,
     ):
-        D, I = hidden_dim, intermediate_dim
         tile, expert = al.convert(al.block_id(0), al.u32), al.convert(al.block_id(1), al.u32)
         tid = al.convert(al.thread_id(0), al.u32)
         wave, lane = al.amdgpu.readfirstlane(tid // 64), tid % 64
@@ -125,8 +123,6 @@ def make_stage2_kernel(config):
                     br,
                     rw_resource,
                     storage,
-                    D,
-                    I,
                     tokens,
                     group,
                     scale_base,

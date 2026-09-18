@@ -15,6 +15,8 @@ from .weight_mxfp4 import load_weight_fragment, make_w13_resources
 
 @cache
 def make_stage1_compute(config):
+    hidden, intermediate = config.hidden, config.intermediate
+    K_TILES = config.hidden // 128
     BM, BN, WORDS = config.stage1_tile_m, config.stage1_projection_n, config.stage1_lds_words
     MR, NR = BM // 16, BN // 64
     BIAS = config.bias
@@ -32,8 +34,6 @@ def make_stage1_compute(config):
         up_scales: al.Tensor((4,), al.u32),
         bias: al.Tensor((4,), al.u32),
         storage: al.Tensor((WORDS,), al.u32),
-        hidden: al.u32,
-        intermediate: al.u32,
         tokens: al.u32,
         block: al.u32,
         wave: al.u32,
@@ -44,7 +44,7 @@ def make_stage1_compute(config):
         input_scales = al.make_local((MR,), al.u32)
         weights = al.make_local((2, NR, 4), al.u32)
         weight_scales = al.make_local((2, NR), al.u32)
-        for k in al.range(hidden // 128):
+        for k in al.static_range(K_TILES):
             ki = al.convert(k, al.u32)
             for m in al.static_range(MR):
                 xv, xs = load_input_fragment(
@@ -93,6 +93,7 @@ def make_stage1_compute(config):
 
 
 def make_stage1_kernel(config):
+    D, I = config.hidden, config.intermediate
     E, TOPK = config.experts, config.topk
     BM, BN, WORDS = config.stage1_tile_m, config.stage1_projection_n, config.stage1_lds_words
     SLICES, SEGMENTS = BM // 8, BN // 128
@@ -112,10 +113,7 @@ def make_stage1_kernel(config):
         counts: al.Tensor((2,), al.u32),
         workspace_ptr: al.Pointer(al.u8),
         capacity: al.u32,
-        hidden_dim: al.u32,
-        intermediate_dim: al.u32,
     ):
-        D, I = hidden_dim, intermediate_dim
         extent, tokens = al.amdgpu.readfirstlane(counts[0]), al.amdgpu.readfirstlane(counts[1])
         tile, block = al.convert(al.block_id(0), al.u32), al.convert(al.block_id(1), al.u32)
         tid = al.convert(al.thread_id(0), al.u32)
@@ -137,7 +135,7 @@ def make_stage1_kernel(config):
         wu, su, _ = initialize_w13_resources(weight, ws, bias_ptr, expert, tile, D, I, al.convert(1, al.u32))
         storage = al.make_shared((WORDS,), al.u32)
         stage1_compute(
-            act_resource, scale_resource, route_resource, wg, sg, wu, su, bias, storage, D, I, tokens, block, wave, lane
+            act_resource, scale_resource, route_resource, wg, sg, wu, su, bias, storage, tokens, block, wave, lane
         )
         scale_base = capacity * I // 2
         workspace_bytes = scale_base + ((capacity + 255) // 256) * 256 * (I // 32)

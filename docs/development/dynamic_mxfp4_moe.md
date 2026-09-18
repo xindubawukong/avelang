@@ -1,6 +1,6 @@
 # Dynamic MXFP4 Local MoE: optimization history
 
-Current step 02: [moe][rocm] Use blocked MXFP4 weight scale layout.
+Current step 03: [moe][rocm] Make dim and inter_dim compile time constants.
 
 This prefix targets Petit dev-megamoe before d97fb857. The public local ID
 has one shared cache policy at bit40 and the Stage1 tile at bit41. Stage2 is

@@ -233,8 +233,6 @@ def dynamic_mxfp4_moe(
             routing.counts,
             workspace.intermediate,
             capacity,
-            d,
-            i,
             num_warps=config1.stage1_num_warps,
         )
         out.zero_()
@@ -249,8 +247,6 @@ def dynamic_mxfp4_moe(
             routing.counts,
             out,
             capacity,
-            d,
-            i,
             num_warps=config2.stage2_num_warps,
         )
         return out
