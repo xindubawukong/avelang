@@ -1,4 +1,4 @@
-"""Direct buffer-to-LDS copies into alternating linear Stage1 input tiles."""
+"""Direct buffer-to-LDS copies into alternating XOR-swizzled Stage1 input tiles."""
 
 from functools import cache
 
@@ -33,7 +33,7 @@ def make_mxfp4_input(config):
             token, slot = route & 0xFFFFFF, route >> 24
             offset = al.select(
                 token < tokens and slot < TOPK,
-                token * (D // 2) + k * 128 + vector * 16,
+                token * (D // 2) + k * 128 + (vector ^ (row & 7)) * 16,
                 al.convert(0xFFFFFFF0, al.u32),
             )
             destination = (k % 2 * STRIDE + wave * TB * 32 + load * 256) * 4
@@ -54,7 +54,9 @@ def make_mxfp4_input(config):
         lds = al.view(storage, al.u32, al.make_layout((2, BM, 8, 4), (STRIDE, 32, 4, 1)))
         for m in al.static_range(MR):
             for half_k in al.static_range(2):
-                fragments[m, half_k] = lds[k % 2, (wave // WN) * WM + m * 16 + lane % 16, lane // 16 + half_k * 4]
+                fragments[m, half_k] = lds[
+                    k % 2, (wave // WN) * WM + m * 16 + lane % 16, (lane // 16 + half_k * 4) ^ (lane & 7)
+                ]
         return storage[k % 2 * STRIDE + ACT_WORDS + (wave // WN) * 64 + lane]
 
     return prefetch_input, read_input

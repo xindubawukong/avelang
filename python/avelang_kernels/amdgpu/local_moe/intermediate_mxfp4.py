@@ -94,8 +94,8 @@ def make_stage2_input(config):
         if token < tokens and slot < TOPK:
             offset = (token * TOPK + slot) * (I // 2) + k * 128 + vector * 16
             values = al.amdgpu.raw_buffer_load_x4(act, offset, 0, 0)
-        lds = al.view(storage, al.u32, al.make_layout((2, 32, 8, 4), (1024, 32, 4, 1)))
-        lds[k % 2, row, vector] = values
+        lds = al.view(storage, al.u32, al.make_layout((2, 32, 16, 4), (2048, 64, 4, 1)))
+        lds[k % 2, row, vector ^ (row & 15)] = values
         scale = al.convert(0, al.u32)
         for byte in al.static_range(4):
             scale_row = block * 32 + lane % 16 + (byte % 2) * 16
@@ -111,9 +111,9 @@ def make_stage2_input(config):
         k: al.u32,
         lane: al.u32,
     ):
-        lds = al.view(storage, al.u32, al.make_layout((2, 32, 8, 4), (1024, 32, 4, 1)))
+        lds = al.view(storage, al.u32, al.make_layout((2, 32, 16, 4), (2048, 64, 4, 1)))
         for m in al.static_range(2):
             for half_k in al.static_range(2):
-                fragments[m, half_k] = lds[k % 2, m * 16 + lane % 16, lane // 16 + half_k * 4]
+                fragments[m, half_k] = lds[k % 2, m * 16 + lane % 16, (lane // 16 + half_k * 4) ^ (lane & 15)]
 
     return prefetch_stage2_input, read_stage2_input
