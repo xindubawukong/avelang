@@ -176,13 +176,15 @@ def make_stage2_kernel(config):
                 output = al.make_tensor(out_ptr, al.bf16, al.make_layout((tokens * D,), (1,)))
                 output_resource = al.amdgpu.make_rsrc(output, tokens * D * 2)
                 pairs = al.view(storage, al.bf16, al.make_layout((4096, 2), (2, 1)))
-                for m in al.static_range(16):
-                    pair = m * 256 + tid
-                    row, column = pair // 128, pair % 128 * 2
-                    # Invalid rows start at the resource bound, so buffer atomics
-                    # discard them without rereading route IDs or branching per pair.
-                    offset = row_offsets[row] + tile * 512 + column * 2
-                    al.amdgpu.raw_buffer_atomic_add_bf16x2(pairs[pair], output_resource, offset)
+                m_lane, n_lane = tid // 32, tid % 32
+                for mr in al.static_range(4):
+                    row = m_lane + mr * 8
+                    row_offset = row_offsets[row]
+                    for nr in al.static_range(4):
+                        column = nr * 64 + n_lane * 2
+                        pair = row * 128 + column // 2
+                        offset = row_offset + (tile * 256 + column) * 2
+                        al.amdgpu.raw_buffer_atomic_add_bf16x2(pairs[pair], output_resource, offset)
             # Protect the shared arena before this worker takes another group.
             al.syncthreads()
 
