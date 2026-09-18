@@ -16,6 +16,7 @@ from .dispatch import resolve_2stage_implementation
 from .intermediate_mxfp4 import make_stage2_input_k128, make_stage2_input_k256
 from .solutionid import DataType
 from .weight_mxfp4 import make_w2_k128_weight_loads, make_w2_resources
+from .workgroup import make_grouped_workgroup_mapping
 
 STAGE2_K256_ARENA_WORDS = 4096
 STAGE2_K256_LDS_WORDS = 4160
@@ -326,6 +327,7 @@ def _make_stage2_kernel_k128(config: MoeConfig):
     SC = config.scale_columns
     RATIO = config.stage1_tile_m // BM
     WORDS = BM * 128
+    map_workgroup = make_grouped_workgroup_mapping(D // 256, 2, 4)
     stage2_compute_k128 = make_stage2_compute_k128(I, BM, SC, config.stage2_weight_load_aux)
     initialize_w2_resources = make_w2_resources(D, I, E, SC)
 
@@ -347,7 +349,7 @@ def _make_stage2_kernel_k128(config: MoeConfig):
         groups = (counts[0] + BM - 1) // BM
         if bid >= groups * (D // 256):
             return
-        tile, block = (bid % (D // 256), bid // (D // 256))
+        tile, block = map_workgroup(bid, groups)
         tid = al.convert(al.thread_id(0), al.u32)
         experts = al.make_tensor(expert_ptr, al.u32, al.make_layout((capacity // (BM * RATIO),), (1,)))
         expert = al.amdgpu.readfirstlane(experts[block // RATIO])

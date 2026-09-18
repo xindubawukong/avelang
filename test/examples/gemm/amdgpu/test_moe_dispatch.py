@@ -250,6 +250,45 @@ def test_explicit_names_and_integer_codes_keep_the_same_solution():
     assert choose(bias_dtype=None) == choose(bias_dtype=DataType.NONE)
 
 
+def mapping_kernel(n_tiles, m_group, groups):
+    import avelang
+    import avelang.language as al
+    from avelang_kernels.amdgpu.local_moe.workgroup import make_grouped_workgroup_mapping
+
+    map_workgroup = make_grouped_workgroup_mapping(n_tiles, m_group, groups)
+    NT = n_tiles
+
+    @avelang.jit
+    def kernel(out: al.Pointer(al.u32), grid_m: al.u32):
+        bid = al.convert(al.block_id(0), al.u32)
+        result = al.make_tensor(out, al.u32, al.make_layout((grid_m * NT, 2), (2, 1)))
+        n, m = map_workgroup(bid, grid_m)
+        result[bid, 0] = n
+        result[bid, 1] = m
+
+    return kernel
+
+
+@pytest.mark.skipif(not torch.version.hip or not torch.cuda.is_available(), reason="Requires AMD GPU")
+@pytest.mark.parametrize("n_tiles,m_group,groups", [(3, 4, 8), (14, 2, 4)])
+def test_grouped_mapping_is_a_permutation_including_partial_groups(n_tiles, m_group, groups):
+    kernel = mapping_kernel(n_tiles, m_group, groups)
+    for grid_m in (1, 2, 3, 5, 7, 16, 17, 65):
+        output = torch.empty((grid_m * n_tiles, 2), dtype=torch.int32, device="cuda")
+        kernel[lambda grid_m=grid_m: ((grid_m * n_tiles, 1, 1), (1, 1, 1))](output, grid_m)
+        expected = []
+        blocks = grid_m * n_tiles
+        for block in range(blocks):
+            group = block % groups
+            remapped = group * (blocks // groups) + min(group, blocks % groups) + block // groups
+            first_m = remapped // (m_group * n_tiles) * m_group
+            height = min(grid_m - first_m, m_group)
+            within = remapped % (m_group * n_tiles)
+            expected.append((within // height, first_m + within % height))
+        assert len(set(expected)) == blocks
+        assert output.cpu().tolist() == [list(pair) for pair in expected]
+
+
 def test_kimi_basic_configuration():
     cfg = get_2stage_cfgs(8, 3584, 384, 896, 16, activation="situ", bias_dtype="none")
     assert cfg.activation == ActivationFunction.SITU_V2
