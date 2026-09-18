@@ -94,7 +94,7 @@ class MoeConfig:
 
     @property
     def stage1_lds_words(self) -> int:
-        return self.stage1_arena_words
+        return self.stage1_arena_words + 256
 
     @property
     def stage2_tile_m(self) -> int:

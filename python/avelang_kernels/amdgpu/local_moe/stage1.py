@@ -30,12 +30,11 @@ def make_stage1_compute(config):
     def stage1_compute(
         act: al.Tensor((4,), al.u32),
         scales: al.Tensor((4,), al.u32),
-        routes: al.Tensor((4,), al.u32),
         resource_w: al.Tensor((4,), al.u32),
         resource_ws: al.Tensor((4,), al.u32),
         bias: al.Tensor((4,), al.u32),
         storage: al.Tensor((WORDS,), al.u32),
-        tokens: al.u32,
+        input_offsets: al.Tensor((2,), al.u32),
         block: al.u32,
         wave: al.u32,
         lane: al.u32,
@@ -45,14 +44,15 @@ def make_stage1_compute(config):
         fragments = al.make_local((MR, 2, 4), al.u32)
         weights = al.make_local((2, 2, NR, 4), al.u32)
         weight_scales = al.make_local((2, NS), al.u32)
-        prefetch_input(act, scales, routes, storage, tokens, block, al.convert(0, al.u32), wave, lane)
+        input_scales = al.make_local((2,), al.u32)
+        prefetch_input(act, scales, storage, input_offsets, block, al.convert(0, al.u32), wave, lane)
         load_weights(resource_w, resource_ws, weights, weight_scales, al.convert(0, al.u32), wave, lane)
         al.amdgpu.s_waitcnt(0, 0, 0)
         al.syncthreads()
-        input_scale = read_input(storage, fragments, al.convert(0, al.u32), wave, lane)
+        read_input(storage, fragments, input_scales, al.convert(0, al.u32), wave, lane)
         for k in al.static_range(K_TILES):
             next_k = al.convert(k + 1, al.u32)
-            prefetch_input(act, scales, routes, storage, tokens, block, next_k, wave, lane)
+            prefetch_input(act, scales, storage, input_offsets, block, next_k, wave, lane)
             for projection in al.static_range(2):
                 for half_k in al.static_range(2):
                     for n in al.static_range(NR):
@@ -61,7 +61,7 @@ def make_stage1_compute(config):
                                 weights[projection, half_k, n],
                                 weight_scales[projection, n // 2],
                                 fragments[m, half_k],
-                                input_scale,
+                                input_scales[m // 2],
                                 accum[projection, n, m],
                                 2 * half_k + n % 2,
                                 2 * half_k + m,
@@ -71,7 +71,7 @@ def make_stage1_compute(config):
             al.amdgpu.s_waitcnt(0, 0, 0)
             al.syncthreads()
             if k + 1 < K_TILES:
-                input_scale = read_input(storage, fragments, next_k, wave, lane)
+                read_input(storage, fragments, input_scales, next_k, wave, lane)
         result = al.view(storage, al.f32, al.make_layout((BM, BN), (BN, 1)))
         for m in al.static_range(MR):
             for n in al.static_range(NR):
@@ -99,6 +99,7 @@ def make_stage1_kernel(config):
     E, TOPK = config.experts, config.topk
     BM, BN, WORDS = config.stage1_tile_m, config.stage1_projection_n, config.stage1_lds_words
     SLICES, SEGMENTS = BM // 8, BN // 128
+    ARENA, TB, INPUT_LOADS = config.stage1_arena_words, BM // 4, BM // 32
     initialize_w13_resources = make_w13_resources(D, I, E, BN, I)
     stage1_compute = make_stage1_compute(config)
     store_intermediate = make_intermediate_store()
@@ -137,15 +138,23 @@ def make_stage1_kernel(config):
             weight, ws, bias_ptr, expert, tile, al.convert(1, al.u32)
         )
         storage = al.make_shared((WORDS,), al.u32)
+        metadata_row = lane % TB + wave * TB + (lane // TB) * BM
+        storage[ARENA + metadata_row] = al.amdgpu.raw_buffer_load_x1(route_resource, metadata_row * 4, 0, 0)
+        input_offsets = al.make_local((2,), al.u32)
+        # Each wave reads the metadata rows it just published into LDS.
+        # Keep these source offsets in registers across all K iterations.
+        for load in al.static_range(INPUT_LOADS):
+            row = wave * TB + load * 8 + lane // 8
+            token = storage[ARENA + row] & 0xFFFFFF
+            input_offsets[load] = al.min(token, tokens) * (D // 2) + ((lane % 8) ^ (row & 7)) * 16
         stage1_compute(
             act_resource,
             scale_resource,
-            route_resource,
             resource_w,
             resource_ws,
             bias,
             storage,
-            tokens,
+            input_offsets,
             block,
             wave,
             lane,
@@ -157,7 +166,7 @@ def make_stage1_kernel(config):
         values = al.view(storage, al.f32, al.make_layout((BM, BN // 4, 4), (BN, 4, 1)))
         for batch in al.static_range(SLICES):
             row = batch * 8 + tid // 32
-            route = al.amdgpu.raw_buffer_load_x1(route_resource, row * 4, 0, 0)
+            route = storage[ARENA + row]
             token, slot = route & 0xFFFFFF, route >> 24
             if block * BM + row < extent and token < tokens and slot < TOPK:
                 for segment in al.static_range(SEGMENTS):
