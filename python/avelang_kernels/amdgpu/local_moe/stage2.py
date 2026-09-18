@@ -157,9 +157,14 @@ def _make_weighted_fragment_store(tile_m, words):
 
 @cache
 def make_stage2_compute_k128(intermediate, tile_m, scale_columns, weight_cache):
-    """K128 weight-A GEMM with synchronous per-tile input/weight loading."""
+    """Reuse resident-input LDS for XOR-swizzled BF16 [tile_m, 256] output.
+
+    The caller must synchronize before reading the output. Leaving that wait
+    outside lets the local wrapper prefetch route IDs before the barrier.
+    """
     I, BM, MR = (intermediate, tile_m, tile_m // 16)
-    KT, SC, SX, WORDS = (intermediate // 128, scale_columns, tile_m // 32, tile_m * 128)
+    KT, SC = (intermediate // 128, scale_columns)
+    SX, WORDS = (tile_m // 32, tile_m * 128)
     write_fragment = _make_weighted_fragment_store(BM, WORDS)
     prefetch_resident_input, read_resident_input, load_input_scales = make_stage2_input_k128(I, BM, SC)
     load_w2_values, load_w2_scales = make_w2_k128_weight_loads(I, SC, weight_cache)
@@ -189,31 +194,44 @@ def make_stage2_compute_k128(intermediate, tile_m, scale_columns, weight_cache):
         fragments = al.make_local((MR, 4), al.u32)
         route_weights = al.make_local((MR,), al.f32)
         prefetch_resident_input(act_resource, storage, block, wave, lane)
-        al.amdgpu.s_waitcnt(0, 0, 0)
+        load_w2_values(weight_resource, weights, al.convert(0, al.u32), wave, lane)
+        load_w2_scales(scale_resource, weight_scale_cache, weight_scales, al.convert(0, al.u32), wave, lane)
+        load_input_scales(act_resource, input_scale_cache, block, act_bytes, al.convert(0, al.u32), lane)
+        al.amdgpu.s_waitcnt(6 + SX, 0, 0)
         al.syncthreads()
         for k in al.static_range(KT):
             stage = k % 2
-            load_w2_values(weight_resource, weights, al.convert(k, al.u32), wave, lane)
-            load_w2_scales(scale_resource, weight_scale_cache, weight_scales, al.convert(k, al.u32), wave, lane)
-            for n in al.static_range(2):
-                weight_scales[stage, n] = weight_scale_cache[n] >> 16 * (k % 2)
-            if k % 2 == 0:
-                load_input_scales(act_resource, input_scale_cache, block, act_bytes, al.convert(k, al.u32), lane)
-            al.amdgpu.s_waitcnt(0, 0, 0)
-            read_resident_input(storage, fragments, al.convert(k, al.u32), lane)
             for m32 in al.static_range(SX):
                 input_scales[m32] = input_scale_cache[m32] >> 16 * (k % 2)
-            for n in al.static_range(4):
-                for m in al.static_range(MR):
-                    accum[n, m] = al.amdgpu.mfma_scale_16x16x128_fp4(
-                        weights[stage, n],
-                        weight_scales[stage, n // 2],
-                        fragments[m],
-                        input_scales[m // 2],
-                        accum[n, m],
-                        n % 2,
-                        m % 2,
+            if k % 2:
+                for n in al.static_range(2):
+                    weight_scales[stage, n] = weight_scale_cache[n] >> 16
+            read_resident_input(storage, fragments, al.convert(k, al.u32), lane)
+            if k + 1 < KT:
+                load_w2_values(weight_resource, weights, al.convert(k + 1, al.u32), wave, lane)
+                if (k + 1) % 2 == 0:
+                    load_w2_scales(
+                        scale_resource, weight_scale_cache, weight_scales, al.convert(k + 1, al.u32), wave, lane
                     )
+                    load_input_scales(
+                        act_resource, input_scale_cache, block, act_bytes, al.convert(k + 1, al.u32), lane
+                    )
+            al.amdgpu.sched_barrier(0)
+            al.amdgpu.s_setprio(1)
+            for n32 in al.static_range(2):
+                for m in al.static_range(MR):
+                    for n16 in al.static_range(2):
+                        accum[n32 * 2 + n16, m] = al.amdgpu.mfma_scale_16x16x128_fp4(
+                            weights[stage, n32 * 2 + n16],
+                            weight_scales[stage, n32],
+                            fragments[m],
+                            input_scales[m // 2],
+                            accum[n32 * 2 + n16, m],
+                            n16,
+                            m % 2,
+                        )
+            al.amdgpu.s_setprio(0)
+            al.amdgpu.sched_barrier(0)
         for m in al.static_range(MR):
             route_weights[m] = al.bitcast(
                 al.amdgpu.raw_buffer_load_x1(rw_resource, (m * 16 + lane % 16) * 4, 0, 0), al.f32
