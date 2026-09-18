@@ -46,9 +46,6 @@ def make_stage2_compute(config):
             ki = al.convert(k, al.u32)
             prefetched, input_scale = prefetch_stage2_input(act, act_offset, input_valid, block, ki, lane, scale_base)
             lds[k % 2, input_row, vector ^ (input_row & 15)] = prefetched
-            al.amdgpu.s_waitcnt(0, 0, 0)
-            al.syncthreads()
-            read_stage2_input(storage, fragments, ki, lane)
             for half_k in al.static_range(2):
                 for n in al.static_range(4):
                     offset_w = (wave * 64 + n * 16) * (intermediate // 2) + half_k * 1024 + lane * 16
@@ -57,7 +54,8 @@ def make_stage2_compute(config):
                 weight_scales[n] = al.amdgpu.raw_buffer_load_x1(
                     scales, (wave * 2 + n) * intermediate + lane * 4, k * 256, 0
                 )
-            al.amdgpu.s_waitcnt(0, 0, 0)
+            al.syncthreads()
+            read_stage2_input(storage, fragments, ki, lane)
             for half_k in al.static_range(2):
                 for n in al.static_range(4):
                     for m in al.static_range(2):
