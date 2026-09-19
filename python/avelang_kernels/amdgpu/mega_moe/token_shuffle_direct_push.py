@@ -20,7 +20,7 @@ def make_direct_push_token_shuffle(layout, threads, words):
     L1, WEIGHTS, META, READY = layout.l1_tokens, layout.l1_weights, layout.metadata, layout.l1_ready
     ENTRY, PLAN, DONE, PLAN_READY = layout.entry_count, layout.plan_base, layout.count_done, layout.plan_ready
     GATE, LAUNCH, HEADS, L2_READY = layout.epoch_gate, layout.launch_ready, layout.work_heads, layout.l2_ready
-    ITER = (E + threads - 1) // threads
+    WAVES, ITER = threads // 64, (E + threads - 1) // threads
     EXPERTS_PER_LANE = (LE + 63) // 64
 
     @avelang.jit
@@ -63,22 +63,37 @@ def make_direct_push_token_shuffle(layout, threads, words):
         wave: al.u32,
         lane: al.u32,
     ):
-        for ordinal in al.range(begin, end):
-            route = al.amdgpu.raw_buffer_load_x1(
-                resource, B + rank * SLOT + ROUTES + ((destination * LE + expert) * CAPACITY + ordinal) * 4, 0, 17
-            )
-            copy_row(
-                resource,
-                x,
-                rw,
-                destination,
-                pool + ordinal,
-                route,
-                rank,
-                tid,
-                al.convert(threads, al.u32),
-                tid == 0,
-            )
+        if end - begin >= WAVES * 2:
+            for ordinal in al.range(begin + wave, end, WAVES):
+                route = al.convert(0, al.u32)
+                if lane == 0:
+                    route = al.amdgpu.raw_buffer_load_x1(
+                        resource,
+                        B + rank * SLOT + ROUTES + ((destination * LE + expert) * CAPACITY + ordinal) * 4,
+                        0,
+                        17,
+                    )
+                route = al.amdgpu.readfirstlane(route)
+                copy_row(
+                    resource, x, rw, destination, pool + ordinal, route, rank, lane, al.convert(64, al.u32), lane == 0
+                )
+        else:
+            for ordinal in al.range(begin, end):
+                route = al.amdgpu.raw_buffer_load_x1(
+                    resource, B + rank * SLOT + ROUTES + ((destination * LE + expert) * CAPACITY + ordinal) * 4, 0, 17
+                )
+                copy_row(
+                    resource,
+                    x,
+                    rw,
+                    destination,
+                    pool + ordinal,
+                    route,
+                    rank,
+                    tid,
+                    al.convert(threads, al.u32),
+                    tid == 0,
+                )
         complete_stores()
         al.syncthreads()
         if tid == 0:
@@ -221,30 +236,60 @@ def make_direct_push_token_shuffle(layout, threads, words):
             if tid == 0:
                 wait_equal(resource, rank * C + PLAN_READY + (parity * R + dest) * 4, expected)
             al.syncthreads()
-            for task in al.range(slot, E, P):
-                expert = task // R
-                if tid == 0:
-                    scratch[0] = al.amdgpu.raw_buffer_load_x1(
-                        resource, B + rank * SLOT + SEND + (dest * LE + expert) * 8 + parity * 4, 0, 17
+            if P == 56:
+                if tid < LE:
+                    scratch[tid] = al.amdgpu.raw_buffer_load_x1(
+                        resource, B + rank * SLOT + SEND + (dest * LE + tid) * 8 + parity * 4, 0, 17
                     )
-                    scratch[1] = al.amdgpu.raw_buffer_load_x1(
-                        resource, rank * C + PLAN + (dest * LE + expert) * 8 + parity * 4, 0, 17
+                    scratch[E + tid] = al.amdgpu.raw_buffer_load_x1(
+                        resource, rank * C + PLAN + (dest * LE + tid) * 8 + parity * 4, 0, 17
                     )
                 al.syncthreads()
-                copy_rows(
-                    resource,
-                    x,
-                    rw,
-                    dest,
-                    expert,
-                    scratch[1],
-                    al.convert(0, al.u32),
-                    scratch[0],
-                    rank,
-                    tid,
-                    wave,
-                    lane,
-                )
+                for expert in al.range(LE):
+                    count, base = scratch[expert], scratch[E + expert]
+                    workers = al.select(count >= 64, al.convert(P // R, al.u32), al.convert(1, al.u32))
+                    worker = slot // R
+                    if workers > 1 or worker == expert % (P // R):
+                        part = al.select(workers == 1, al.convert(0, al.u32), worker)
+                        copy_rows(
+                            resource,
+                            x,
+                            rw,
+                            dest,
+                            al.convert(expert, al.u32),
+                            base,
+                            count * part // workers,
+                            count * (part + 1) // workers,
+                            rank,
+                            tid,
+                            wave,
+                            lane,
+                        )
+            else:
+                for task in al.range(slot, E, P):
+                    expert = task // R
+                    if tid == 0:
+                        scratch[0] = al.amdgpu.raw_buffer_load_x1(
+                            resource, B + rank * SLOT + SEND + (dest * LE + expert) * 8 + parity * 4, 0, 17
+                        )
+                        scratch[1] = al.amdgpu.raw_buffer_load_x1(
+                            resource, rank * C + PLAN + (dest * LE + expert) * 8 + parity * 4, 0, 17
+                        )
+                    al.syncthreads()
+                    copy_rows(
+                        resource,
+                        x,
+                        rw,
+                        dest,
+                        expert,
+                        scratch[1],
+                        al.convert(0, al.u32),
+                        scratch[0],
+                        rank,
+                        tid,
+                        wave,
+                        lane,
+                    )
         if tid == 0:
             wait_equal(resource, rank * C + PLAN_READY + (parity * R + rank) * 4, expected)
         al.syncthreads()

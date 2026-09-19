@@ -191,9 +191,7 @@ class MegaMoeWorkspace:
             self.memory, weights.w2, weights.s2, weights.bias2, rank, int(weights.bias2 is not None)
         )
         barrier[lambda: ((1, 1, 1), (64, 1, 1))](self.memory, rank, num_warps=1)
-        combine[lambda: ((config.max_tokens_per_rank, 1, 1), (256, 1, 1))](
-            self.memory, out, tokens, out.stride(0), rank
-        )
+        combine[lambda: ((128, 1, 1), (512, 1, 1))](self.memory, out, tokens, out.stride(0), rank, num_warps=8)
         barrier[lambda: ((1, 1, 1), (64, 1, 1))](self.memory, rank, num_warps=1)
         return out
 

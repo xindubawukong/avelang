@@ -1,4 +1,4 @@
-"""Combine source-owned route rows after a full cross-GPU handoff."""
+"""System publication and source-owned BF16 route reduction in FP32."""
 
 from functools import cache
 
@@ -9,36 +9,68 @@ from .workspace import WorkspaceLayout
 
 
 @cache
-def make_combine_kernel(config):
+def make_route_reduce(config, blocks, waves):
     layout = WorkspaceLayout(config)
-    D, K = config.solution.hidden, config.solution.topk
-    SIZE, B, SLOT, OUT = (
-        layout.workspace_bytes,
-        layout.rank_sym_buffer_base,
-        layout.rank_slot_bytes,
-        layout.route_output,
-    )
+    R, TOPK, D = config.solution.world_size, config.solution.topk, config.solution.hidden
+    B, SLOT, OUT = layout.rank_sym_buffer_base, layout.rank_slot_bytes, layout.route_output
+    VECS, BLOCKS, WAVES, TOTAL_WAVES = D // 8, blocks, waves, blocks * waves
 
     @avelang.jit
-    def combine(heap: al.Pointer(al.u8), out: al.Pointer(al.bf16), tokens: al.u32, stride: al.u32, rank: al.u32):
-        tid, token = al.convert(al.thread_id(0), al.u32), al.convert(al.block_id(0), al.u32)
+    def reduce_routes(
+        resource: al.Tensor((4,), al.u32),
+        out: al.Pointer(al.u32),
+        tokens: al.u32,
+        stride: al.u32,
+        rank: al.u32,
+        block: al.u32,
+        tid: al.u32,
+    ):
+        wave, lane = tid // 64, tid % 64
+        if tokens != 0:
+            global_wave = block * WAVES + wave
+            if R == 1 and tokens == 8:
+                global_wave = wave * BLOCKS + block
+            waves_per_token = (TOTAL_WAVES + tokens - 1) // tokens if R > 1 else (VECS + 63) // 64
+            vecs_per_wave = (VECS + waves_per_token - 1) // waves_per_token if R > 1 else al.convert(64, al.u32)
+            output = al.make_tensor(out, al.u32, al.make_layout((tokens, stride // 8, 4), (stride // 2, 4, 1)))
+            for task in al.range(global_wave, tokens * waves_per_token, TOTAL_WAVES):
+                token, wave_in_token = task // waves_per_token, task % waves_per_token
+                for vec_in_wave in al.range(lane, vecs_per_wave, 64):
+                    col = wave_in_token * vecs_per_wave + vec_in_wave
+                    if col < VECS:
+                        values = al.make_local((TOPK, 4), al.u32)
+                        for slot in al.static_range(TOPK):
+                            offset = al.amdgpu.readfirstlane(
+                                al.convert(B + rank * SLOT + OUT + (token * TOPK + slot) * D * 2, al.u32)
+                            )
+                            values[slot] = al.amdgpu.raw_buffer_load_x4(
+                                resource, al.convert(col * 16, al.u32), offset, 17
+                            )
+                        bf = al.view(values, al.bf16, al.make_layout((TOPK, 4, 2), (8, 2, 1)))
+                        accum = al.full((4, 2), 0, al.f32)
+                        for slot in al.static_range(TOPK):
+                            for pair in al.static_range(4):
+                                accum[pair] = accum[pair] + al.convert(bf[slot, pair], al.f32)
+                        result = al.make_local((4, 2), al.bf16)
+                        for pair in al.static_range(4):
+                            result[pair] = al.convert(accum[pair], al.bf16)
+                        packed = al.view(result, al.u32, al.make_layout((4,), (1,)))
+                        output[token, col] = packed
+
+    return reduce_routes
+
+
+@cache
+def make_combine_kernel(config):
+    layout = WorkspaceLayout(config)
+    SIZE = layout.workspace_bytes
+    reduce_routes = make_route_reduce(config, 128, 8)
+
+    @avelang.jit
+    def combine(heap: al.Pointer(al.u8), out: al.Pointer(al.u32), tokens: al.u32, stride: al.u32, rank: al.u32):
+        tid, block = al.convert(al.thread_id(0), al.u32), al.convert(al.block_id(0), al.u32)
         memory = al.make_tensor(heap, al.u8, al.make_layout((SIZE,), (1,)))
         resource = al.amdgpu.make_rsrc(memory, SIZE)
-        output = al.make_tensor(out, al.bf16, al.make_layout((tokens, D // 8, 8), (stride, 8, 1)))
-        if token < tokens:
-            for vector in al.range(tid, D // 8, 256):
-                accum = al.make_local((8,), al.f32)
-                for element in al.static_range(8):
-                    accum[element] = al.convert(0.0, al.f32)
-                packed = al.make_local((1, 4), al.u32)
-                values = al.view(packed, al.bf16, al.make_layout((1, 8), (8, 1)))
-                for route in al.static_range(K):
-                    packed[0] = al.amdgpu.raw_buffer_load_x4(
-                        resource, B + rank * SLOT + OUT + (token * K + route) * D * 2 + vector * 16, 0, 17
-                    )
-                    for element in al.static_range(8):
-                        accum[element] = accum[element] + al.convert(values[0, element], al.f32)
-                for element in al.static_range(8):
-                    output[token, vector, element] = al.convert(accum[element], al.bf16)
+        reduce_routes(resource, out, tokens, stride, rank, block, tid)
 
     return combine
