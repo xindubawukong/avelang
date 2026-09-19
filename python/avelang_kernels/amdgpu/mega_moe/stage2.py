@@ -33,7 +33,7 @@ def make_stage2(config):
         bias_enabled: al.u32,
     ):
         tid, logical = al.convert(al.thread_id(0), al.u32), al.convert(al.block_id(0), al.u32)
-        lane = tid % 64
+        wave, lane = al.amdgpu.readfirstlane(tid // 64), tid % 64
         memory = al.make_tensor(heap, al.u8, al.make_layout((SIZE,), (1,)))
         resource = al.amdgpu.make_rsrc(memory, SIZE)
         storage = al.make_shared((WORDS,), al.u32)
@@ -63,17 +63,31 @@ def make_stage2(config):
                     tile,
                     tid,
                 )
-                for word in al.static_range(16):
-                    linear = word * 256 + tid
-                    row, column = linear // 128, (linear % 128) * 2
-                    if row < rows and tile * 256 + column < LOGICAL:
+                for group in al.static_range(8):
+                    row = wave + group * 4
+                    if row < rows:
                         metadata = al.amdgpu.raw_buffer_load_x2(
                             resource, B + rank * SLOT + META + (pool + row) * 8, 0, 17
                         )
-                        route, source = metadata[0], metadata[1]
-                        value = storage[output_word_index(row, column)]
-                        offset = B + source * SLOT + OUT + route * LOGICAL * 2 + tile * 512 + column * 2
-                        al.amdgpu.raw_buffer_store_x1(value, resource, offset, 0, 17)
+                        route = al.amdgpu.readfirstlane(al.convert(metadata[0], al.u32))
+                        source = al.amdgpu.readfirstlane(al.convert(metadata[1], al.u32))
+                        row_view = al.subview(
+                            memory,
+                            (
+                                al.convert(source, al.u64) * SLOT
+                                + B
+                                + OUT
+                                + al.convert(route, al.u64) * (LOGICAL * 2),
+                            ),
+                            (LOGICAL * 2,),
+                            (1,),
+                        )
+                        output_resource = al.amdgpu.make_rsrc(row_view, LOGICAL * 2)
+                        for half in al.static_range(2):
+                            value = storage[output_word_index(row, (half * 64 + lane) * 2)]
+                            al.amdgpu.raw_buffer_store_x1(
+                                value, output_resource, tile * 512 + (half * 64 + lane) * 4, 0, 17
+                            )
                 al.amdgpu.fence(1, 2)
                 al.syncthreads()
                 logical = logical + 256
