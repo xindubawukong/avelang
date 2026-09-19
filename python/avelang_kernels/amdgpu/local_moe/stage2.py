@@ -25,7 +25,7 @@ STAGE2_K256_LDS_WORDS = 4160
 @avelang.jit
 def output_word_index(row: al.u32, column: al.u32) -> al.u32:
     """Map a BF16 column in the N256 output tile to an XOR-swizzled u32 word."""
-    return (row * 256 + column) // 2 ^ (row & 15) * 4
+    return ((row * 256 + column) // 2) ^ ((row & 15) * 4)
 
 
 @avelang.jit
@@ -36,6 +36,7 @@ def _pack_weighted_bf16_pair(first: al.f32, second: al.f32, route_weight: al.f32
     values[0, 1] = second * route_weight
     packed = al.make_local((1, 2), al.bf16)
     packed[0] = al.convert(values[0], al.bf16)
+    # Two BF16 values occupy one u32; a one-element view is scalar.
     word = al.view(packed, al.u32, al.make_layout((1,), (1,)))
     return word
 
@@ -43,7 +44,7 @@ def _pack_weighted_bf16_pair(first: al.f32, second: al.f32, route_weight: al.f32
 @cache
 def make_stage2_compute_k256(intermediate, bias, weight_cache, act_cache=0, words=STAGE2_K256_LDS_WORDS):
     """Write weighted BF16 [32, 256] output into swizzled LDS and synchronize."""
-    I, BIAS, K_TILES = (intermediate, bias, intermediate // 256)
+    I, BIAS, K_TILES = intermediate, bias, intermediate // 256
     prefetch_stage2_input, read_stage2_input = make_stage2_input_k256(words, act_cache)
 
     @avelang.jit
@@ -63,8 +64,8 @@ def make_stage2_compute_k256(intermediate, bias, weight_cache, act_cache=0, word
         tile: al.u32,
         tid: al.u32,
     ):
-        lane, wave = (tid % 64, al.amdgpu.readfirstlane(tid // 64))
-        input_row, vector = (tid // 8, tid % 8)
+        lane, wave = tid % 64, al.amdgpu.readfirstlane(tid // 64)
+        input_row, vector = tid // 8, tid % 8
         accum = al.full((4, 2, 4), 0, al.f32)
         lds = al.view(storage, al.u32, al.make_layout((2, 32, 16, 4), (2048, 64, 4, 1)))
         weights = al.make_local((2, 4, 4), al.u32)
@@ -77,13 +78,15 @@ def make_stage2_compute_k256(intermediate, bias, weight_cache, act_cache=0, word
             route_weights[m] = al.bitcast(bits, al.f32)
         if BIAS:
             for n in al.static_range(4):
-                offset = (tile * 256 + wave * 64 + n * 4 + lane // 16 * 16) * 2
+                offset = (tile * 256 + wave * 64 + n * 4 + (lane // 16) * 16) * 2
                 packed_bias[n] = al.amdgpu.raw_buffer_load_x2(bias_resource, offset, 0, 0)
         for k in al.static_range(K_TILES):
             stage = k % 2
             prefetched, scale = prefetch_stage2_input(
                 act_resource, act_offset, act_base, scale_offset, scale_base, input_valid, al.convert(k, al.u32)
             )
+            # Keep the weight issue group next to the LDS handoff/MFMA loop.
+            # A bulk-load helper changed allocation/scheduling and slowed DSv4 EP8.
             for half_k in al.static_range(2):
                 for n in al.static_range(4):
                     offset_w = (wave * 64 + n * 16) * (I // 2) + half_k * 1024 + lane * 16
@@ -92,7 +95,7 @@ def make_stage2_compute_k256(intermediate, bias, weight_cache, act_cache=0, word
                 weight_scales[n] = al.amdgpu.raw_buffer_load_x1(
                     scale_resource, (wave * 2 + n) * I + lane * 4, k * 256, 0
                 )
-            lds[stage, input_row, vector ^ input_row & 15] = prefetched
+            lds[stage, input_row, vector ^ (input_row & 15)] = prefetched
             al.syncthreads()
             read_stage2_input(storage, fragments, al.convert(k, al.u32), lane)
             for half_k in al.static_range(2):
@@ -108,6 +111,8 @@ def make_stage2_compute_k256(intermediate, bias, weight_cache, act_cache=0, word
                             2 * half_k + m,
                         )
         al.syncthreads()
+        # Keep accumulator traversal here. Passing the entire tile to a helper
+        # raised GPT-OSS VGPR usage from 128 to 132 and regressed Stage2 timing.
         bias_values = al.view(packed_bias, al.bf16, al.make_layout((4, 4), (4, 1)))
         pairs = al.make_local((2,), al.u32)
         for m in al.static_range(2):
@@ -115,12 +120,12 @@ def make_stage2_compute_k256(intermediate, bias, weight_cache, act_cache=0, word
             if row < work_m:
                 for n in al.static_range(4):
                     for pair in al.static_range(2):
-                        first, second = (accum[n, m, pair * 2], accum[n, m, pair * 2 + 1])
+                        first, second = accum[n, m, pair * 2], accum[n, m, pair * 2 + 1]
                         if BIAS:
                             first = first + al.convert(bias_values[n, pair * 2], al.f32)
                             second = second + al.convert(bias_values[n, pair * 2 + 1], al.f32)
                         pairs[pair] = _pack_weighted_bf16_pair(first, second, route_weights[m])
-                    index = output_word_index(row, wave * 64 + n * 16 + lane // 16 * 4)
+                    index = output_word_index(row, wave * 64 + n * 16 + (lane // 16) * 4)
                     storage[index] = pairs[0]
                     storage[index + 1] = pairs[1]
         al.syncthreads()
@@ -131,7 +136,7 @@ def make_stage2_compute_k256(intermediate, bias, weight_cache, act_cache=0, word
 @cache
 def _make_weighted_fragment_store(tile_m, words):
     """Pack four adjacent BF16 columns and write one XOR-swizzled LDS row."""
-    BM, MR, WORDS = (tile_m, tile_m // 16, words)
+    BM, MR, WORDS = tile_m, tile_m // 16, words
 
     @avelang.jit
     def write_fragment(
@@ -147,9 +152,13 @@ def _make_weighted_fragment_store(tile_m, words):
         packed = al.view(pairs, al.u64, al.make_layout((1,), (1,)))
         for m in al.static_range(MR):
             for pair in al.static_range(2):
-                pairs[0, pair] = _pack_weighted_bf16_pair(accum[m, pair * 2], accum[m, pair * 2 + 1], route_weights[m])
+                pairs[0, pair] = _pack_weighted_bf16_pair(
+                    accum[m, pair * 2],
+                    accum[m, pair * 2 + 1],
+                    route_weights[m],
+                )
             row = m * 16 + lane % 16
-            index = output_word_index(row, wave * 64 + n * 16 + lane // 16 * 4)
+            index = output_word_index(row, wave * 64 + n * 16 + (lane // 16) * 4)
             shared[index // 2] = packed
 
     return write_fragment
@@ -162,9 +171,9 @@ def make_stage2_compute_k128(intermediate, tile_m, scale_columns, weight_cache):
     The caller must synchronize before reading the output. Leaving that wait
     outside lets the local wrapper prefetch route IDs before the barrier.
     """
-    I, BM, MR = (intermediate, tile_m, tile_m // 16)
-    KT, SC = (intermediate // 128, scale_columns)
-    SX, WORDS = (tile_m // 32, tile_m * 128)
+    I, BM, MR = intermediate, tile_m, tile_m // 16
+    KT, SC = intermediate // 128, scale_columns
+    SX, WORDS = tile_m // 32, tile_m * 128
     write_fragment = _make_weighted_fragment_store(BM, WORDS)
     prefetch_resident_input, read_resident_input, load_input_scales = make_stage2_input_k128(I, BM, SC)
     load_w2_values, load_w2_scales = make_w2_k128_weight_loads(I, SC, weight_cache)
@@ -180,7 +189,7 @@ def make_stage2_compute_k128(intermediate, tile_m, scale_columns, weight_cache):
         act_bytes: al.u32,
         tid: al.u32,
     ):
-        lane, wave = (tid % 64, al.amdgpu.readfirstlane(tid // 64))
+        lane, wave = tid % 64, al.amdgpu.readfirstlane(tid // 64)
         accum = al.make_local((4, MR, 4), al.f32)
         for n in al.static_range(4):
             for m in al.static_range(MR):
@@ -193,6 +202,8 @@ def make_stage2_compute_k128(intermediate, tile_m, scale_columns, weight_cache):
         input_scales = al.make_local((2,), al.u32)
         fragments = al.make_local((MR, 4), al.u32)
         route_weights = al.make_local((MR,), al.f32)
+        # DMA the complete I range once; the compact tiles remain resident
+        # until the last MFMA cluster reuses the arena for the C-shuffle.
         prefetch_resident_input(act_resource, storage, block, wave, lane)
         load_w2_values(weight_resource, weights, al.convert(0, al.u32), wave, lane)
         load_w2_scales(scale_resource, weight_scale_cache, weight_scales, al.convert(0, al.u32), wave, lane)
@@ -202,7 +213,7 @@ def make_stage2_compute_k128(intermediate, tile_m, scale_columns, weight_cache):
         for k in al.static_range(KT):
             stage = k % 2
             for m32 in al.static_range(SX):
-                input_scales[m32] = input_scale_cache[m32] >> 16 * (k % 2)
+                input_scales[m32] = input_scale_cache[m32] >> (16 * (k % 2))
             if k % 2:
                 for n in al.static_range(2):
                     weight_scales[stage, n] = weight_scale_cache[n] >> 16
@@ -224,6 +235,7 @@ def make_stage2_compute_k128(intermediate, tile_m, scale_columns, weight_cache):
             al.amdgpu.sched_barrier(0)
             al.amdgpu.s_setprio(1)
             if k + 1 == KT:
+                # Store the preceding N fragment while the next one computes.
                 for n in al.static_range(4):
                     for m in al.static_range(MR):
                         accum[n, m] = al.amdgpu.mfma_scale_16x16x128_fp4(
@@ -261,12 +273,12 @@ def make_stage2_kernel(config: MoeConfig):
     """Build the local Stage2 kernel for the selected K256 or K128 pipeline."""
     if config.stage2_tile_k == 128:
         return _make_stage2_kernel_k128(config)
-    D, I, E, TOPK = (config.hidden, config.intermediate, config.experts, config.topk)
+    D, I, E, TOPK = config.hidden, config.intermediate, config.experts, config.topk
     BIAS = config.solution.bias_dtype == DataType.BF16
     WORKERS = config.stage2_workers
     WEIGHT_CACHE = config.stage2_weight_load_aux
     RATIO = config.stage1_tile_m // 32
-    WORDS, ROW_OFFSETS = (STAGE2_K256_LDS_WORDS, STAGE2_K256_ARENA_WORDS)
+    WORDS, ROW_OFFSETS = STAGE2_K256_LDS_WORDS, STAGE2_K256_ARENA_WORDS
     stage2_compute_k256 = make_stage2_compute_k256(I, BIAS, WEIGHT_CACHE)
     initialize_w2_resources = make_w2_resources(D, I, E, I // 32)
 
@@ -283,12 +295,12 @@ def make_stage2_kernel(config: MoeConfig):
         out_ptr: al.Pointer(al.bf16),
         capacity: al.u32,
     ):
-        tile, worker = (al.block_id(0), al.block_id(1))
+        tile, worker = al.block_id(0), al.block_id(1)
         tid = al.thread_id(0)
         lane = tid % 64
         wave = al.amdgpu.readfirstlane(al.convert(tid // 64, al.u32))
         groups = (counts[0] + 31) // 32
-        quotient, remainder = (groups // WORKERS, groups % WORKERS)
+        quotient, remainder = groups // WORKERS, groups % WORKERS
         begin = worker * quotient + al.min(worker, remainder)
         assigned = quotient + al.select(worker < remainder, al.convert(1, al.u32), al.convert(0, al.u32))
         for block in al.range(begin, begin + assigned):
@@ -298,7 +310,7 @@ def make_stage2_kernel(config: MoeConfig):
                 routes = al.make_tensor(ids_ptr, al.u32, al.make_layout((capacity,), (1,)))
                 route_weights = al.make_tensor(route_weight_ptr, al.f32, al.make_layout((capacity,), (1,)))
                 act_bytes = capacity * I // 2
-                workspace_bytes = act_bytes + (capacity + 255) // 256 * 256 * (I // 32)
+                workspace_bytes = act_bytes + ((capacity + 255) // 256) * 256 * (I // 32)
                 workspace = al.make_tensor(workspace_ptr, al.u8, al.make_layout((workspace_bytes,), (1,)))
                 act_resource = al.amdgpu.make_rsrc(workspace, workspace_bytes)
                 weight_resource, scale_resource, bias_resource = initialize_w2_resources(
@@ -310,15 +322,16 @@ def make_stage2_kernel(config: MoeConfig):
                 rw_view = al.subview(route_weights, (block * 32,), (32,), (1,))
                 route_resource = al.amdgpu.make_rsrc(r_view, 128)
                 rw_resource = al.amdgpu.make_rsrc(rw_view, 128)
+
                 storage = al.make_shared((WORDS,), al.u32)
                 row_offsets = al.subview(storage, (ROW_OFFSETS,), (32,), (1,))
-                input_row, vector = (tid // 8, tid % 8)
+                input_row, vector = tid // 8, tid % 8
                 route = al.amdgpu.raw_buffer_load_x1(route_resource, al.convert(input_row * 4, al.u32), 0, 0)
-                token, slot = (route & 16777215, route >> 24)
+                token, slot = route & 0xFFFFFF, route >> 24
                 valid = token < counts[1] and slot < TOPK
                 if tid < 32:
                     metadata_route = al.amdgpu.raw_buffer_load_x1(route_resource, al.convert(tid * 4, al.u32), 0, 0)
-                    metadata_token, metadata_slot = (metadata_route & 16777215, metadata_route >> 24)
+                    metadata_token, metadata_slot = metadata_route & 0xFFFFFF, metadata_route >> 24
                     row_offsets[tid] = al.select(
                         metadata_token < counts[1] and metadata_slot < TOPK, metadata_token * D * 2, counts[1] * D * 2
                     )
@@ -339,22 +352,27 @@ def make_stage2_kernel(config: MoeConfig):
                     al.convert(tid, al.u32),
                 )
                 shared = al.view(storage, al.bf16, al.make_layout((4096, 2), (2, 1)))
+                # Counts are invariant during this kernel. Snapshot the bound
+                # here so each atomic row does not reload counts and wait on VMEM.
+                # Keeping its lifetime after the GEMM also avoids increasing VGPRs.
                 output_bytes = al.amdgpu.readfirstlane(counts[1]) * D * 2
                 for m in al.static_range(8):
                     row = wave * 8 + m
                     row_offset = al.amdgpu.readfirstlane(row_offsets[row])
+                    # Skip invalid output rows.
                     if row_offset < output_bytes:
                         offset = al.convert(row_offset + tile * 512 + lane * 4, al.u32)
                         index = output_word_index(row, lane * 2)
                         al.amdgpu.raw_buffer_atomic_add_bf16x2(shared[index], output_resource, offset)
                         al.amdgpu.raw_buffer_atomic_add_bf16x2(shared[index + 64], output_resource, offset + 256)
+            # Protect the shared arena before this worker takes its next route tile.
             al.syncthreads()
 
     return stage2
 
 
 def _make_stage2_kernel_k128(config: MoeConfig):
-    D, I, E, TOPK = (config.hidden, config.intermediate, config.experts, config.topk)
+    D, I, E, TOPK = config.hidden, config.intermediate, config.experts, config.topk
     BM = config.stage2_tile_m
     OUTPUT_CHUNKS = BM // 8
     SC = config.scale_columns
@@ -390,7 +408,7 @@ def _make_stage2_kernel_k128(config: MoeConfig):
         if expert >= E:
             return
         act_bytes = capacity * I // 2
-        workspace_bytes = act_bytes + (capacity + 255) // 256 * 256 * SC
+        workspace_bytes = act_bytes + ((capacity + 255) // 256) * 256 * SC
         workspace = al.make_tensor(workspace_ptr, al.u8, al.make_layout((workspace_bytes,), (1,)))
         act_resource = al.amdgpu.make_rsrc(workspace, workspace_bytes)
         weight_resource, scale_resource, _ = initialize_w2_resources(
@@ -418,9 +436,9 @@ def _make_stage2_kernel_k128(config: MoeConfig):
         for chunk in al.static_range(OUTPUT_CHUNKS):
             row = chunk * 8 + tid // 32
             packed_token = output_routes[chunk]
-            token, slot = (packed_token & 16777215, packed_token >> 24)
+            token, slot = packed_token & 0xFFFFFF, packed_token >> 24
             if token < tokens and slot < TOPK:
-                offset = al.convert(token * D * 2 + tile * 512 + tid % 32 * 4, al.u32)
+                offset = al.convert(token * D * 2 + tile * 512 + (tid % 32) * 4, al.u32)
                 for n in al.static_range(4):
                     index = output_word_index(row, (n * 32 + tid % 32) * 2)
                     if ROUTE_OUTPUT:

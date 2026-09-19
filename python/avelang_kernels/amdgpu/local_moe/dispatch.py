@@ -6,7 +6,14 @@ from functools import lru_cache
 import torch
 
 from .config import MoeConfig
-from .solutionid import ActivationFunction, DataType, MoeSolutionId, Stage1TileShape, Stage2TileShape, WeightLoadPolicy
+from .solutionid import (
+    ActivationFunction,
+    DataType,
+    MoeSolutionId,
+    Stage1TileShape,
+    Stage2TileShape,
+    WeightLoadPolicy,
+)
 
 
 def _normalize_activation(value) -> ActivationFunction:
@@ -37,11 +44,12 @@ def _normalize_data_type(value) -> DataType:
     if isinstance(value, Enum):
         value = value.name
     elif isinstance(value, torch.dtype):
-        value = str(value)
+        value = str(value)  # torch.bfloat16, torch.uint8, etc.
     if isinstance(value, str):
         name = value.removeprefix("torch.").lower()
         if name == "bfloat16":
             return DataType.BF16
+        # This interface uses uint8/FP4x2 containers for packed MXFP4 values.
         if name in ("uint8", "fp4x2", "float4_e2m1fn_x2"):
             return DataType.MXFP4
         try:
@@ -89,9 +97,11 @@ def _normalize_request(model_dim, inter_dim, activation, bias_dtype, dtype, q_dt
         act_dtype=_normalize_data_type(q_dtype_a),
         weight_dtype=_normalize_data_type(q_dtype_w),
     )
-    return (solution, arch)
+    return solution, arch
 
 
+# These fields describe the caller's operation and input layout. Tile, MFMA
+# and buffering choices belong to the selected implementation.
 _OPERATION_FIELDS = (
     "hidden",
     "intermediate",
@@ -105,6 +115,7 @@ _OPERATION_FIELDS = (
 
 @lru_cache(maxsize=2048)
 def _registered_2stage_implementations(hidden, intermediate):
+    # Keep the concrete factories lazy so they can call the public resolver.
     from .stage1 import make_stage1_kernel
     from .stage2 import make_stage2_kernel
 
@@ -227,7 +238,7 @@ def _get_2stage_cfgs_cached(token, requested, arch, policy1, policy2, explicit, 
                 if token * requested.topk // requested.experts < 64
                 else WeightLoadPolicy.CACHED
             )
-            s1_shape, s2_shape = (Stage1TileShape.M32_N256, Stage2TileShape.M32_N256_K256)
+            s1_shape, s2_shape = Stage1TileShape.M32_N256, Stage2TileShape.M32_N256_K256
         matches = tuple(
             s
             for s in candidates
@@ -245,7 +256,7 @@ def _get_2stage_cfgs_cached(token, requested, arch, policy1, policy2, explicit, 
                 s.stage2_weight_load_policy != (policy2 if policy2 is not None else preferred2),
             ),
         )
-    reduce = kimi and token >= 8192 and (not is_ep) if route_reduce is None else route_reduce
+    reduce = kimi and token >= 8192 and not is_ep if route_reduce is None else route_reduce
     if reduce and (is_ep or not kimi or selected.stage2_tile_k != 128):
         raise ValueError("route reduction requires complete local Kimi K3 routing and K128 stage2")
     return MoeConfig(selected, requested.experts, requested.topk, reduce)
@@ -293,8 +304,10 @@ def get_2stage_cfgs(
         policy1 = policy2 = common_policy
     if type(is_ep) is not bool or (use_route_reduce is not None and type(use_route_reduce) is not bool):
         raise TypeError("is_ep and use_route_reduce must be booleans")
-    if solution_id is not None and (not isinstance(solution_id, MoeSolutionId)):
+    if solution_id is not None and not isinstance(solution_id, MoeSolutionId):
         solution_id = MoeSolutionId.from_int(solution_id)
+    # Validate non-encoded parameters before cache lookup too: bool/int keys
+    # compare equal in Python, so invalid inputs must not reuse valid entries.
     config = MoeConfig(requested, expert, topk)
     return _get_2stage_cfgs_cached(token, config, arch, policy1, policy2, solution_id, is_ep, use_route_reduce)
 

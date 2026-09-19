@@ -12,6 +12,8 @@ class MoeConfig:
     experts: int
     topk: int
     use_route_reduce: bool = False
+
+    # Fixed launch geometry for the current local implementations.
     stage2_workers: ClassVar[int] = 256
     stage1_num_warps: ClassVar[int] = 4
     stage2_num_warps: ClassVar[int] = 4

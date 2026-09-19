@@ -28,7 +28,7 @@ def situ_v2_exponents(gate: al.f32, up: al.f32) -> (al.f32, al.f32):
     """Independent exponentials that Stage1 can issue across its whole tile."""
     eg = al.exp2(al.abs(gate) * al.convert(-0.7213475204444817, al.f32))
     eu = al.exp2(al.abs(up) * al.convert(-0.11541560327111708, al.f32))
-    return (eg, eu)
+    return eg, eu
 
 
 @avelang.jit
@@ -37,6 +37,8 @@ def situ_v2_finish(gate: al.f32, up: al.f32, eg: al.f32, eu: al.f32) -> al.f32:
     eg2 = eg * eg
     one = al.convert(1.0, al.f32)
     numerator = (one - eg) * (one - eu)
+    # HIP contracts eg*eg + 1 in Petit's denominator. Preserve that single
+    # rounding explicitly; a one-ulp difference can cross an FP4 midpoint.
     denominator = (one + eg) * al.fma(eg, eg, one) * (one + eu)
     positive = al.convert(100.0, al.f32) * numerator * al.amdgpu.rcp(denominator)
     gated = al.select(gate > al.convert(0.0, al.f32), positive, -positive * eg2)

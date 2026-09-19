@@ -14,11 +14,11 @@ def make_mxfp4_input(config):
     Scale words follow each stage's act. Each u32 packs four E8M0 scales.
     """
     D = config.compute_hidden
-    BM, WN, WM = (config.stage1_tile_m, config.stage1_warps_n, config.stage1_wave_m)
-    KG, MR = (config.stage1_k_groups, WM // 16)
-    SX, TB = (WM // 32, BM // 4)
-    LOADS, WORDS = (BM // 32, config.stage1_lds_words)
-    STRIDE, ACT_WORDS = (config.stage1_input_stage_words, KG * BM * 32)
+    BM, WN, WM = config.stage1_tile_m, config.stage1_warps_n, config.stage1_wave_m
+    KG, MR = config.stage1_k_groups, WM // 16
+    SX, TB = WM // 32, BM // 4
+    LOADS, WORDS = BM // 32, config.stage1_lds_words
+    STRIDE, ACT_WORDS = config.stage1_input_stage_words, KG * BM * 32
 
     @avelang.jit
     def prefetch_input(
@@ -37,6 +37,8 @@ def make_mxfp4_input(config):
                 offset = input_offsets[load] + group * (D // KG // 2) + k * 128
                 destination = (stage * STRIDE + group * BM * 32 + wave * TB * 32 + load * 256) * 4
                 al.amdgpu.raw_buffer_load_x4_lds(act_resource, storage, 16, offset, 0, destination, 0)
+        # Match the source pipeline: all act copies precede scale copies.
+        # A single wave guard avoids splitting the K2 act path in two.
         if wave < BM // 32:
             for group in al.static_range(KG):
                 offset_s = ((block * (BM // 32) + wave) * (D // 256) + k + group * (D // KG // 256)) * 256 + lane * 4
@@ -59,8 +61,8 @@ def make_mxfp4_input(config):
         for m in al.static_range(MR):
             for half_k in al.static_range(2):
                 row = wave_m * WM + m * 16 + lane % 16
-                fragments[m, half_k] = lds[stage, group, row, lane // 16 + half_k * 4 ^ row & 7]
+                fragments[m, half_k] = lds[stage, group, row, (lane // 16 + half_k * 4) ^ (row & 7)]
         for m32 in al.static_range(SX):
             scales[m32] = storage[stage * STRIDE + ACT_WORDS + (group * (BM // 32) + wave_m * SX + m32) * 64 + lane]
 
-    return (prefetch_input, read_input)
+    return prefetch_input, read_input

@@ -30,7 +30,7 @@ class Routing:
 
 def _pack_weights(values: torch.Tensor, scales: torch.Tensor):
     """Pack E2M1 bytes [E,N,K/2] and E8M0 scales [E,N,K/32]."""
-    if values.ndim != 3 or values.dtype != torch.uint8 or (not values.is_contiguous()):
+    if values.ndim != 3 or values.dtype != torch.uint8 or not values.is_contiguous():
         raise ValueError("weights must be contiguous uint8 [experts, N, K/2]")
     experts, n, half_k = values.shape
     k = 2 * half_k
@@ -40,7 +40,7 @@ def _pack_weights(values: torch.Tensor, scales: torch.Tensor):
         scales.shape != (experts, n, k // 32)
         or scales.dtype != torch.uint8
         or scales.device != values.device
-        or (not scales.is_contiguous())
+        or not scales.is_contiguous()
     ):
         raise ValueError("weight scales must be contiguous uint8 [experts, N, K/32] on the same device")
     if k % 256:
@@ -48,15 +48,16 @@ def _pack_weights(values: torch.Tensor, scales: torch.Tensor):
         padded[..., : k // 32] = scales
         scales = padded
     words = values.view(torch.int32).reshape(experts, n // 16, 16, k // 128, 4, 4)
+    # [expert, N16 tile, K128 tile, K32 lane group, N lane, register]
     words = words.permute(0, 1, 3, 4, 2, 5).contiguous().view(experts, n // 16, k // 128, 4, 16, 4)
     tiled_scales = scales.reshape(experts, n // 32, 2, 16, ceildiv(k, 256), 2, 4)
     tiled_scales = tiled_scales.permute(0, 1, 4, 6, 3, 5, 2).contiguous()
-    return (words.view(torch.uint8).reshape_as(values), tiled_scales.reshape_as(scales))
+    return words.view(torch.uint8).reshape_as(values), tiled_scales.reshape_as(scales)
 
 
 def _pack_bias(bias: torch.Tensor) -> torch.Tensor:
     """Preserve the Petit bias ordering used with weight-as-A MFMA."""
-    if bias.dtype != torch.bfloat16 or bias.ndim not in (2, 3) or (not bias.is_contiguous()):
+    if bias.dtype != torch.bfloat16 or bias.ndim not in (2, 3) or not bias.is_contiguous():
         raise ValueError("bias must be contiguous BF16 [E,N] or [E,2,N]")
     if bias.shape[-1] % 256:
         raise ValueError("bias columns must be divisible by 256")
@@ -119,7 +120,7 @@ class MoeWorkspace:
 def prepare_input(x: torch.Tensor, routing: Routing, config: MoeConfig, workspace: MoeWorkspace):
     """Run AITER input quantization/sorting into caller-owned buffers."""
     tokens, columns = x.shape
-    act, per_token, scales = (workspace.input_act, workspace.input_scales, workspace.sorted_scales)
+    act, per_token, scales = workspace.input_act, workspace.input_scales, workspace.sorted_scales
     for tensor, shape in (
         (act, (tokens, columns // 2)),
         (per_token, (tokens, columns // 32)),
@@ -129,12 +130,18 @@ def prepare_input(x: torch.Tensor, routing: Routing, config: MoeConfig, workspac
             tensor.shape != shape
             or tensor.dtype != torch.uint8
             or tensor.device != x.device
-            or (not tensor.is_contiguous())
+            or not tensor.is_contiguous()
         ):
             raise ValueError("input-preparation workspace has incompatible shape, dtype, device or strides")
     if not tokens:
-        return (act, scales)
-    from aiter.ops.quant import dynamic_per_group_scaled_quant, fused_dynamic_mx_quant_moe_sort_hip, mxfp4_moe_sort_hip
+        return act, scales
+
+    # Keep AITER a dependency of BF16 input preparation, not kernel imports.
+    from aiter.ops.quant import (
+        dynamic_per_group_scaled_quant,
+        fused_dynamic_mx_quant_moe_sort_hip,
+        mxfp4_moe_sort_hip,
+    )
 
     sorted_scales = scales.view(routing.capacity, columns // 32)
     if tokens <= 2048 // config.topk:
@@ -144,7 +151,7 @@ def prepare_input(x: torch.Tensor, routing: Routing, config: MoeConfig, workspac
     else:
         dynamic_per_group_scaled_quant(act, x, per_token, 32, shuffle_scale=False)
         mxfp4_moe_sort_hip(sorted_scales, per_token, routing.ids, routing.counts, tokens, columns)
-    return (act, scales)
+    return act, scales
 
 
 def dynamic_mxfp4_moe(
@@ -180,14 +187,9 @@ def dynamic_mxfp4_moe(
         (routing.experts, torch.int32, capacity // config.stage1_tile_m),
         (routing.counts, torch.int32, 2),
     ):
-        if (
-            tensor.dtype != dtype
-            or tensor.numel() != count
-            or tensor.device != x.device
-            or (not tensor.is_contiguous())
-        ):
+        if tensor.dtype != dtype or tensor.numel() != count or tensor.device != x.device or not tensor.is_contiguous():
             raise ValueError("routing tensor has incompatible dtype, size, device or strides")
-    e, d, i = (config.experts, config.hidden, config.intermediate)
+    e, d, i = config.experts, config.hidden, config.intermediate
     for tensor, shape in (
         (weights.w13, (e, 2 * i, d // 2)),
         (weights.w2, (e, d, i // 2)),
@@ -198,7 +200,7 @@ def dynamic_mxfp4_moe(
             tensor.shape != shape
             or tensor.dtype != torch.uint8
             or tensor.device != x.device
-            or (not tensor.is_contiguous())
+            or not tensor.is_contiguous()
         ):
             raise ValueError("expert weights/scales have incompatible shape, dtype, device or strides")
     if config.bias:
@@ -209,7 +211,7 @@ def dynamic_mxfp4_moe(
                 tensor.shape != shape
                 or tensor.dtype != torch.bfloat16
                 or tensor.device != x.device
-                or (not tensor.is_contiguous())
+                or not tensor.is_contiguous()
             ):
                 raise ValueError("bias must be packed BF16 [E,2,I] and [E,D]")
     elif weights.bias1 is not None or weights.bias2 is not None:
@@ -220,8 +222,8 @@ def dynamic_mxfp4_moe(
         workspace.out.shape != x.shape
         or workspace.out.device != x.device
         or workspace.out.dtype != x.dtype
-        or (not workspace.out.is_contiguous())
-        or (workspace.intermediate.device != x.device)
+        or not workspace.out.is_contiguous()
+        or workspace.intermediate.device != x.device
     ):
         raise ValueError("workspace output must match input shape, device and dtype")
     IntermediateLayout(capacity, i, config.sorted_intermediate).views(workspace.intermediate, x.shape[0], config.topk)
@@ -230,8 +232,8 @@ def dynamic_mxfp4_moe(
         route_output is None
         or route_output.shape != (x.shape[0], config.topk, d)
         or route_output.dtype != torch.bfloat16
-        or (route_output.device != x.device)
-        or (not route_output.is_contiguous())
+        or route_output.device != x.device
+        or not route_output.is_contiguous()
     ):
         raise ValueError("route reduction requires a BF16 [tokens, topk, hidden] workspace")
     out = workspace.out

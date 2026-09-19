@@ -22,9 +22,9 @@ GPTOSS = MoeSolutionId(3072, 3072, ActivationFunction.OPENAI_SWIGLU, DataType.BF
 @pytest.mark.parametrize(
     "hidden,intermediate,activation,bias,experts,topk,encoded",
     [
-        (3072, 3072, ActivationFunction.OPENAI_SWIGLU, DataType.BF16, 16, 4, 206973273361),
-        (7168, 2048, ActivationFunction.SILU_DOT, DataType.NONE, 33, 9, 139326488593),
-        (7168, 3072, ActivationFunction.SILU_DOT, DataType.NONE, 49, 7, 208045965329),
+        (3072, 3072, ActivationFunction.OPENAI_SWIGLU, DataType.BF16, 16, 4, 0x3030918511),
+        (7168, 2048, ActivationFunction.SILU_DOT, DataType.NONE, 33, 9, 0x2070818011),
+        (7168, 3072, ActivationFunction.SILU_DOT, DataType.NONE, 49, 7, 0x3070818011),
     ],
 )
 def test_petit_profile_ids(hidden, intermediate, activation, bias, experts, topk, encoded):
@@ -55,9 +55,10 @@ def test_policy_bias_and_activation_fields():
             stage2_weight_load_policy=WeightLoadPolicy.NON_TEMPORAL,
         ),
     )
-    assert int(changed.solution) == 3505507106833
+    assert int(changed.solution) == 0x33030818011
     assert changed.stage1_weight_load_aux == changed.stage2_weight_load_aux == 2
     assert config.stage1_weight_load_aux == config.stage2_weight_load_aux == 0
+    # Expert count and top-k are not encoded in the local solution ID.
     assert replace(config, experts=32, topk=8).solution == config.solution
 
 
@@ -75,7 +76,7 @@ def test_unencodable_dimensions(shape):
         replace(GPTOSS, intermediate=shape)
 
 
-@pytest.mark.parametrize("encoded", [-1, 1 << 47 | 206973273361, 1 << 63, 1 << 64, 0, 206973273375])
+@pytest.mark.parametrize("encoded", [-1, (1 << 47) | 0x3030918511, 1 << 63, 1 << 64, 0, 0x303091851F])
 def test_invalid_ids(encoded):
     with pytest.raises(ValueError):
         MoeSolutionId.from_int(encoded)
@@ -109,7 +110,7 @@ def test_config_preserves_encodable_solutions(field, value):
 
 
 def test_stage1_m64_bit_and_shape():
-    solution = MoeSolutionId.from_int(4605019784465)
+    solution = MoeSolutionId.from_int(0x43030918511)
     assert solution.stage1_tile_shape == Stage1TileShape.M64_N512
     assert (solution.stage1_tile_m, solution.stage1_tile_n) == (64, 512)
     assert solution.stage1_weight_load_policy == solution.stage2_weight_load_policy == WeightLoadPolicy.CACHED
@@ -120,8 +121,8 @@ def test_stage1_m64_bit_and_shape():
 @pytest.mark.parametrize("policies", range(4))
 def test_interleaved_tile_bits_and_independent_policies(s1, bits1, s2, bits2, policies):
     base = MoeSolutionId(3584, 384, ActivationFunction.SITU_V2, DataType.NONE)
-    assert int(base) == 26719911953
-    encoded = int(base) | bits1 | bits2 | policies << 40
+    assert int(base) == 0x0638A18011
+    encoded = int(base) | bits1 | bits2 | (policies << 40)
     solution = MoeSolutionId.from_int(encoded)
     assert solution.stage1_tile_shape == Stage1TileShape(s1)
     assert solution.stage2_tile_shape == Stage2TileShape(s2)
@@ -130,7 +131,7 @@ def test_interleaved_tile_bits_and_independent_policies(s1, bits1, s2, bits2, po
     assert int(solution) == encoded
 
 
-@pytest.mark.parametrize("bits", [1 << 42 | 1 << 44, 1 << 43 | 1 << 45])
+@pytest.mark.parametrize("bits", [(1 << 42) | (1 << 44), (1 << 43) | (1 << 45)])
 def test_reserved_tile_values(bits):
     with pytest.raises(ValueError):
         MoeSolutionId.from_int(int(GPTOSS) | bits)

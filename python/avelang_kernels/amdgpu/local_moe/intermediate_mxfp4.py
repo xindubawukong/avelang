@@ -27,7 +27,7 @@ class IntermediateLayout:
 
     @property
     def scale_shape(self) -> tuple[int, int]:
-        return (ceildiv(self.route_capacity, 256) * 256, ceildiv(self.intermediate, 256) * 8)
+        return ceildiv(self.route_capacity, 256) * 256, ceildiv(self.intermediate, 256) * 8
 
     @property
     def scale_offset(self) -> int:
@@ -49,12 +49,12 @@ class IntermediateLayout:
         else:
             act = flat[: tokens * topk * self.intermediate // 2].view(tokens, topk, self.intermediate // 2)
         scales = flat[self.scale_offset : self.nbytes].view(scale_byte_shape(self.scale_shape[0], self.intermediate))
-        return (act, scales)
+        return act, scales
 
 
 @cache
 def make_intermediate_store(intermediate, scale_columns, *, act_aux, scale_aux):
-    I, SCALE_COLS = (intermediate, scale_columns)
+    I, SCALE_COLS = intermediate, scale_columns
 
     @avelang.jit
     def store_intermediate(
@@ -68,10 +68,10 @@ def make_intermediate_store(intermediate, scale_columns, *, act_aux, scale_aux):
         scale_base: al.u32,
     ):
         packed, exponent = quantize_mxfp4_activation(act)
-        partner = al.amdgpu.get_dpp(packed, packed, 177, 15, 15, 0)
+        partner = al.amdgpu.get_dpp(packed, packed, 0xB1, 15, 15, 0)
         if col_lane % 2 == 0:
             offset = act_base + act_row * (I // 2) + column_base // 2 + col_lane * 2
-            al.amdgpu.raw_buffer_store_x1(packed | partner << 16, act_resource, offset, 0, act_aux)
+            al.amdgpu.raw_buffer_store_x1(packed | (partner << 16), act_resource, offset, 0, act_aux)
         if col_lane % 8 == 0:
             col = column_base // 32 + col_lane // 8
             offset = scale_byte_offset(scale_row, col, al.convert(SCALE_COLS, al.u32))
@@ -94,29 +94,32 @@ def make_stage2_input_k256(words, act_aux):
         valid: al.u1,
         k: al.u32,
     ) -> (al.Tensor((4,), al.u32), al.u32):
-        offset = al.select(valid, act_offset + k * 128, al.convert(4294967280, al.u32))
+        offset = al.select(valid, act_offset + k * 128, al.convert(0xFFFFFFF0, al.u32))
         act = al.amdgpu.raw_buffer_load_x4(act_resource, offset, act_base, act_aux)
         scale = al.amdgpu.raw_buffer_load_x1(act_resource, scale_offset + k * 256, scale_base, act_aux)
-        return (act, scale)
+        return act, scale
 
     @avelang.jit
     def read_stage2_input(
-        storage: al.Tensor((WORDS,), al.u32), fragments: al.Tensor((2, 2, 4), al.u32), k: al.u32, lane: al.u32
+        storage: al.Tensor((WORDS,), al.u32),
+        fragments: al.Tensor((2, 2, 4), al.u32),
+        k: al.u32,
+        lane: al.u32,
     ):
         lds = al.view(storage, al.u32, al.make_layout((2, 32, 16, 4), (2048, 64, 4, 1)))
         for m in al.static_range(2):
             for half_k in al.static_range(2):
                 row = m * 16 + lane % 16
-                fragments[m, half_k] = lds[k % 2, row, lane // 16 + half_k * 4 ^ row & 15]
+                fragments[m, half_k] = lds[k % 2, row, (lane // 16 + half_k * 4) ^ (row & 15)]
 
-    return (prefetch_stage2_input, read_stage2_input)
+    return prefetch_stage2_input, read_stage2_input
 
 
 @cache
 def make_stage2_input_k128(intermediate, tile_m, scale_columns):
-    I, BM, SC = (intermediate, tile_m, scale_columns)
-    KT, MR, SX = (I // 128, BM // 16, BM // 32)
-    DMA_WARPS, WORDS = (BM // 16, BM * 128)
+    I, BM, SC = intermediate, tile_m, scale_columns
+    KT, MR, SX = I // 128, BM // 16, BM // 32
+    DMA_WARPS, WORDS = BM // 16, BM * 128
 
     @avelang.jit
     def prefetch_resident_input(
@@ -126,22 +129,26 @@ def make_stage2_input_k128(intermediate, tile_m, scale_columns):
         wave: al.u32,
         lane: al.u32,
     ):
+        # All K128 input tiles coexist until the final compute cluster.
         for k in al.static_range(KT):
             if wave < DMA_WARPS:
                 row = wave * 16 + lane // 4
-                source_vector = lane % 4 ^ row >> 1 & 3
+                source_vector = (lane % 4) ^ ((row >> 1) & 3)
                 offset = (block * BM + row) * (I // 2) + k * 64 + source_vector * 16
                 destination = (k * BM * 16 + wave * 256) * 4
                 al.amdgpu.raw_buffer_load_x4_lds(act_resource, storage, 16, offset, 0, destination, 0)
 
     @avelang.jit
     def read_resident_input(
-        storage: al.Tensor((WORDS,), al.u32), fragments: al.Tensor((MR, 4), al.u32), k: al.u32, lane: al.u32
+        storage: al.Tensor((WORDS,), al.u32),
+        fragments: al.Tensor((MR, 4), al.u32),
+        k: al.u32,
+        lane: al.u32,
     ):
         lds = al.view(storage, al.u32, al.make_layout((KT, BM, 4, 4), (BM * 16, 16, 4, 1)))
         for m in al.static_range(MR):
             row = m * 16 + lane % 16
-            fragments[m] = lds[k, row, lane // 16 ^ row >> 1 & 3]
+            fragments[m] = lds[k, row, (lane // 16) ^ ((row >> 1) & 3)]
 
     @avelang.jit
     def load_input_scales(
@@ -153,7 +160,7 @@ def make_stage2_input_k128(intermediate, tile_m, scale_columns):
         lane: al.u32,
     ):
         for m32 in al.static_range(SX):
-            offset = (block * BM + m32 * 32) * SC + k // 2 * 256 + lane * 4
+            offset = (block * BM + m32 * 32) * SC + (k // 2) * 256 + lane * 4
             cached[m32] = al.amdgpu.raw_buffer_load_x1(act_resource, offset, scale_base, 0)
 
-    return (prefetch_resident_input, read_resident_input, load_input_scales)
+    return prefetch_resident_input, read_resident_input, load_input_scales
