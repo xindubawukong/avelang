@@ -13,11 +13,11 @@ def quantize_reference(x, petit_intermediate=False):
     x = x.cpu().float().reshape(x.shape[0], -1, 32)
     maximum = x.abs().amax(-1)
     if petit_intermediate:
-        bits = (maximum.contiguous().view(torch.int32) + 0x00400000) & 0xFF800000
+        bits = maximum.contiguous().view(torch.int32) + 4194304 & 4286578688
         exponent = (bits >> 23).clamp_min(2) - 2
     else:
         bits = (maximum * (1.0 / 6.0)).contiguous().view(torch.int32)
-        exponent = ((bits >> 23) & 255) + (((bits >> 23) & 255) < 255).int() * ((bits & 0x7FFFFF) != 0).int()
+        exponent = (bits >> 23 & 255) + (bits >> 23 & 255 < 255).int() * (bits & 8388607 != 0).int()
     divisor = (exponent << 23).contiguous().view(torch.float32)
     scaled = x.abs() / torch.where(divisor == 0, 1.0, divisor)[..., None]
     levels = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0])
@@ -25,11 +25,11 @@ def quantize_reference(x, petit_intermediate=False):
     codes = distances.argmin(-1)
     upper = (codes + 1).clamp_max(7)
     tie = distances.gather(-1, codes[..., None]) == distances.gather(-1, upper[..., None])
-    codes += ((codes & 1) != 0).int() * tie.squeeze(-1).int() * (codes != 7).int()
+    codes += (codes & 1 != 0).int() * tie.squeeze(-1).int() * (codes != 7).int()
     codes |= torch.signbit(x).int() << 3
     codes = codes.reshape(x.shape[0], -1)
-    act = (codes[:, ::2] | (codes[:, 1::2] << 4)).to(torch.uint8)
-    return act, exponent.to(torch.uint8)
+    act = (codes[:, ::2] | codes[:, 1::2] << 4).to(torch.uint8)
+    return (act, exponent.to(torch.uint8))
 
 
 def test_workspace_layout():
@@ -44,37 +44,30 @@ def test_workspace_layout():
     assert torch.all(workspace[act.numel() : layout.scale_offset] == 173)
 
 
-@pytest.mark.parametrize("k", [256, 512])
+@pytest.mark.parametrize("k", [128, 256, 384, 512])
 def test_native_weight_layout(k):
-    e, n = 2, 256
+    e, n = (2, 256)
     data = torch.arange(e * n * k // 2).to(torch.uint8).reshape(e, n, k // 2)
     scales = torch.arange(e * n * k // 32).to(torch.uint8).reshape(e, n, k // 32)
     packed, ps = _pack_weights(data, scales)
-    # Invert Petit's original seven-axis tile permutation independently.
     unpacked = packed.view(torch.int32).reshape(e * n // 256, 4, 4, k // 128, 4, 16, 4)
     unpacked = unpacked.permute(0, 1, 2, 5, 3, 4, 6).contiguous().view(torch.uint8).reshape_as(data)
     assert torch.equal(unpacked, data)
-    flat = ps.reshape(e * n // 32, k // 256, 4, 16, 2, 2)
-    unpacked_scales = flat.permute(0, 5, 3, 1, 4, 2).contiguous().reshape(e, n, k // 32)
-    assert torch.equal(unpacked_scales, scales)
-
-
-@pytest.mark.parametrize("k", [128, 384])
-def test_native_weights_reject_partial_k256_tiles(k):
-    data = torch.zeros((1, 256, k // 2), dtype=torch.uint8)
-    scales = torch.full((1, 256, k // 32), 127, dtype=torch.uint8)
-    with pytest.raises(ValueError, match="N and K divisible by 256"):
-        _pack_weights(data, scales)
+    padded_columns = (k + 255) // 256 * 8
+    flat = ps.reshape(e * n // 32, (k + 255) // 256, 4, 16, 2, 2)
+    unpacked_scales = flat.permute(0, 5, 3, 1, 4, 2).contiguous().reshape(e, n, padded_columns)
+    assert torch.equal(unpacked_scales[..., : k // 32], scales)
+    assert torch.all(unpacked_scales[..., k // 32 :] == 127)
 
 
 def test_bias_layout():
     bias = torch.arange(2 * 2 * 512, dtype=torch.float32).to(torch.bfloat16).reshape(2, 2, 512)
-    # Bias packing is an involution: it swaps the middle two tile axes.
     assert torch.equal(_pack_bias(_pack_bias(bias)), bias)
 
 
-gfx950 = bool(torch.version.hip and torch.cuda.is_available()) and (
-    torch.cuda.get_device_properties(torch.cuda.current_device()).gcnArchName.split(":")[0] == "gfx950"
+gfx950 = (
+    bool(torch.version.hip and torch.cuda.is_available())
+    and torch.cuda.get_device_properties(torch.cuda.current_device()).gcnArchName.split(":")[0] == "gfx950"
 )
 
 
@@ -82,7 +75,7 @@ def make_problem(config, tokens):
     from avelang_kernels.amdgpu.local_moe import ExpertWeights, Routing
 
     torch.manual_seed(71)
-    e, d, i, topk = config.experts, config.hidden, config.intermediate, config.topk
+    e, d, i, topk = (config.experts, config.hidden, config.intermediate, config.topk)
     block_m = config.stage1_tile_m
     x = torch.randn((tokens, d), dtype=torch.bfloat16, device="cuda")
     w13 = torch.randint(0, 256, (e, 2 * i, d // 2), dtype=torch.uint8, device="cuda")
@@ -93,7 +86,7 @@ def make_problem(config, tokens):
     b2 = torch.randn((e, d), dtype=torch.bfloat16, device="cuda") if config.bias else None
     raw = (w13, w2, s13, s2, b1, b2)
     packed = ExpertWeights.pack(*raw)
-    ids, route_weights, experts, routes = [], [], [], []
+    ids, route_weights, experts, routes = ([], [], [], [])
     for expert in range(e):
         begin = len(ids)
         for token in range(tokens):
@@ -104,8 +97,8 @@ def make_problem(config, tokens):
                     route_weights.append(weight)
                     routes.append((token, slot, expert, weight))
         count = len(ids) - begin
-        padding = (-count) % block_m
-        ids += [(topk << 24) | tokens] * padding
+        padding = -count % block_m
+        ids += [topk << 24 | tokens] * padding
         route_weights += [0.0] * padding
         experts += [expert] * ((count + block_m - 1) // block_m)
     routing = Routing(
@@ -114,11 +107,11 @@ def make_problem(config, tokens):
         torch.tensor(experts, dtype=torch.int32, device="cuda"),
         torch.tensor([len(ids), tokens], dtype=torch.int32, device="cuda"),
     )
-    return x, packed, routing, raw, routes
+    return (x, packed, routing, raw, routes)
 
 
 def dequantize_reference(act, scales):
-    act, scales = act.cpu(), scales.cpu()
+    act, scales = (act.cpu(), scales.cpu())
     codes = torch.stack((act & 15, act >> 4), -1).flatten(-2).long()
     levels = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0])
     return levels[codes] * (2.0 ** (scales.float() - 127)).repeat_interleave(32, -1)
@@ -126,7 +119,7 @@ def dequantize_reference(act, scales):
 
 def moe_reference(x, config, raw, routes):
     w13, w2, s13, s2, b1, b2 = raw
-    w13, w2 = dequantize_reference(w13, s13), dequantize_reference(w2, s2)
+    w13, w2 = (dequantize_reference(w13, s13), dequantize_reference(w2, s2))
     x = dequantize_reference(*quantize_reference(x))
     out = torch.zeros_like(x, dtype=torch.bfloat16)
     for token, slot, expert, weight in routes:
@@ -138,6 +131,8 @@ def moe_reference(x, config, raw, routes):
             gate = gate.clamp_max(7)
             up = up.clamp(-7, 7) + 1
             hidden = gate * torch.sigmoid(1.702 * gate) * up
+        elif config.activation == ActivationFunction.SITU_V2:
+            hidden = 100 * torch.tanh(gate * 0.25) * torch.sigmoid(gate) * torch.tanh(up * 0.04)
         else:
             hidden = torch.nn.functional.silu(gate) * up
         hidden = dequantize_reference(*quantize_reference(hidden[None], petit_intermediate=True))[0]
@@ -207,8 +202,8 @@ def test_graph_replay_reads_changed_routing_and_empty_extent():
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         dynamic_mxfp4_moe(x, weights, routing, config, workspace=workspace)
-    valid = (routing.ids & 0xFFFFFF) < len(x)
-    routing.ids[valid] = (routing.ids[valid] & 0xFF000000) | (((routing.ids[valid] & 0xFFFFFF) + 1) % len(x))
+    valid = routing.ids & 16777215 < len(x)
+    routing.ids[valid] = routing.ids[valid] & 4278190080 | ((routing.ids[valid] & 16777215) + 1) % len(x)
     routing.experts.add_(1).remainder_(config.experts)
     graph.replay()
     expected = moe_reference(
@@ -241,17 +236,16 @@ def test_no_contributing_routes(case):
 def test_persistent_stage2_reuses_worker_after_invalid_group(policy):
     from avelang_kernels.amdgpu.local_moe.stage2 import make_stage2
 
-    # Worker 0 owns groups 0, 1, 2: it must continue past invalid group 0.
-    groups, d, i = 513, 256, 512
-    capacity, tokens = groups * 32, groups * 32 - 7
+    groups, d, i = (513, 256, 512)
+    capacity, tokens = (groups * 32, groups * 32 - 7)
     config = get_2stage_cfgs(tokens, d, i, 1, 1, activation="silu", bias_dtype="none", weight_load_policy=policy)
     layout = IntermediateLayout(capacity, i)
     workspace = torch.empty(layout.nbytes, device="cuda", dtype=torch.uint8)
     act, scales = layout.views(workspace, tokens, 1)
-    act.fill_(0x22)  # Two FP4 ones per byte.
+    act.fill_(34)
     scales.fill_(127)
     weight, ws = _pack_weights(
-        torch.full((1, d, i // 2), 0x22, device="cuda", dtype=torch.uint8),
+        torch.full((1, d, i // 2), 34, device="cuda", dtype=torch.uint8),
         torch.full((1, d, i // 32), 127, device="cuda", dtype=torch.uint8),
     )
     ids = torch.full((capacity,), tokens, device="cuda", dtype=torch.int32)
@@ -283,36 +277,129 @@ def test_aiter_input_preparation(tokens, columns, capacity):
     torch.manual_seed(67)
     x = torch.randn((tokens, columns), device="cuda", dtype=torch.bfloat16)
     x[0, :32] = 0
-    topk, stride = 2, ((tokens + 31) // 32) * 32
-    ids = torch.full((capacity,), tokens | (topk << 24), device="cuda", dtype=torch.int32)
+    topk, stride = (2, (tokens + 31) // 32 * 32)
+    ids = torch.full((capacity,), tokens | topk << 24, device="cuda", dtype=torch.int32)
     for slot in range(topk):
-        ids[slot * stride : slot * stride + tokens] = torch.arange(tokens, device="cuda", dtype=torch.int32) | (
-            slot << 24
+        ids[slot * stride : slot * stride + tokens] = (
+            torch.arange(tokens, device="cuda", dtype=torch.int32) | slot << 24
         )
     counts = torch.tensor([stride * topk, tokens], device="cuda", dtype=torch.int32)
     config = get_2stage_cfgs(tokens, columns, 256, 2, topk, activation="silu", bias_dtype="none")
     routing = Routing(
-        ids,
-        torch.ones(capacity, device="cuda"),
-        torch.zeros(capacity // 32, device="cuda", dtype=torch.int32),
-        counts,
+        ids, torch.ones(capacity, device="cuda"), torch.zeros(capacity // 32, device="cuda", dtype=torch.int32), counts
     )
     workspace = MoeWorkspace.allocate(x, routing, config)
     act, scales = prepare_input(x, routing, config, workspace)
     assert act.data_ptr() == workspace.input_act.data_ptr()
     assert scales.data_ptr() == workspace.sorted_scales.data_ptr()
     expected_act, expected_scales = quantize_reference(x)
-    # AITER input kernels seed amax with 1e-10, including all-zero blocks.
     expected_scales[0, 0] = 92
     torch.testing.assert_close(act.cpu(), expected_act, rtol=0, atol=0)
     logical_scales = unsort_scales(scales, capacity, columns).cpu()
-    valid = (ids.cpu() & 0xFFFFFF) < tokens
-    token_ids = (ids.cpu()[valid] & 0xFFFFFF).long()
+    valid = ids.cpu() & 16777215 < tokens
+    token_ids = (ids.cpu()[valid] & 16777215).long()
     torch.testing.assert_close(logical_scales[valid], expected_scales[token_ids], rtol=0, atol=0)
 
 
 @pytest.mark.skipif(not gfx950, reason="Native MXFP4 requires gfx950")
-@pytest.mark.parametrize("activation", ["swiglu", "silu"])
+@pytest.mark.parametrize("s1,s2", [(0, 1)])
+def test_k128_tiles_with_known_projection_and_padded_routes(s1, s2):
+    from avelang_kernels.amdgpu.local_moe import ExpertWeights, MoeConfig, MoeSolutionId, dynamic_mxfp4_moe
+    from avelang_kernels.amdgpu.local_moe.solutionid import DataType
+
+    config = MoeConfig(
+        MoeSolutionId(512, 384, ActivationFunction.SITU_V2, DataType.NONE, stage1_tile_shape=s1, stage2_tile_shape=s2),
+        3,
+        2,
+    )
+    x, weights, routing, _, routes = make_problem(config, 35)
+    x.fill_(1)
+    weights = ExpertWeights.pack(
+        torch.full_like(weights.w13, 34),
+        torch.full_like(weights.w2, 34),
+        torch.full_like(weights.s13, 121),
+        torch.full((3, 512, 12), 121, device="cuda", dtype=torch.uint8),
+    )
+    actual = dynamic_mxfp4_moe(x, weights, routing, config)
+    gate = torch.tensor(8.0)
+    activation = 100 * torch.tanh(gate / 4) * torch.sigmoid(gate) * torch.tanh(gate / 25)
+    hidden = dequantize_reference(*quantize_reference(activation.expand(1, 384), petit_intermediate=True))[0]
+    value = hidden.sum() / 64
+    expected = torch.zeros((35, 512), dtype=torch.bfloat16)
+    for token, slot, expert, weight in routes:
+        expected[token] += (value * weight).bfloat16()
+    torch.testing.assert_close(actual.cpu(), expected, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not gfx950, reason="Native MXFP4 requires gfx950")
+@pytest.mark.parametrize("tile_m", [32])
+@pytest.mark.parametrize("route_output", [False])
+def test_k128_stage2_nonuniform_rows_and_columns(tile_m, route_output):
+    from avelang_kernels.amdgpu.local_moe import MoeConfig, MoeSolutionId
+    from avelang_kernels.amdgpu.local_moe.solutionid import DataType, Stage1TileShape, Stage2TileShape
+    from avelang_kernels.amdgpu.local_moe.stage2 import make_stage2
+
+    tokens, hidden, intermediate, topk = (97, 3584, 384, 2)
+    config = MoeConfig(
+        MoeSolutionId(
+            hidden,
+            intermediate,
+            ActivationFunction.SITU_V2,
+            DataType.NONE,
+            stage1_tile_shape=Stage1TileShape.M64_N256 if tile_m == 64 else Stage1TileShape.M32_N256,
+            stage2_tile_shape=Stage2TileShape.M64_N256_K128 if tile_m == 64 else Stage2TileShape.M32_N256_K128,
+        ),
+        3,
+        topk,
+    )
+    _, _, routing, raw, _ = make_problem(config, tokens)
+    capacity = routing.capacity
+    routing.weights.copy_((torch.arange(capacity, device="cuda") * 5 % 11 + 1).float() / 8)
+    act = torch.randint(0, 256, (capacity, intermediate // 2), dtype=torch.uint8, device="cuda")
+    rows = torch.arange(capacity, device="cuda")[:, None]
+    columns = torch.arange(intermediate // 32, device="cuda")[None, :]
+    scales = (125 + (rows + columns) % 3).to(torch.uint8)
+    weight_scales = torch.full_like(raw[3], 125)
+    w2, s2 = _pack_weights(raw[1], weight_scales)
+    layout = IntermediateLayout(capacity, intermediate, sorted_act=True)
+    workspace = torch.empty(layout.nbytes, dtype=torch.uint8, device="cuda")
+    stored_act, stored_scales = layout.views(workspace, tokens, topk)
+    stored_act.copy_(act)
+    padded_scales = torch.full(layout.scale_shape, 127, dtype=torch.uint8, device="cuda")
+    padded_scales[:capacity, : intermediate // 32] = scales
+    stored_scales.copy_(padded_scales.reshape(-1, 2, 16, 2, 2, 4).permute(0, 3, 5, 2, 4, 1))
+    out = torch.zeros((tokens, topk, hidden) if route_output else (tokens, hidden), dtype=torch.bfloat16, device="cuda")
+    make_stage2(config)[lambda: config.stage2_grid(tokens, capacity)](
+        workspace,
+        w2,
+        s2,
+        None,
+        routing.ids,
+        routing.experts,
+        routing.weights,
+        routing.counts,
+        out,
+        capacity,
+        num_warps=config.stage2_num_warps,
+    )
+    logical_act = dequantize_reference(act, scales)
+    logical_weights = dequantize_reference(raw[1], weight_scales)
+    ids = routing.ids.cpu()
+    token, slot = (ids & 16777215, ids >> 24)
+    expert_ids = routing.experts.cpu().repeat_interleave(tile_m)
+    route_weights = routing.weights.cpu()
+    expected = torch.zeros((tokens, topk, hidden), dtype=torch.bfloat16)
+    for expert in range(config.experts):
+        valid = (expert_ids == expert) & (token < tokens) & (slot < topk)
+        values = logical_act[valid] @ logical_weights[expert].T
+        expected[token[valid], slot[valid]] = (values * route_weights[valid, None]).bfloat16()
+    if not route_output:
+        expected = expected.float().sum(dim=1).bfloat16()
+    torch.testing.assert_close(out.cpu(), expected, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not gfx950, reason="Native MXFP4 requires gfx950")
+@pytest.mark.parametrize("activation", ["swiglu", "situ"])
 def test_m64_n512_stage1_bias_and_m32_stage2(activation):
     from dataclasses import replace
 

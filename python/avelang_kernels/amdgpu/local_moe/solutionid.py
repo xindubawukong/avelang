@@ -33,6 +33,7 @@ class Stages(IntEnum):
 class ActivationFunction(IntEnum):
     SILU_DOT = 0
     OPENAI_SWIGLU = 1
+    SITU_V2 = 2
 
 
 class Stage1Buffering(IntEnum):
@@ -46,17 +47,15 @@ class WeightLoadPolicy(IntEnum):
 
 
 class Stage1TileShape(IntEnum):
-    # N includes both gate and up projections: M32 has 128 columns each.
     M32_N256 = 0
     M64_N512 = 1
 
 
 class Stage2TileShape(IntEnum):
     M32_N256_K256 = 0
+    M32_N256_K128 = 1
 
 
-# Field positions match FusedMoESolutionId::Repr/FromRepr in fused_moe.h.
-# MegaMoE reuses these low 24 bits from the local implementation.
 BASE_FIELDS = (
     ("act_dtype", DataType, 0, 4),
     ("weight_dtype", DataType, 4, 4),
@@ -72,7 +71,6 @@ _FIELDS = BASE_FIELDS + (
     ("stage2_weight_load_policy", WeightLoadPolicy, 41, 1),
 )
 _SHAPES = (("hidden", 24), ("intermediate", 32))
-# The local tile fields occupy interleaved bits in the current Petit ABI.
 _TILES = (("stage1_tile_shape", Stage1TileShape, (42, 44, 46)), ("stage2_tile_shape", Stage2TileShape, (43, 45)))
 
 
@@ -120,29 +118,31 @@ class MoeSolutionId:
             raise TypeError("solution ID must be an integer")
         if value < 0 or value >> 47:
             raise ValueError("local MoE solution ID must be nonnegative with reserved bits [47,63] clear")
-        fields = {name: enum((value >> shift) & ((1 << bits) - 1)) for name, enum, shift, bits in _FIELDS}
-        fields.update({name: ((value >> shift) & 255) * 64 for name, shift in _SHAPES})
+        fields = {name: enum(value >> shift & (1 << bits) - 1) for name, enum, shift, bits in _FIELDS}
+        fields.update({name: (value >> shift & 255) * 64 for name, shift in _SHAPES})
         fields.update(
             {
-                name: enum(sum(((value >> bit) & 1) << index for index, bit in enumerate(bits)))
+                name: enum(sum(((value >> bit & 1) << index for index, bit in enumerate(bits))))
                 for name, enum, bits in _TILES
             }
         )
         return cls(**fields)
 
     def __int__(self) -> int:
-        fields = sum(int(getattr(self, name)) << shift for name, _, shift, _ in _FIELDS)
-        shapes = sum((getattr(self, name) // 64) << shift for name, shift in _SHAPES)
+        fields = sum((int(getattr(self, name)) << shift for name, _, shift, _ in _FIELDS))
+        shapes = sum((getattr(self, name) // 64 << shift for name, shift in _SHAPES))
         tiles = sum(
-            ((int(getattr(self, name)) >> index) & 1) << bit
-            for name, _, bits in _TILES
-            for index, bit in enumerate(bits)
+            (
+                (int(getattr(self, name)) >> index & 1) << bit
+                for name, _, bits in _TILES
+                for index, bit in enumerate(bits)
+            )
         )
         return fields | shapes | tiles
 
     @property
     def stage1_tile_m(self) -> int:
-        return 64 if self.stage1_tile_shape == Stage1TileShape.M64_N512 else 32
+        return 64 if self.stage1_tile_shape in (Stage1TileShape.M64_N512,) else 32
 
     @property
     def stage1_tile_n(self) -> int:
@@ -150,9 +150,13 @@ class MoeSolutionId:
         return 512 if self.stage1_tile_shape == Stage1TileShape.M64_N512 else 256
 
     @property
+    def stage1_k_groups(self) -> int:
+        return 1
+
+    @property
     def stage2_tile_m(self) -> int:
         return 32
 
     @property
     def stage2_tile_k(self) -> int:
-        return 256
+        return 256 if self.stage2_tile_shape == Stage2TileShape.M32_N256_K256 else 128

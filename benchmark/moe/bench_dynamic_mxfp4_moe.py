@@ -23,12 +23,20 @@ BENCH_CASES = {
     },
     "dsv3": {"model_dim": 7168, "inter_dim": 2048, "expert": 33, "topk": 9, "activation": "silu", "bias_dtype": "none"},
     "dsv4": {"model_dim": 7168, "inter_dim": 3072, "expert": 49, "topk": 7, "activation": "silu", "bias_dtype": "none"},
+    "kimi_k3": {
+        "model_dim": 3584,
+        "inter_dim": 384,
+        "expert": 896,
+        "topk": 16,
+        "activation": "situ",
+        "bias_dtype": "none",
+    },
 }
 
 
 def make_inputs(config, tokens, seed):
     torch.manual_seed(seed)
-    e, d, i, k = config.experts, config.hidden, config.intermediate, config.topk
+    e, d, i, k = (config.experts, config.hidden, config.intermediate, config.topk)
     x = torch.randn((tokens, d), dtype=torch.bfloat16, device="cuda")
     w13 = torch.randint(0, 256, (e, 2 * i, d // 2), dtype=torch.uint8, device="cuda")
     w2 = torch.randint(0, 256, (e, d, i // 2), dtype=torch.uint8, device="cuda")
@@ -40,15 +48,15 @@ def make_inputs(config, tokens, seed):
     top_ids = torch.rand((tokens, e)).topk(k, dim=1).indices
     top_weights = torch.rand((tokens, k)).softmax(-1)
     bm = config.stage1_tile_m
-    capacity = ((tokens * k + e * bm - k + bm - 1) // bm) * bm
-    ids = torch.full((capacity,), (k << 24) | tokens, dtype=torch.int32)
+    capacity = (tokens * k + e * bm - k + bm - 1) // bm * bm
+    ids = torch.full((capacity,), k << 24 | tokens, dtype=torch.int32)
     rw = torch.zeros(capacity, dtype=torch.float32)
     experts = torch.full((capacity // bm,), -1, dtype=torch.int32)
     begin = 0
     for expert in range(e):
         matches = (top_ids == expert).nonzero()
         count = len(matches)
-        ids[begin : begin + count] = matches[:, 0].int() | (matches[:, 1].int() << 24)
+        ids[begin : begin + count] = matches[:, 0].int() | matches[:, 1].int() << 24
         rw[begin : begin + count] = top_weights[matches[:, 0], matches[:, 1]]
         blocks = (count + bm - 1) // bm
         experts[begin // bm : begin // bm + blocks] = expert
@@ -56,7 +64,7 @@ def make_inputs(config, tokens, seed):
     routing = Routing(
         ids.cuda(), rw.cuda(), experts.cuda(), torch.tensor([begin, tokens], dtype=torch.int32, device="cuda")
     )
-    return x, weights, routing
+    return (x, weights, routing)
 
 
 def measure(fn, warmup, repeat, graph_iters):
@@ -69,7 +77,7 @@ def measure(fn, warmup, repeat, graph_iters):
             fn()
     samples = []
     for _ in range(repeat):
-        start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+        start, end = (torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True))
         start.record()
         graph.replay()
         end.record()
@@ -82,7 +90,7 @@ def run_case(args, model, tokens):
     config = get_2stage_cfgs(token=tokens, **BENCH_CASES[model], arch="gfx950")
     x, weights, routing = make_inputs(config, tokens, args.seed)
     ws = MoeWorkspace.allocate(x, routing, config)
-    stage1_kernel, stage2_kernel = make_stage1(config), make_stage2(config)
+    stage1_kernel, stage2_kernel = (make_stage1(config), make_stage2(config))
 
     def stage1():
         stage1_kernel[lambda: config.stage1_grid(routing.capacity)](
@@ -101,7 +109,7 @@ def run_case(args, model, tokens):
 
     def stage2():
         ws.out.zero_()
-        stage2_kernel[lambda: config.stage2_grid()](
+        stage2_kernel[lambda: config.stage2_grid(tokens, routing.capacity)](
             ws.intermediate,
             weights.w2,
             weights.s2,
