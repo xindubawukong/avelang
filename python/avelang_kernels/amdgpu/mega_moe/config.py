@@ -14,9 +14,9 @@ class MegaMoeConfig:
     stage1_tile_m: int = 32
     stage1_num_warps: int = 4
     max_tokens_per_rank: ClassVar[int] = 1024
-    stage1_projection_n: ClassVar[int] = 128
+    stage1_projection_n: ClassVar[int] = 256
     stage1_k_groups: ClassVar[int] = 1
-    stage1_weight_load_aux: ClassVar[int] = 2
+    stage1_weight_load_aux: ClassVar[int] = 0
 
     def __post_init__(self):
         if not isinstance(self.solution, MegaMoeSolutionId):

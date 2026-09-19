@@ -8,9 +8,9 @@ from .solutionid import ActivationFunction, DataType, MegaMoeSolutionId, Produce
 
 _PROFILES = (
     *((r, 32, 4, 2880, 3072, ActivationFunction.OPENAI_SWIGLU, DataType.BF16, (0,)) for r in (2, 4, 8)),
-    (8, 128, 4, 2880, 3072, ActivationFunction.OPENAI_SWIGLU, DataType.BF16, (0,)),
-    (8, 256, 8, 7168, 2048, ActivationFunction.SILU_DOT, DataType.NONE, (0,)),
-    (8, 384, 6, 7168, 3072, ActivationFunction.SILU_DOT, DataType.NONE, (0,)),
+    (8, 128, 4, 2880, 3072, ActivationFunction.OPENAI_SWIGLU, DataType.BF16, (0, 1, 2)),
+    (8, 256, 8, 7168, 2048, ActivationFunction.SILU_DOT, DataType.NONE, (0, 2, 3)),
+    (8, 384, 6, 7168, 3072, ActivationFunction.SILU_DOT, DataType.NONE, (0, 3)),
     (8, 896, 16, 3584, 3072, ActivationFunction.SITU_V2, DataType.NONE, (0,)),
 )
 
@@ -33,8 +33,24 @@ def get_2stage_cfgs(tokens, world_size, experts, topk, hidden, intermediate, *, 
             raise ValueError("bias_dtype must be 'none' or 'bf16'") from None
     solution = MegaMoeSolutionId(world_size, experts, topk, hidden, intermediate, activation, bias_dtype)
     MegaMoeConfig.validate_tokens(tokens)
+    e, activation = solution.experts, solution.activation
     geometry = ProducerGeometry.CTA56
+    if activation == ActivationFunction.SITU_V2:
+        geometry = ProducerGeometry.CTA56
+    elif e > 56:
+        if activation == ActivationFunction.SILU_DOT and (
+            (e == 256 and 12 <= tokens < 1024) or (e == 384 and tokens < 512)
+        ):
+            geometry = ProducerGeometry.CTA192
+        elif tokens < 12:
+            geometry = ProducerGeometry.CTA128
+        elif tokens < 24:
+            geometry = ProducerGeometry.CTA64
+    threshold = 128 if e == 256 else 256
     tile_m, num_warps = 32, 4
+    if solution.world_size != 1 and tokens >= threshold:
+        tile_m = 64
+        num_warps = 4 if e == 128 and tokens < 1024 else 8
     config = MegaMoeConfig(
         replace(solution, producer_geometry=geometry),
         stage1_tile_m=tile_m,
