@@ -71,7 +71,7 @@ class MoeConfig:
 
     @property
     def stage1_k_groups(self) -> int:
-        return 1
+        return self.solution.stage1_k_groups
 
     @property
     def stage1_wave_m(self) -> int:
@@ -83,7 +83,7 @@ class MoeConfig:
 
     @property
     def stage1_warps_n(self) -> int:
-        return self.stage1_num_warps // (self.stage1_warps_m * 1)
+        return self.stage1_num_warps // (self.stage1_warps_m * self.stage1_k_groups)
 
     @property
     def stage1_wave_n(self) -> int:
@@ -91,11 +91,13 @@ class MoeConfig:
 
     @property
     def stage1_input_stage_words(self) -> int:
-        return 1 * (self.stage1_tile_m * 32 + self.stage1_tile_m // 32 * 64)
+        return self.stage1_k_groups * (self.stage1_tile_m * 32 + self.stage1_tile_m // 32 * 64)
 
     @property
     def stage1_arena_words(self) -> int:
-        partial = 0
+        partial = (
+            2 * (self.stage1_wave_n // 16) * (self.stage1_wave_m // 16) * 128 * 4 if self.stage1_k_groups == 2 else 0
+        )
         return max(2 * self.stage1_input_stage_words, self.stage1_tile_m * self.stage1_projection_n, partial)
 
     @property

@@ -14,7 +14,7 @@ import avelang.language as al
 def make_w13_weight_loads(config):
     """Fill [projection, half_k, n_fragment, word4] registers; caller owns waits."""
     D, I = (config.compute_hidden, config.intermediate)
-    WN, NR = (config.stage1_warps_n, config.stage1_wave_n // 16)
+    WN, KG, NR = (config.stage1_warps_n, config.stage1_k_groups, config.stage1_wave_n // 16)
     NS, CACHE = (NR // 2, config.stage1_weight_load_aux)
 
     @avelang.jit
@@ -28,20 +28,20 @@ def make_w13_weight_loads(config):
         lane: al.u32,
     ):
         wave_n = wave % WN
-        group = al.convert(0, al.u32)
+        group = wave // WN if KG == 2 else al.convert(0, al.u32)
         for projection in al.static_range(2):
             for half_k in al.static_range(2):
                 for n in al.static_range(NR):
                     offset = (
                         (wave_n * (NR * 16) + n * 16) * (D // 2)
-                        + group * (D // 1) * 8
+                        + group * (D // KG) * 8
                         + lane * 16
                         + half_k * 1024
                         + projection * I * D // 2
                     )
                     values[projection, half_k, n] = al.amdgpu.raw_buffer_load_x4(w, offset, k * 2048, CACHE)
             for n in al.static_range(NS):
-                offset_s = (wave_n * NS + n) * D + group * (D // 1) + lane * 4 + projection * I * D // 32
+                offset_s = (wave_n * NS + n) * D + group * (D // KG) + lane * 4 + projection * I * D // 32
                 scales[projection, n] = al.amdgpu.raw_buffer_load_x1(ws, offset_s, k * 256, 0)
 
     return load_weights

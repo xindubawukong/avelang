@@ -150,7 +150,10 @@ def test_explicit_id_policy_conflicts_and_unsupported_stages():
     solution = choose().solution
     with pytest.raises(ValueError, match="weight_load_policy"):
         choose(solution_id=solution, weight_load_policy="cached")
-    for changed in (replace(solution, stages=Stages.ONE_STAGE),):
+    for changed in (
+        replace(solution, stages=Stages.ONE_STAGE),
+        replace(solution, stage1_tile_shape=Stage1TileShape.M32_N128_K2),
+    ):
         with pytest.raises(ValueError, match="unsupported Ave local MoE solution"):
             choose(solution_id=changed)
 
@@ -176,6 +179,7 @@ def test_config_stores_solution_and_has_derived_readonly_fields():
         {"mfma": MfmaShape.BF16_MXFP4},
         {"stages": Stages.ONE_STAGE},
         {"stage1_buffering": Stage1Buffering.SINGLE_BUFFER},
+        {"stage1_tile_shape": Stage1TileShape.M32_N128_K2},
         {"hidden": 320},
     ],
 )

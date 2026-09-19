@@ -39,13 +39,13 @@ def make_stage1_compute(config, *, prefetch_input, read_input):
     """
     D, I = (config.compute_hidden, config.intermediate)
     BM, BN, WN, WM = (config.stage1_tile_m, config.stage1_projection_n, config.stage1_warps_n, config.stage1_wave_m)
-    NR, MR = (config.stage1_wave_n // 16, WM // 16)
+    KG, NR, MR = (config.stage1_k_groups, config.stage1_wave_n // 16, WM // 16)
     NS = NR // 2
     WORDS = config.stage1_lds_words
     BIAS = config.bias
     SWIGLU = config.activation == ActivationFunction.OPENAI_SWIGLU
     SITU = config.activation == ActivationFunction.SITU_V2
-    K_TILES = D // 1 // 256
+    K_TILES = D // KG // 256
     VMEM = 2 * (2 * NR + NS)
     BIAS_STRIDE = (I + 255) // 256 * 256
     load_weights = make_w13_weight_loads(config)
@@ -65,7 +65,7 @@ def make_stage1_compute(config, *, prefetch_input, read_input):
         tid: al.u32,
     ):
         wave_n = wave % WN
-        wave_m = wave // WN
+        wave_m = al.convert(0, al.u32) if KG == 2 else wave // WN
         accum = al.make_local((2, NR, MR, 4), al.f32)
         for projection in al.static_range(2):
             for n in al.static_range(NR):
@@ -118,6 +118,22 @@ def make_stage1_compute(config, *, prefetch_input, read_input):
                 al.amdgpu.s_waitcnt(VMEM, 0, 0)
                 al.syncthreads()
                 read_input(storage, fragments, input_scales, al.convert(k + 1, al.u32), wave, lane)
+        if KG == 2:
+            partials = al.view(
+                storage, al.f32, al.make_layout((2, NR, MR, 128, 4), (NR * MR * 512, MR * 512, 512, 4, 1))
+            )
+            al.syncthreads()
+            if wave >= 2:
+                for projection in al.static_range(2):
+                    for n in al.static_range(NR):
+                        for m in al.static_range(MR):
+                            partials[projection, n, m, tid - 128] = accum[projection, n, m]
+            al.syncthreads()
+            if wave < 2:
+                for projection in al.static_range(2):
+                    for n in al.static_range(NR):
+                        for m in al.static_range(MR):
+                            accum[projection, n, m] = accum[projection, n, m] + partials[projection, n, m, tid]
         if BIAS:
             for projection in al.static_range(2):
                 packed_bias = al.make_local((NR, 2), al.u32)
@@ -147,9 +163,10 @@ def make_stage1_compute(config, *, prefetch_input, read_input):
                     else:
                         activated[n, m, c] = silu_dot(gate, up)
         al.syncthreads()
-        for n in al.static_range(NR):
-            for m in al.static_range(MR):
-                hidden[wave_m * WM + m * 16 + lane % 16, wave_n * (NR * 4) + n * 4 + lane // 16] = activated[n, m]
+        if KG == 1 or wave < 2:
+            for n in al.static_range(NR):
+                for m in al.static_range(MR):
+                    hidden[wave_m * WM + m * 16 + lane % 16, wave_n * (NR * 4) + n * 4 + lane // 16] = activated[n, m]
 
     return stage1_compute
 

@@ -49,6 +49,7 @@ class WeightLoadPolicy(IntEnum):
 class Stage1TileShape(IntEnum):
     M32_N256 = 0
     M64_N512 = 1
+    M32_N128_K2 = 4
 
 
 class Stage2TileShape(IntEnum):
@@ -147,11 +148,13 @@ class MoeSolutionId:
     @property
     def stage1_tile_n(self) -> int:
         """Combined gate/up width, matching Petit's naming."""
+        if self.stage1_tile_shape == Stage1TileShape.M32_N128_K2:
+            return 128
         return 512 if self.stage1_tile_shape == Stage1TileShape.M64_N512 else 256
 
     @property
     def stage1_k_groups(self) -> int:
-        return 1
+        return 2 if self.stage1_tile_shape == Stage1TileShape.M32_N128_K2 else 1
 
     @property
     def stage2_tile_m(self) -> int:
