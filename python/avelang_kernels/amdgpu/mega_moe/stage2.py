@@ -1,4 +1,4 @@
-"""Run one Stage2 tile per workgroup and return route rows to their sources."""
+"""Reuse Stage2 workgroups across tiles and return route rows to their sources."""
 
 from functools import cache
 
@@ -36,39 +36,46 @@ def make_stage2(config):
         lane = tid % 64
         memory = al.make_tensor(heap, al.u8, al.make_layout((SIZE,), (1,)))
         resource = al.amdgpu.make_rsrc(memory, SIZE)
-        expert, pool, rows, tile, found = get_work(resource, rank, logical)
-        if found != 0:
-            storage = al.make_shared((WORDS,), al.u32)
-            wr, sr, br = initialize_w2_resources(weight, scales, bias, expert, tile, bias_enabled)
-            rw_offset = al.convert(rank, al.u64) * SLOT + B + RW + al.convert(pool, al.u64) * 4
-            weight_view = al.subview(memory, (rw_offset,), (128,), (1,))
-            rw_resource = al.amdgpu.make_rsrc(weight_view, 128)
-            input_row, vector = tid // 8, tid % 8
-            stage2_compute_k256(
-                resource,
-                wr,
-                sr,
-                br,
-                rw_resource,
-                storage,
-                (pool + input_row) * (I // 2) + vector * 16,
-                al.convert(ACT, al.u32),
-                pool * SC + lane * 4,
-                al.convert(SCALES, al.u32),
-                input_row < rows,
-                rows,
-                tile,
-                tid,
-            )
-            for word in al.static_range(16):
-                linear = word * 256 + tid
-                row, column = linear // 128, (linear % 128) * 2
-                if row < rows and tile * 256 + column < LOGICAL:
-                    metadata = al.amdgpu.raw_buffer_load_x2(resource, B + rank * SLOT + META + (pool + row) * 8, 0, 17)
-                    route, source = metadata[0], metadata[1]
-                    value = storage[output_word_index(row, column)]
-                    offset = B + source * SLOT + OUT + route * LOGICAL * 2 + tile * 512 + column * 2
-                    al.amdgpu.raw_buffer_store_x1(value, resource, offset, 0, 17)
-            al.amdgpu.fence(1, 2)
+        storage = al.make_shared((WORDS,), al.u32)
+        active = al.convert(1, al.u32)
+        while active != 0:
+            expert, pool, rows, tile, found = get_work(resource, rank, logical)
+            active = al.amdgpu.readfirstlane(found)
+            if active != 0:
+                wr, sr, br = initialize_w2_resources(weight, scales, bias, expert, tile, bias_enabled)
+                rw_offset = al.convert(rank, al.u64) * SLOT + B + RW + al.convert(pool, al.u64) * 4
+                weight_view = al.subview(memory, (rw_offset,), (128,), (1,))
+                rw_resource = al.amdgpu.make_rsrc(weight_view, 128)
+                input_row, vector = tid // 8, tid % 8
+                stage2_compute_k256(
+                    resource,
+                    wr,
+                    sr,
+                    br,
+                    rw_resource,
+                    storage,
+                    (pool + input_row) * (I // 2) + vector * 16,
+                    al.convert(ACT, al.u32),
+                    pool * SC + lane * 4,
+                    al.convert(SCALES, al.u32),
+                    input_row < rows,
+                    rows,
+                    tile,
+                    tid,
+                )
+                for word in al.static_range(16):
+                    linear = word * 256 + tid
+                    row, column = linear // 128, (linear % 128) * 2
+                    if row < rows and tile * 256 + column < LOGICAL:
+                        metadata = al.amdgpu.raw_buffer_load_x2(
+                            resource, B + rank * SLOT + META + (pool + row) * 8, 0, 17
+                        )
+                        route, source = metadata[0], metadata[1]
+                        value = storage[output_word_index(row, column)]
+                        offset = B + source * SLOT + OUT + route * LOGICAL * 2 + tile * 512 + column * 2
+                        al.amdgpu.raw_buffer_store_x1(value, resource, offset, 0, 17)
+                al.amdgpu.fence(1, 2)
+                al.syncthreads()
+                logical = logical + 256
 
     return stage2

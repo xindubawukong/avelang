@@ -172,7 +172,6 @@ class MegaMoeWorkspace:
         ):
             raise ValueError("out must be BF16 [tokens, hidden] with a logical or padded row stride")
         count, plan, push, stage1, stage2, combine, barrier = factory(config)
-        layout = WorkspaceLayout(config)
         rank = self.heap.rank
         count[lambda: ((1, 1, 1), (256, 1, 1))](self.memory, inputs.expert_ids, tokens, rank)
         barrier[lambda: ((1, 1, 1), (64, 1, 1))](self.memory, rank, num_warps=1)
@@ -182,11 +181,10 @@ class MegaMoeWorkspace:
             self.memory, inputs.act, inputs.expert_weights, tokens, rank
         )
         barrier[lambda: ((1, 1, 1), (64, 1, 1))](self.memory, rank, num_warps=1)
-        stage1[lambda: ((layout.pool_blocks * (i // config.stage1_projection_n), 1, 1), (256, 1, 1))](
+        stage1[lambda: ((256, 1, 1), (256, 1, 1))](
             self.memory, weights.w13, weights.s13, weights.bias1, rank, int(weights.bias1 is not None)
         )
-        barrier[lambda: ((1, 1, 1), (64, 1, 1))](self.memory, rank, num_warps=1)
-        stage2[lambda: ((layout.pool_blocks * (d // 256), 1, 1), (256, 1, 1))](
+        stage2[lambda: ((256, 1, 1), (256, 1, 1))](
             self.memory, weights.w2, weights.s2, weights.bias2, rank, int(weights.bias2 is not None)
         )
         barrier[lambda: ((1, 1, 1), (64, 1, 1))](self.memory, rank, num_warps=1)
