@@ -15,7 +15,7 @@ def make_w13_weight_loads(config):
     """Fill [projection, half_k, n_fragment, word4] registers; caller owns waits."""
     D, I = config.compute_hidden, config.intermediate
     WN, NR = config.stage1_warps_n, config.stage1_wave_n // 16
-    NS, CACHE = NR // 2, config.weight_load_aux
+    NS, CACHE = NR // 2, config.stage1_weight_load_aux
 
     @avelang.jit
     def load_weights(

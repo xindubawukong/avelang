@@ -56,7 +56,6 @@ def make_stage2_compute_k256(intermediate, bias, weight_cache, words=STAGE2_K256
             )
             # Match dev-megamoe: publish each input tile, issue W2 loads,
             # synchronize, then read LDS and run MFMA.
-            lds[stage, input_row, vector ^ (input_row & 15)] = prefetched
             for half_k in al.static_range(2):
                 for n in al.static_range(4):
                     offset_w = (wave * 64 + n * 16) * (I // 2) + half_k * 1024 + lane * 16
@@ -65,6 +64,7 @@ def make_stage2_compute_k256(intermediate, bias, weight_cache, words=STAGE2_K256
                 weight_scales[n] = al.amdgpu.raw_buffer_load_x1(
                     scale_resource, (wave * 2 + n) * I + lane * 4, k * 256, 0
                 )
+            lds[stage, input_row, vector ^ (input_row & 15)] = prefetched
             al.syncthreads()
             read_stage2_input(storage, fragments, al.convert(k, al.u32), lane)
             for half_k in al.static_range(2):
@@ -86,9 +86,6 @@ def make_stage2_compute_k256(intermediate, bias, weight_cache, words=STAGE2_K256
                     for n in al.static_range(4):
                         offset = (tile * 256 + wave * 64 + n * 4 + (lane // 16) * 16) * 2
                         packed_bias[n] = al.amdgpu.raw_buffer_load_x2(bias_resource, offset, 0, 0)
-            else:
-                # Local dev-megamoe retains the trailing barrier between K tiles.
-                al.syncthreads()
 
         al.syncthreads()
         al.amdgpu.s_setprio(0)
@@ -113,7 +110,7 @@ def make_stage2_kernel(config: MoeConfig):
     D, I, E, TOPK = config.hidden, config.intermediate, config.experts, config.topk
     BIAS = config.solution.bias_dtype == DataType.BF16
     WORKERS = config.stage2_workers
-    WEIGHT_CACHE = config.weight_load_aux
+    WEIGHT_CACHE = config.stage2_weight_load_aux
     RATIO = config.stage1_tile_m // 32
     WORDS, ROW_OFFSETS = STAGE2_K256_LDS_WORDS, STAGE2_K256_ARENA_WORDS
     stage2_compute_k256 = make_stage2_compute_k256(I, BIAS, WEIGHT_CACHE)
@@ -172,7 +169,6 @@ def make_stage2_kernel(config: MoeConfig):
                         metadata_token < num_tokens and metadata_slot < TOPK, metadata_token * D * 2, num_tokens * D * 2
                     )
                     storage[4128 + tid] = al.amdgpu.raw_buffer_load_x1(rw_resource, al.convert(tid * 4, al.u32), 0, 0)
-                al.syncthreads()
                 stage2_compute_k256(
                     act_resource,
                     weight_resource,

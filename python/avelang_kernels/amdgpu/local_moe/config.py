@@ -14,7 +14,6 @@ class MoeConfig:
 
     # Fixed launch geometry for the current local implementations.
     stage2_workers: ClassVar[int] = 256
-
     stage1_num_warps: ClassVar[int] = 4
     stage2_num_warps: ClassVar[int] = 4
 
@@ -53,8 +52,12 @@ class MoeConfig:
         return self.solution.bias_dtype != DataType.NONE
 
     @property
-    def weight_load_aux(self) -> int:
-        return 2 if self.solution.weight_load_policy == WeightLoadPolicy.NON_TEMPORAL else 0
+    def stage1_weight_load_aux(self) -> int:
+        return 2 if self.solution.stage1_weight_load_policy == WeightLoadPolicy.NON_TEMPORAL else 0
+
+    @property
+    def stage2_weight_load_aux(self) -> int:
+        return 2 if self.solution.stage2_weight_load_policy == WeightLoadPolicy.NON_TEMPORAL else 0
 
     @property
     def stage1_tile_m(self) -> int:

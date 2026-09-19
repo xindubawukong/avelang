@@ -45,6 +45,7 @@ def make_stage1_compute(config, *, prefetch_input, read_input):
     BIAS = config.bias
     SWIGLU = config.activation == ActivationFunction.OPENAI_SWIGLU
     K_TILES = D // 256
+    VMEM = 2 * (2 * NR + NS)
     BIAS_STRIDE = I
     load_weights = make_w13_weight_loads(config)
 
@@ -110,7 +111,7 @@ def make_stage1_compute(config, *, prefetch_input, read_input):
             # on the last iteration; only input DMA and the handoff are guarded.
             load_weights(resource_w, resource_ws, weights, weight_scales, al.convert(k + 1, al.u32), wave, lane)
             if k + 1 < K_TILES:
-                al.amdgpu.s_waitcnt(0, 0, 0)
+                al.amdgpu.s_waitcnt(VMEM, 0, 0)
                 al.syncthreads()
                 read_input(storage, fragments, input_scales, al.convert(k + 1, al.u32), wave, lane)
         if BIAS:
