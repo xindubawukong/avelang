@@ -10,7 +10,7 @@ from functools import cache
 import avelang
 import avelang.language as al
 
-from .activation import openai_swiglu, silu_dot
+from .activation import openai_swiglu, silu_dot, situ_v2
 from .config import MoeConfig
 from .dispatch import resolve_2stage_implementation
 from .input_mxfp4 import make_mxfp4_input
@@ -44,6 +44,7 @@ def make_stage1_compute(config, *, prefetch_input, read_input):
     WORDS = config.stage1_lds_words
     BIAS = config.bias
     SWIGLU = config.activation == ActivationFunction.OPENAI_SWIGLU
+    SITU = config.activation == ActivationFunction.SITU_V2
     K_TILES = D // 256
     VMEM = 2 * (2 * NR + NS)
     BIAS_STRIDE = I
@@ -141,6 +142,8 @@ def make_stage1_compute(config, *, prefetch_input, read_input):
                     gate, up = accum[0, n, m, c], accum[1, n, m, c]
                     if SWIGLU:
                         activated[n, m, c] = openai_swiglu(gate, up)
+                    elif SITU:
+                        activated[n, m, c] = situ_v2(gate, up)
                     else:
                         activated[n, m, c] = silu_dot(gate, up)
         al.syncthreads()

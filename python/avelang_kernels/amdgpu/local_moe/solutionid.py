@@ -33,6 +33,7 @@ class Stages(IntEnum):
 class ActivationFunction(IntEnum):
     SILU_DOT = 0
     OPENAI_SWIGLU = 1
+    SITU_V2 = 2
 
 
 class Stage1Buffering(IntEnum):
