@@ -33,6 +33,7 @@ class Stages(IntEnum):
 class ActivationFunction(IntEnum):
     SILU_DOT = 0
     OPENAI_SWIGLU = 1
+    SITU_V2 = 2
 
 
 class Stage1Buffering(IntEnum):
@@ -49,10 +50,14 @@ class Stage1TileShape(IntEnum):
     # N includes both gate and up projections: M32 has 128 columns each.
     M32_N256 = 0
     M64_N512 = 1
+    M64_N256 = 2
+    M32_N128_K2 = 4  # Value 3 is reserved in Petit.
 
 
 class Stage2TileShape(IntEnum):
     M32_N256_K256 = 0
+    M32_N256_K128 = 1
+    M64_N256_K128 = 2
 
 
 # Field positions match FusedMoESolutionId::Repr/FromRepr in fused_moe.h.
@@ -142,17 +147,23 @@ class MoeSolutionId:
 
     @property
     def stage1_tile_m(self) -> int:
-        return 64 if self.stage1_tile_shape == Stage1TileShape.M64_N512 else 32
+        return 64 if self.stage1_tile_shape in (Stage1TileShape.M64_N512, Stage1TileShape.M64_N256) else 32
 
     @property
     def stage1_tile_n(self) -> int:
         """Combined gate/up width, matching Petit's naming."""
+        if self.stage1_tile_shape == Stage1TileShape.M32_N128_K2:
+            return 128
         return 512 if self.stage1_tile_shape == Stage1TileShape.M64_N512 else 256
 
     @property
+    def stage1_k_groups(self) -> int:
+        return 2 if self.stage1_tile_shape == Stage1TileShape.M32_N128_K2 else 1
+
+    @property
     def stage2_tile_m(self) -> int:
-        return 32
+        return 64 if self.stage2_tile_shape == Stage2TileShape.M64_N256_K128 else 32
 
     @property
     def stage2_tile_k(self) -> int:
-        return 256
+        return 256 if self.stage2_tile_shape == Stage2TileShape.M32_N256_K256 else 128

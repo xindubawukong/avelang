@@ -18,6 +18,7 @@ from avelang_kernels.amdgpu.local_moe.solutionid import (
     MfmaShape,
     Stage1Buffering,
     Stage1TileShape,
+    Stage2TileShape,
     Stages,
     WeightLoadPolicy,
     WeightOrdering,
@@ -130,17 +131,6 @@ def test_unsupported_requests(overrides):
         available_2stage_solutions(**(PROBLEM | overrides))
 
 
-@pytest.mark.parametrize("activation", ["situ", "situ_v2", "situv2", 2])
-def test_unsupported_activation_is_not_mapped_to_silu(activation):
-    with pytest.raises(ValueError):
-        get_2stage_cfgs(8, 3584, 384, 896, 16, activation=activation, bias_dtype="none")
-
-
-def test_intermediate_must_support_k256_stage2():
-    with pytest.raises(ValueError, match="unsupported Ave local MoE solution"):
-        choose(inter_dim=384, activation="silu", bias_dtype="none")
-
-
 @pytest.mark.parametrize(
     "field,value",
     [
@@ -160,7 +150,10 @@ def test_explicit_id_policy_conflicts_and_unsupported_stages():
     solution = choose().solution
     with pytest.raises(ValueError, match="weight_load_policy"):
         choose(solution_id=solution, weight_load_policy="cached")
-    for changed in (replace(solution, stages=Stages.ONE_STAGE),):
+    for changed in (
+        replace(solution, stages=Stages.ONE_STAGE),
+        replace(solution, stage1_tile_shape=Stage1TileShape.M32_N128_K2),
+    ):
         with pytest.raises(ValueError, match="unsupported Ave local MoE solution"):
             choose(solution_id=changed)
 
@@ -186,6 +179,7 @@ def test_config_stores_solution_and_has_derived_readonly_fields():
         {"mfma": MfmaShape.BF16_MXFP4},
         {"stages": Stages.ONE_STAGE},
         {"stage1_buffering": Stage1Buffering.SINGLE_BUFFER},
+        {"stage1_tile_shape": Stage1TileShape.M32_N128_K2},
         {"hidden": 320},
     ],
 )
@@ -259,8 +253,66 @@ def test_explicit_names_and_integer_codes_keep_the_same_solution():
     assert choose(bias_dtype=None) == choose(bias_dtype=DataType.NONE)
 
 
-def test_independent_policies():
+@pytest.mark.parametrize("tokens", [0, 8, 12, 16, 17, 128, 1024, 1025, 2047, 2048, 2049, 4096, 8191, 8192, 16384])
+def test_kimi_selection_boundaries(tokens):
+    config = get_2stage_cfgs(tokens, 3584, 384, 896, 16, activation="situ", bias_dtype="none")
+    solution = config.solution
+    assert solution.stage1_weight_load_policy == (tokens <= 2048)
+    assert solution.stage2_weight_load_policy == (16 < tokens <= 1024)
+    assert solution.stage1_tile_shape == (Stage1TileShape.M64_N256 if tokens >= 2048 else Stage1TileShape.M32_N128_K2)
+    assert solution.stage2_tile_shape == (
+        Stage2TileShape.M64_N256_K128 if tokens >= 2048 else Stage2TileShape.M32_N256_K128
+    )
+    assert config.use_route_reduce == (tokens >= 8192)
+    ep = get_2stage_cfgs(tokens, 3584, 384, 896, 16, activation="situ", bias_dtype="none", is_ep=True)
+    assert ep.solution == solution and not ep.use_route_reduce
+
+
+def test_independent_policies_and_reduction_require_complete_routes():
     config = choose(stage1_weight_load_policy="cached", stage2_weight_load_policy="non_temporal")
     assert config.stage1_weight_load_aux == 0 and config.stage2_weight_load_aux == 2
     with pytest.raises(ValueError, match="conflict"):
         choose(weight_load_policy="cached", stage2_weight_load_policy="non_temporal")
+    with pytest.raises(ValueError, match="complete local"):
+        get_2stage_cfgs(
+            8192, 3584, 384, 896, 16, activation="situ", bias_dtype="none", is_ep=True, use_route_reduce=True
+        )
+
+
+def mapping_kernel(n_tiles, m_group, groups):
+    import avelang
+    import avelang.language as al
+    from avelang_kernels.amdgpu.local_moe.workgroup import make_grouped_workgroup_mapping
+
+    map_workgroup = make_grouped_workgroup_mapping(n_tiles, m_group, groups)
+    NT = n_tiles
+
+    @avelang.jit
+    def kernel(out: al.Pointer(al.u32), grid_m: al.u32):
+        bid = al.convert(al.block_id(0), al.u32)
+        result = al.make_tensor(out, al.u32, al.make_layout((grid_m * NT, 2), (2, 1)))
+        n, m = map_workgroup(bid, grid_m)
+        result[bid, 0] = n
+        result[bid, 1] = m
+
+    return kernel
+
+
+@pytest.mark.skipif(not torch.version.hip or not torch.cuda.is_available(), reason="Requires AMD GPU")
+@pytest.mark.parametrize("n_tiles,m_group,groups", [(3, 4, 8), (14, 2, 4)])
+def test_grouped_mapping_is_a_permutation_including_partial_groups(n_tiles, m_group, groups):
+    kernel = mapping_kernel(n_tiles, m_group, groups)
+    for grid_m in (1, 2, 3, 5, 7, 16, 17, 65):
+        output = torch.empty((grid_m * n_tiles, 2), dtype=torch.int32, device="cuda")
+        kernel[lambda grid_m=grid_m: ((grid_m * n_tiles, 1, 1), (1, 1, 1))](output, grid_m)
+        expected = []
+        blocks = grid_m * n_tiles
+        for block in range(blocks):
+            group = block % groups
+            remapped = group * (blocks // groups) + min(group, blocks % groups) + block // groups
+            first_m = remapped // (m_group * n_tiles) * m_group
+            height = min(grid_m - first_m, m_group)
+            within = remapped % (m_group * n_tiles)
+            expected.append((within // height, first_m + within % height))
+        assert len(set(expected)) == blocks
+        assert output.cpu().tolist() == [list(pair) for pair in expected]
