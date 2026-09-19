@@ -2,12 +2,7 @@
 
 LLVM 24, gfx950 (MI350), BF16 input/output and dynamically quantized MXFP4
 activations/weights. Stage1/Stage2 and intermediate quantization use Ave DSL.
-BF16 input quantization and scale sorting call AITER as two separate kernels.
-
-The two-stage implementation follows Petit `dev-megamoe` at
-`3f64a87a5dd95f0bc01f3df92aeb05da27194e08`, the parent of the Kimi commit
-`d97fb857`. The Ave module/helper organization is retained. This API always
-selects the existing two-stage path; it does not add Petit's one-stage fallback.
+BF16 input quantization and scale sorting call AITER.
 
 Install the `moe` extra (`pip install -e '.[moe]'`) with a ROCm-compatible
 `amd-aiter` build, or install AITER from the local checkout. AITER is imported
@@ -51,9 +46,9 @@ out = dynamic_mxfp4_moe(x, weights, routing, config, workspace=workspace)
 
 - `MoeSolutionId` owns the local ID codec and encoded choices. Dimensions are
   positive multiples of 64, at most 16320; dispatch applies kernel constraints.
-  The common weight policy occupies bit40 and the Stage1 M32/M64 tile bit41,
-  matching dev-megamoe. Stage2 has fixed geometry. Bits42–63 are reserved.
-  Cached M32 profile IDs are unchanged; NT and M64 IDs use this earlier ABI.
+  Stage1/Stage2 cache policies occupy bits 40/41. Tile fields keep their Petit
+  bit positions: Stage1 uses 42/44/46 and Stage2 uses 43/45. Unsupported enum
+  values and reserved bits are rejected; existing profile IDs are unchanged.
 - `MoeConfig` contains the solution, expert count and top-k. It derives geometry,
   LDS sizes and launch grids, and checks general problem invariants.
 - `dispatch.py` binds complete IDs to Stage1/Stage2 factory pairs. Configuration
@@ -61,7 +56,8 @@ out = dynamic_mxfp4_moe(x, weights, routing, config, workspace=workspace)
   combination through the same registry.
 - `get_2stage_cfgs` selects a configuration and caches normalized requests.
   `solution_id` pins an explicit compatible choice. `weight_load_policy` sets
-  the common policy for both stages. Conflicting explicit choices raise an error.
+  both stages; `stage1_weight_load_policy` and `stage2_weight_load_policy` allow
+  separate overrides. Conflicting explicit choices raise an error.
 
 Activation, dtype and cache policy have separate normalization functions.
 They accept known names and typed enums; dtype also accepts torch dtypes.
@@ -93,9 +89,8 @@ byte-container shapes. The hardware MFMA operates on K128 fragments within
 these K256 blocks; the native weight/scale encoding retains those subtiles.
 
 `IntermediateLayout` owns the intermediate size and views. Act uses
-token/top-k-slot order; scales use row-major sorted-route order, with row
-capacity padded to256. Input and weight scales retain their native layout;
-`unsort_scales` applies to those native scales, not the intermediate workspace.
+token/top-k-slot order; scales use sorted-route order in native M32/K256 tiles,
+with row capacity padded to 256. `unsort_scales` decodes the scales for inspection.
 Input quantization follows AITER's upward-rounded amax/6 scale; intermediate
 quantization follows Petit's distinct rounding rule.
 
@@ -113,37 +108,30 @@ output-column tile. Each worker partitions the live route extent from device
 counts and synchronizes before reusing its shared arena.
 
 Automatic weight policy is non-temporal below 64 routed tokens per expert,
-and cached otherwise. One policy applies to both stages.
+and cached otherwise. Both stages can be overridden independently.
 
 | Responsibility | Ave files | Implementation |
 | --- | --- | --- |
 | Selection and encoding | `solutionid.py`, `config.py`, `dispatch.py` | Complete factory registry, shape and policy selection |
-| Input preparation | `api.py` → AITER | Preallocated buffers; separate input quantization and scale sorting |
+| Input preparation | `api.py` → AITER | Preallocated buffers; fused small-batch quantize/sort |
 | Stage1 input/weights | `input_mxfp4.py`, `weight_mxfp4.py` | Double LDS slots, XOR layout, 16-byte act / 4-byte scale DMA |
-| Stage1 compute | `stage1.py`, `activation.py` | Bulk W13 loads, full VMEM waits, existing hot-loop instruction grouping, SiLU-dot/SwiGLU |
-| Intermediate storage | `intermediate_mxfp4.py`, `scale_layout.py` | Row-major intermediate scales; packed scale stores and word-load/lane-shuffle reads |
-| Stage2 | `stage2.py` | Input LDS stores then W2 loads then barrier; scalar BF16 C-shuffle and branchless packed atomics |
+| Stage1 compute | `stage1.py`, `activation.py` | Four-phase weight prefetch where applicable, MFMA instruction grouping, SiLU-dot/SwiGLU |
+| Intermediate storage | `intermediate_mxfp4.py`, `scale_layout.py` | Quantization/stores, native scale layout and Stage2 input reads |
+| Stage2 | `stage2.py` | Weight prefetch before LDS handoff, packed BF16 C-shuffle, persistent work and per-wave atomic output |
 | Workspace and execution | `api.py` | Caller-owned graph-safe buffers; clears output before Stage2 |
 
 Stage1's compute helper produces an FP32 activation tile in LDS; its wrapper
 owns route lookup and intermediate stores. Stage2's compute helper produces
-weighted BF16 values in linear LDS; its wrapper owns task selection,
+weighted BF16 values in XOR-swizzled LDS; its wrapper owns task selection,
 valid-row checks and global atomic writes. Both use weight as MFMA operand A.
 Access helpers issue memory operations; the compute pipelines own waits and
 barriers. The input arena is reused for output only after its consumers finish.
 
-Stage1 skips the terminal input prefetch, retains the bulk weight-load sequence,
-and fully waits before consuming the next input tile. The existing hot-loop
-scheduler predates Kimi. Stage2 retains the local branch's per-K trailing
-barrier, caches routing weights and output offsets in the LDS metadata tail,
-and loads bias/route-weight fragments after the final MFMA. Output BF16 elements
-are stored individually into linear LDS and read back as pairs for buffer
-atomics, with hardware bounds discarding invalid rows.
-
-The later native intermediate-scale format, independent stage cache policies,
-four-phase W13 prefetch, partial VMEM waits, before-StoreLds W2 prefetch, packed
-BF16 LDS stores, wave-uniform output skipping, output XOR layout and post-GEMM
-bound snapshot are absent.
+`output_word_index` defines the C-shuffle mapping in one place. Its column
+argument is in BF16 elements and its result is a u32 word index. Pair conversion
+uses shape-preserving vector `al.convert`. The output-size bound is read after
+each GEMM and reused across each wave's eight row writes, keeping its register
+lifetime outside the GEMM.
 
 ## Validation and benchmark
 

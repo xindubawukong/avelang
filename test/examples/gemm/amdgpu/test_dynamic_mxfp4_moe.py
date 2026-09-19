@@ -5,7 +5,7 @@ import torch
 from avelang_kernels.amdgpu.local_moe import get_2stage_cfgs
 from avelang_kernels.amdgpu.local_moe.api import _pack_bias, _pack_weights
 from avelang_kernels.amdgpu.local_moe.intermediate_mxfp4 import IntermediateLayout
-from avelang_kernels.amdgpu.local_moe.scale_layout import unsort_scales
+from avelang_kernels.amdgpu.local_moe.scale_layout import scale_byte_shape, unsort_scales
 from avelang_kernels.amdgpu.local_moe.solutionid import ActivationFunction
 
 
@@ -37,7 +37,7 @@ def test_workspace_layout():
     workspace = torch.full((layout.nbytes,), 173, dtype=torch.uint8)
     act, scales = layout.views(workspace, tokens=8, topk=4)
     assert act.shape == (8, 4, 1536)
-    assert scales.shape == (256, 96)
+    assert scales.shape == scale_byte_shape(256, 3072)
     assert scales.data_ptr() - workspace.data_ptr() == 96 * 1536
     act.fill_(1)
     scales.fill_(2)
@@ -325,38 +325,3 @@ def test_m64_n512_stage1_bias_and_m32_stage2(activation):
     actual = dynamic_mxfp4_moe(x, weights, routing, config)
     expected = moe_reference(x, config, raw, routes)
     torch.testing.assert_close(actual.cpu(), expected, rtol=0.02, atol=0.01)
-
-
-@pytest.mark.skipif(not gfx950, reason="Native MXFP4 requires gfx950")
-def test_stage2_row_major_scales_with_routed_rows_and_k_halves():
-    from avelang_kernels.amdgpu.local_moe.stage2 import make_stage2
-
-    tokens, d, i = 32, 256, 512
-    config = get_2stage_cfgs(tokens, d, i, 1, 1, activation="silu", bias_dtype="none")
-    layout = IntermediateLayout(tokens, i)
-    workspace = torch.zeros(layout.nbytes, device="cuda", dtype=torch.uint8)
-    act, scales = layout.views(workspace, tokens, 1)
-    act.fill_(0x22)
-    # Vary scales over every row, K32 block and both K256 tiles. The Stage2
-    # scale consumer must combine bytes from four different lanes correctly.
-    rows = torch.arange(tokens)[:, None]
-    columns = torch.arange(i // 32)[None, :]
-    exponents = (124 + (rows * 3 + columns) % 5).to(torch.uint8)
-    scales[:tokens].copy_(exponents)
-    weight, ws = _pack_weights(
-        torch.full((1, d, i // 2), 0x22, device="cuda", dtype=torch.uint8),
-        torch.full((1, d, i // 32), 127, device="cuda", dtype=torch.uint8),
-    )
-    token_ids = (torch.arange(tokens) * 13 + 7) % tokens
-    ids = token_ids.to(device="cuda", dtype=torch.int32)
-    experts = torch.zeros(1, device="cuda", dtype=torch.int32)
-    route_weights = torch.full((tokens,), 0.5, device="cuda")
-    counts = torch.tensor([tokens, tokens], device="cuda", dtype=torch.int32)
-    output = torch.zeros((tokens, d), device="cuda", dtype=torch.bfloat16)
-    make_stage2(config)[lambda: config.stage2_grid()](
-        workspace, weight, ws, output, ids, experts, route_weights, counts, output, tokens, num_warps=4
-    )
-    expected = torch.empty((tokens, d), dtype=torch.bfloat16)
-    row_sums = 16 * torch.pow(2.0, exponents.float() - 127).sum(dim=1)
-    expected[token_ids] = row_sums[:, None].expand(-1, d).to(torch.bfloat16)
-    torch.testing.assert_close(output.cpu(), expected, rtol=0, atol=0)

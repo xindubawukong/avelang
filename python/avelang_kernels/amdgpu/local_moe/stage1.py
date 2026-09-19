@@ -37,7 +37,7 @@ def make_stage1_compute(config, *, prefetch_input, read_input):
     The input callbacks issue loads and read fragments; this pipeline owns
     their waits. The caller must synchronize before consuming the final tile.
     """
-    D, I = config.hidden, config.intermediate
+    D, I = config.compute_hidden, config.intermediate
     BM, BN, WN, WM = config.stage1_tile_m, config.stage1_projection_n, config.stage1_warps_n, config.stage1_wave_m
     NR, MR = config.stage1_wave_n // 16, WM // 16
     NS = NR // 2
@@ -45,6 +45,7 @@ def make_stage1_compute(config, *, prefetch_input, read_input):
     BIAS = config.bias
     SWIGLU = config.activation == ActivationFunction.OPENAI_SWIGLU
     K_TILES = D // 256
+    VMEM = 2 * (2 * NR + NS)
     BIAS_STRIDE = I
     load_weights = make_w13_weight_loads(config)
 
@@ -106,11 +107,13 @@ def make_stage1_compute(config, *, prefetch_input, read_input):
                                 2 * half_k + n % 2,
                                 2 * half_k + m % 2,
                             )
-            # dev-megamoe W13TileSchedule::Matmul loads the next weights even
-            # on the last iteration; only input DMA and the handoff are guarded.
+            # Match Petit's W13TileSchedule::Matmul: issue the next complete
+            # W1/W3 tile after the current MFMA cluster, including the terminal
+            # clamped load, then leave these requests pending while input DMA
+            # is retired below.
             load_weights(resource_w, resource_ws, weights, weight_scales, al.convert(k + 1, al.u32), wave, lane)
             if k + 1 < K_TILES:
-                al.amdgpu.s_waitcnt(0, 0, 0)
+                al.amdgpu.s_waitcnt(VMEM, 0, 0)
                 al.syncthreads()
                 read_input(storage, fragments, input_scales, al.convert(k + 1, al.u32), wave, lane)
         if BIAS:
