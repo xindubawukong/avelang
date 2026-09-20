@@ -1,4 +1,4 @@
-"""Workspace for separate count, plan, push, compute and combine phases."""
+"""Byte-exact layout of Petit's VMM workspace and direct-push epoch records."""
 
 from dataclasses import dataclass
 
@@ -23,7 +23,9 @@ class WorkspaceLayout:
             "pool_blocks": pool // 32,
             "scale_rows": align_up(pool, 256),
             "scale_cols": (s.intermediate + 255) // 256 * 8,
-            "barrier_record_bytes": 8192 if experts > 128 else 4096,
+            "barrier_record_bytes": (
+                16384 if experts > 512 else 8192 if experts > 128 else 4096
+            ),
         }
         # Offsets relative to the beginning of a rank slot.
         cursor = 0
@@ -35,6 +37,7 @@ class WorkspaceLayout:
             ("input_weights", cap * topk * 4),
             ("input_tokens", cap * self.config.input_token_bytes),
             ("route_output", cap * topk * s.hidden * 2),
+            ("l1_ready", pool // 32 * 4),
             ("metadata", pool * 8),
             ("l1_tokens", pool * self.config.input_token_bytes),
             ("l1_weights", pool * 4),
@@ -49,6 +52,7 @@ class WorkspaceLayout:
         cursor = fields["local_offset"]
         for name, size in (
             ("input_ids", cap * topk * 4),
+            ("l2_ready", pool // 32 * 4),
             ("l2_tokens", pool * s.intermediate // 2),
             ("l2_scales", fields["scale_rows"] * fields["scale_cols"]),
         ):
@@ -58,7 +62,14 @@ class WorkspaceLayout:
         fields["workspace_bytes"] = cursor
         # Offsets relative to each rank's independently owned barrier record.
         cursor = 384
-        for name, size in (("plan_base", experts * 8),):
+        for name, size in (
+            ("entry_count", 256 * 4),
+            ("plan_base", experts * 8),
+            ("count_done", 2 * ranks * 4),
+            ("plan_ready", 2 * ranks * 4),
+            ("epoch_gate", 4),
+            ("launch_ready", ranks * 4),
+        ):
             fields[name] = cursor
             cursor += size
         if cursor > fields["barrier_record_bytes"] or fields["workspace_bytes"] >= 2**32:

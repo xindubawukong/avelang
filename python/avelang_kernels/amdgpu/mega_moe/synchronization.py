@@ -1,9 +1,47 @@
-"""Conservative phase-wide synchronization for sequential push MoE kernels."""
+"""Scoped publication and epoch polling used by the MegaMoE device protocol."""
 
 from functools import cache
 
 import avelang
 import avelang.language as al
+
+
+@avelang.jit
+def complete_stores():
+    al.amdgpu.compiler_barrier()
+    al.amdgpu.s_waitcnt(0, 0, 0)
+    al.amdgpu.fence(1, 2)
+    al.amdgpu.compiler_barrier()
+
+
+@avelang.jit
+def wait_equal(resource: al.Tensor((4,), al.u32), offset: al.u32, expected: al.u32):
+    observed = al.amdgpu.raw_buffer_load_x1(resource, offset, 0, 17)
+    while observed != expected:
+        al.amdgpu.compiler_barrier()
+        observed = al.amdgpu.raw_buffer_load_x1(resource, offset, 0, 17)
+
+    al.amdgpu.fence(0, 2)
+
+
+@avelang.jit
+def wait_epoch(resource: al.Tensor((4,), al.u32), offset: al.u32, expected: al.u32):
+    observed = al.amdgpu.raw_buffer_load_x1(resource, offset, 0, 17)
+    while al.bitcast(observed - expected, al.i32) < 0:
+        al.amdgpu.compiler_barrier()
+        observed = al.amdgpu.raw_buffer_load_x1(resource, offset, 0, 17)
+
+    al.amdgpu.fence(0, 2)
+
+
+@avelang.jit
+def wait_mask(resource: al.Tensor((4,), al.u32), offset: al.u32, mask: al.u32):
+    observed = al.amdgpu.raw_buffer_load_x1(resource, offset, 0, 17)
+    while (observed & mask) != mask:
+        al.amdgpu.s_sleep(1)
+        observed = al.amdgpu.raw_buffer_load_x1(resource, offset, 0, 17)
+
+    al.amdgpu.fence(0, 2)
 
 
 @cache

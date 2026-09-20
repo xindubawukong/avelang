@@ -87,14 +87,5 @@ def make_kernels(config):
     from .stage1 import make_stage1
     from .stage2 import make_stage2
     from .synchronization import make_global_barrier
-    from .token_shuffle_direct_push import make_count, make_plan, make_push
 
-    return (
-        make_count(config),
-        make_plan(config),
-        make_push(config),
-        make_stage1(config),
-        make_stage2(config),
-        make_combine_kernel(config),
-        make_global_barrier(config),
-    )
+    return make_stage1(config), make_stage2(config), make_combine_kernel(config), make_global_barrier(config)

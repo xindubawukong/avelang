@@ -171,18 +171,21 @@ class MegaMoeWorkspace:
             or out.stride(0) not in (config.solution.hidden, config.compute_hidden)
         ):
             raise ValueError("out must be BF16 [tokens, hidden] with a logical or padded row stride")
-        count, plan, push, stage1, stage2, combine, barrier = factory(config)
+        stage1, stage2, combine, barrier = factory(config)
+        threads = config.stage1_num_warps * 64
         rank = self.heap.rank
-        count[lambda: ((1, 1, 1), (256, 1, 1))](self.memory, inputs.expert_ids, tokens, rank)
-        barrier[lambda: ((1, 1, 1), (64, 1, 1))](self.memory, rank, num_warps=1)
-        plan[lambda: ((1, 1, 1), (256, 1, 1))](self.memory, rank)
-        barrier[lambda: ((1, 1, 1), (64, 1, 1))](self.memory, rank, num_warps=1)
-        push[lambda: ((config.solution.experts, 1, 1), (256, 1, 1))](
-            self.memory, inputs.act, inputs.expert_weights, tokens, rank
-        )
-        barrier[lambda: ((1, 1, 1), (64, 1, 1))](self.memory, rank, num_warps=1)
-        stage1[lambda: ((256, 1, 1), (256, 1, 1))](
-            self.memory, weights.w13, weights.s13, weights.bias1, rank, int(weights.bias1 is not None)
+        stage1[lambda: ((256, 1, 1), (threads, 1, 1))](
+            self.memory,
+            inputs.act,
+            inputs.expert_ids,
+            inputs.expert_weights,
+            weights.w13,
+            weights.s13,
+            weights.bias1,
+            tokens,
+            rank,
+            int(weights.bias1 is not None),
+            num_warps=threads // 64,
         )
         stage2[lambda: ((256, 1, 1), (256, 1, 1))](
             self.memory, weights.w2, weights.s2, weights.bias2, rank, int(weights.bias2 is not None)
