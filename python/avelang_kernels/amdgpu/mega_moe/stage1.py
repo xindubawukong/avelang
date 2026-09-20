@@ -103,8 +103,9 @@ def make_stage1(config):
     I, TOPK = config.solution.intermediate, config.solution.topk
     BM, THREADS = config.stage1_tile_m, config.stage1_num_warps * 64
     WORDS, SIZE, ROW_BYTES = config.stage1_lds_words, layout.workspace_bytes, config.input_token_bytes
+    HEADS = layout.work_heads
     direct_push_token_shuffle = make_direct_push_token_shuffle(layout, THREADS, WORDS)
-    get_work = make_scheduler(layout, BM, I // 256)
+    load_expert_metadata, get_work = make_scheduler(layout, BM, I // 256)
     run_stage1_tile = make_stage1_tile(config)
 
     @avelang.jit
@@ -121,6 +122,7 @@ def make_stage1(config):
         bias_enabled: al.u32,
     ):
         tid, block = al.convert(al.thread_id(0), al.u32), al.convert(al.block_id(0), al.u32)
+        lane = tid % 64
         memory = al.make_tensor(heap, al.u8, al.make_layout((SIZE,), (1,)))
         resource = al.amdgpu.make_rsrc(memory, SIZE)
         inputs = al.make_tensor(x, al.u8, al.make_layout((count * ROW_BYTES,), (1,)))
@@ -131,14 +133,20 @@ def make_stage1(config):
         rr = al.amdgpu.make_rsrc(weights, count * TOPK * 4)
         storage = al.make_shared((WORDS,), al.u32)
         direct_push_token_shuffle(resource, storage, xr, ir, rr, count, rank, block, tid)
-        logical, active = block, al.convert(1, al.u32)
+        lane_tokens, lane_base = load_expert_metadata(resource, rank, lane)
+        active = al.convert(1, al.u32)
         while active != 0:
-            expert, pool, rows, tile, found = get_work(resource, rank, logical)
+            if tid == 0:
+                shard = block % 8
+                ticket = al.amdgpu.raw_buffer_atomic_add_u32(al.convert(1, al.u32), resource, HEADS + shard * 64, 0, 16)
+                storage[WORDS - 1] = shard + ticket * 8
+            al.syncthreads()
+            logical = storage[WORDS - 1]
+            expert, pool, rows, tile, found = get_work(lane_tokens, lane_base, logical, lane)
             active = al.amdgpu.readfirstlane(found)
             if active != 0:
                 expert, pool = al.amdgpu.readfirstlane(expert), al.amdgpu.readfirstlane(pool)
                 rows, tile = al.amdgpu.readfirstlane(rows), al.amdgpu.readfirstlane(tile)
                 run_stage1_tile(resource, storage, w, ws, bias, expert, pool, rows, tile, rank, bias_enabled, tid)
-                logical = logical + 256
 
     return stage1

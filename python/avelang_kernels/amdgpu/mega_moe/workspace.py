@@ -51,6 +51,7 @@ class WorkspaceLayout:
         )
         cursor = fields["local_offset"]
         for name, size in (
+            ("work_heads", 1024),
             ("input_ids", cap * topk * 4),
             ("l2_ready", pool // 32 * 4),
             ("l2_tokens", pool * s.intermediate // 2),

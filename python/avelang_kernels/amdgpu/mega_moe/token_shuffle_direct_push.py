@@ -19,7 +19,7 @@ def make_direct_push_token_shuffle(layout, threads, words):
     SEND, RECV, SUM, ROUTES = layout.send_counts, layout.recv_counts, layout.recv_sum, layout.recv_tokens
     L1, WEIGHTS, META, READY = layout.l1_tokens, layout.l1_weights, layout.metadata, layout.l1_ready
     ENTRY, PLAN, DONE, PLAN_READY = layout.entry_count, layout.plan_base, layout.count_done, layout.plan_ready
-    GATE, LAUNCH, L2_READY = layout.epoch_gate, layout.launch_ready, layout.l2_ready
+    GATE, LAUNCH, HEADS, L2_READY = layout.epoch_gate, layout.launch_ready, layout.work_heads, layout.l2_ready
     ITER = (E + threads - 1) // threads
     EXPERTS_PER_LANE = (LE + 63) // 64
 
@@ -150,6 +150,8 @@ def make_direct_push_token_shuffle(layout, threads, words):
             if tid < R:
                 dest = (rank + tid) % R
                 al.amdgpu.raw_buffer_store_x1(expected, resource, dest * C + DONE + (parity * R + rank) * 4, 0, 17)
+            if tid < 16:
+                al.amdgpu.raw_buffer_store_x1(al.convert(0, al.u32), resource, HEADS + tid * 64, 0, 17)
             if wave == 0:
                 if lane < R:
                     wait_equal(resource, rank * C + DONE + (parity * R + lane) * 4, expected)

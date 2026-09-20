@@ -97,7 +97,7 @@ def make_stage2(config):
     layout = WorkspaceLayout(config)
     D = config.compute_hidden
     SIZE, WORDS = layout.workspace_bytes, STAGE2_K256_LDS_WORDS
-    get_work = make_scheduler(layout, 32, D // 256)
+    load_expert_metadata, get_work = make_scheduler(layout, 32, D // 256)
     run_stage2_tile = make_stage2_tile(config)
 
     @avelang.jit
@@ -110,12 +110,14 @@ def make_stage2(config):
         bias_enabled: al.u32,
     ):
         tid = al.convert(al.thread_id(0), al.u32)
+        lane = tid % 64
         memory = al.make_tensor(heap, al.u8, al.make_layout((SIZE,), (1,)))
         resource = al.amdgpu.make_rsrc(memory, SIZE)
         storage = al.make_shared((WORDS,), al.u32)
+        lane_tokens, lane_base = load_expert_metadata(resource, rank, lane)
         logical, active = al.convert(al.block_id(0), al.u32), al.convert(1, al.u32)
         while active != 0:
-            expert, pool, rows, tile, found = get_work(resource, rank, logical)
+            expert, pool, rows, tile, found = get_work(lane_tokens, lane_base, logical, lane)
             active = al.amdgpu.readfirstlane(found)
             if active != 0:
                 expert, pool = al.amdgpu.readfirstlane(expert), al.amdgpu.readfirstlane(pool)
