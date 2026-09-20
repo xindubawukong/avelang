@@ -107,8 +107,10 @@ def make_stage1_compute(config, *, prefetch_input, read_input):
                                 2 * half_k + n % 2,
                                 2 * half_k + m % 2,
                             )
-            # dev-megamoe W13TileSchedule::Matmul loads the next weights even
-            # on the last iteration; only input DMA and the handoff are guarded.
+            # Match Petit's W13TileSchedule::Matmul: issue the next complete
+            # W1/W3 tile after the current MFMA cluster, including the terminal
+            # clamped load, then leave these requests pending while input DMA
+            # is retired below.
             load_weights(resource_w, resource_ws, weights, weight_scales, al.convert(k + 1, al.u32), wave, lane)
             if k + 1 < K_TILES:
                 al.amdgpu.s_waitcnt(VMEM, 0, 0)
