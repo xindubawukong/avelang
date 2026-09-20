@@ -71,13 +71,12 @@ class MegaMoeWorkspace:
             config.solution.hidden,
             config.input_token_bytes,
         )
-        base = layout.rank_base(heap.rank)
-        rows = heap.tensor(base + layout.input_tokens, cap * stride).view(cap, stride)
+        rows = heap.tensor(layout.input_tokens, cap * stride).view(cap, stride)
         inputs = MegaMoeInputViews(
             rows[:, : d // 2],
             rows[:, d // 2 : d // 2 + d // 32],
             heap.tensor(layout.input_ids, cap * topk * 4).view(torch.int32).view(cap, topk),
-            heap.tensor(base + layout.input_weights, cap * topk * 4).view(torch.float32).view(cap, topk),
+            heap.tensor(layout.input_weights, cap * topk * 4).view(torch.float32).view(cap, topk),
         )
         return cls(
             config,
@@ -171,9 +170,9 @@ class MegaMoeWorkspace:
             or out.stride(0) not in (config.solution.hidden, config.compute_hidden)
         ):
             raise ValueError("out must be BF16 [tokens, hidden] with a logical or padded row stride")
-        stage1, stage2, combine, barrier = factory(config)
+        kernels = factory(config)
+        stage1, stage2, combine = kernels
         threads = config.stage1_num_warps * 64
-        rank = self.heap.rank
         stage1[lambda: ((256, 1, 1), (threads, 1, 1))](
             self.memory,
             inputs.act,
@@ -183,16 +182,16 @@ class MegaMoeWorkspace:
             weights.s13,
             weights.bias1,
             tokens,
-            rank,
+            self.heap.rank,
             int(weights.bias1 is not None),
             num_warps=threads // 64,
         )
-        stage2[lambda: ((256, 1, 1), (256, 1, 1))](
-            self.memory, weights.w2, weights.s2, weights.bias2, rank, int(weights.bias2 is not None)
+        stage2[lambda: ((1280, 1, 1), (256, 1, 1))](
+            self.memory, weights.w2, weights.s2, weights.bias2, self.heap.rank, int(weights.bias2 is not None)
         )
-        barrier[lambda: ((1, 1, 1), (64, 1, 1))](self.memory, rank, num_warps=1)
-        combine[lambda: ((128, 1, 1), (512, 1, 1))](self.memory, out, tokens, out.stride(0), rank, num_warps=8)
-        barrier[lambda: ((1, 1, 1), (64, 1, 1))](self.memory, rank, num_warps=1)
+        combine[lambda: ((128, 1, 1), (512, 1, 1))](
+            self.memory, out, tokens, out.stride(0), self.heap.rank, num_warps=8
+        )
         return out
 
 

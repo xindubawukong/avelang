@@ -24,8 +24,8 @@ def make_stage2_tile(config):
     L2, SCALES, READY = layout.l2_tokens, layout.l2_scales, layout.l2_ready
     MASK = (1 << (I // 256)) - 1
     WORDS = STAGE2_K256_LDS_WORDS
-    stage2_compute_k256 = make_stage2_compute_k256(I, s.bias_dtype == DataType.BF16, 2, 17)
-    initialize_w2_resources = make_w2_resources(D, I, E, I // 32)
+    stage2_compute_k256 = make_stage2_compute_k256(I, s.bias_dtype == DataType.BF16, 0, 16)
+    initialize_w2_resources = make_w2_resources(D, I, E, I // 32, limit_to_tile=True)
 
     @avelang.jit
     def run_stage2_tile(
@@ -71,7 +71,7 @@ def make_stage2_tile(config):
         for group in al.static_range(8):
             row = wave + group * 4
             if row < rows:
-                metadata = al.amdgpu.raw_buffer_load_x2(resource, B + rank * SLOT + META + (pool + row) * 8, 0, 17)
+                metadata = al.amdgpu.raw_buffer_load_x2(resource, B + rank * SLOT + META + (pool + row) * 8, 0, 16)
                 route = al.amdgpu.readfirstlane(al.convert(metadata[0], al.u32))
                 source = al.amdgpu.readfirstlane(al.convert(metadata[1], al.u32))
                 row_view = al.subview(
@@ -83,9 +83,7 @@ def make_stage2_tile(config):
                 output_resource = al.amdgpu.make_rsrc(row_view, LOGICAL * 2)
                 for half in al.static_range(2):
                     value = storage[output_word_index(row, (half * 64 + lane) * 2)]
-                    al.amdgpu.raw_buffer_store_x1(value, output_resource, tile * 512 + (half * 64 + lane) * 4, 0, 17)
-        al.amdgpu.fence(1, 2)
-
+                    al.amdgpu.raw_buffer_store_x1(value, output_resource, tile * 512 + (half * 64 + lane) * 4, 0, 2)
         al.syncthreads()
 
     return run_stage2_tile
@@ -123,6 +121,6 @@ def make_stage2(config):
                 expert, pool = al.amdgpu.readfirstlane(expert), al.amdgpu.readfirstlane(pool)
                 rows, tile = al.amdgpu.readfirstlane(rows), al.amdgpu.readfirstlane(tile)
                 run_stage2_tile(heap, resource, storage, w, ws, bias, expert, pool, rows, tile, rank, bias_enabled, tid)
-                logical = logical + 256
+                logical = logical + 1280
 
     return stage2

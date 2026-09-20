@@ -37,12 +37,12 @@ def make_direct_push_token_shuffle(layout, threads, words):
         header: al.u1,
     ):
         for vec in al.range(vector_lane, VECS, vector_stride):
-            value = al.amdgpu.raw_buffer_load_x4(x, (route // TOPK) * ROW_BYTES + vec * 16, 0, 17)
+            value = al.amdgpu.raw_buffer_load_x4(x, (route // TOPK) * ROW_BYTES + vec * 16, 0, 0)
             al.amdgpu.raw_buffer_store_x4(
                 value, resource, B + destination * SLOT + L1 + pool * ROW_BYTES + vec * 16, 0, 17
             )
         if header:
-            weight = al.amdgpu.raw_buffer_load_x1(rw, route * 4, 0, 17)
+            weight = al.amdgpu.raw_buffer_load_x1(rw, route * 4, 0, 0)
             al.amdgpu.raw_buffer_store_x1(weight, resource, B + destination * SLOT + WEIGHTS + pool * 4, 0, 17)
             metadata = al.make_local((2,), al.u32)
             metadata[0], metadata[1] = route, rank
@@ -69,9 +69,9 @@ def make_direct_push_token_shuffle(layout, threads, words):
                 if lane == 0:
                     route = al.amdgpu.raw_buffer_load_x1(
                         resource,
-                        B + rank * SLOT + ROUTES + ((destination * LE + expert) * CAPACITY + ordinal) * 4,
+                        ROUTES + ((destination * LE + expert) * CAPACITY + ordinal) * 4,
                         0,
-                        17,
+                        16,
                     )
                 route = al.amdgpu.readfirstlane(route)
                 copy_row(
@@ -80,7 +80,7 @@ def make_direct_push_token_shuffle(layout, threads, words):
         else:
             for ordinal in al.range(begin, end):
                 route = al.amdgpu.raw_buffer_load_x1(
-                    resource, B + rank * SLOT + ROUTES + ((destination * LE + expert) * CAPACITY + ordinal) * 4, 0, 17
+                    resource, ROUTES + ((destination * LE + expert) * CAPACITY + ordinal) * 4, 0, 16
                 )
                 copy_row(
                     resource,
@@ -123,7 +123,7 @@ def make_direct_push_token_shuffle(layout, threads, words):
         wave, lane = al.amdgpu.readfirstlane(tid // 64), tid % 64
         if tid == 0:
             scratch[2 * E] = al.amdgpu.raw_buffer_atomic_add_u32(
-                al.convert(1, al.u32), resource, rank * C + ENTRY + block * 4, 0, 16
+                al.convert(1, al.u32), resource, rank * C + ENTRY + block * 4, 0, 0
             )
         al.syncthreads()
         epoch = scratch[2 * E] + 1
@@ -141,7 +141,7 @@ def make_direct_push_token_shuffle(layout, threads, words):
                     counts[expert] = al.convert(0, al.u32)
             al.syncthreads()
             for route in al.range(tid, tokens * TOPK, threads):
-                expert = al.amdgpu.raw_buffer_load_x1(ids, route * 4, 0, 17)
+                expert = al.amdgpu.raw_buffer_load_x1(ids, route * 4, 0, 0)
                 if expert < E:
                     al.amdgpu.atomic_add(expert * 4, al.convert(1, al.u32), counts, 0)
             al.syncthreads()
@@ -149,9 +149,7 @@ def make_direct_push_token_shuffle(layout, threads, words):
                 expert = tid + i * threads
                 if expert < E:
                     count = counts[expert]
-                    al.amdgpu.raw_buffer_store_x1(
-                        count, resource, B + rank * SLOT + SEND + expert * 8 + parity * 4, 0, 17
-                    )
+                    al.amdgpu.raw_buffer_store_x1(count, resource, SEND + expert * 8 + parity * 4, 0, 16)
                     al.amdgpu.raw_buffer_store_x1(
                         count,
                         resource,
@@ -166,7 +164,7 @@ def make_direct_push_token_shuffle(layout, threads, words):
                 dest = (rank + tid) % R
                 al.amdgpu.raw_buffer_store_x1(expected, resource, dest * C + DONE + (parity * R + rank) * 4, 0, 17)
             if tid < 16:
-                al.amdgpu.raw_buffer_store_x1(al.convert(0, al.u32), resource, HEADS + tid * 64, 0, 17)
+                al.amdgpu.raw_buffer_store_x1(al.convert(0, al.u32), resource, HEADS + tid * 64, 0, 16)
             if wave == 0:
                 if lane < R:
                     wait_equal(resource, rank * C + DONE + (parity * R + lane) * 4, expected)
@@ -178,7 +176,7 @@ def make_direct_push_token_shuffle(layout, threads, words):
                     if expert < LE:
                         for src in al.static_range(R):
                             count = al.amdgpu.raw_buffer_load_x1(
-                                resource, B + rank * SLOT + RECV + (src * LE + expert) * 8 + parity * 4, 0, 17
+                                resource, B + rank * SLOT + RECV + (src * LE + expert) * 8 + parity * 4, 0, 16
                             )
                             scratch[E + src * LE + expert] = count
                             total = total + count
@@ -191,7 +189,7 @@ def make_direct_push_token_shuffle(layout, threads, words):
                     if expert < LE:
                         record = al.make_local((2,), al.u32)
                         record[0], record[1] = total, al.convert(256 * R, al.u32)
-                        al.amdgpu.raw_buffer_store_x2(record, resource, B + rank * SLOT + SUM + expert * 8, 0, 17)
+                        al.amdgpu.raw_buffer_store_x2(record, resource, SUM + expert * 8, 0, 16)
                         prefix = al.convert(0, al.u32)
                         for src in al.static_range(R):
                             al.amdgpu.raw_buffer_store_x1(
@@ -205,20 +203,20 @@ def make_direct_push_token_shuffle(layout, threads, words):
                     pool_rows = pool_rows + al.shuffle(inclusive, 63, 64)
                 for pool_block in al.range(lane, pool_rows // 32, 64):
                     al.amdgpu.raw_buffer_store_x1(
-                        al.convert(0, al.u32), resource, B + rank * SLOT + READY + pool_block * 4, 0, 17
+                        al.convert(0, al.u32), resource, B + rank * SLOT + READY + pool_block * 4, 0, 16
                     )
-                    al.amdgpu.raw_buffer_store_x1(al.convert(0, al.u32), resource, L2_READY + pool_block * 4, 0, 17)
+                    al.amdgpu.raw_buffer_store_x1(al.convert(0, al.u32), resource, L2_READY + pool_block * 4, 0, 16)
             else:
                 for route in al.range((wave - 1) * 64 + lane, tokens * TOPK, threads - 64):
-                    expert = al.amdgpu.raw_buffer_load_x1(ids, route * 4, 0, 17)
+                    expert = al.amdgpu.raw_buffer_load_x1(ids, route * 4, 0, 0)
                     if expert < E:
                         ordinal = al.amdgpu.atomic_add(expert * 4, al.convert(1, al.u32), counts, 0)
                         al.amdgpu.raw_buffer_store_x1(
                             al.convert(route, al.u32),
                             resource,
-                            B + rank * SLOT + ROUTES + (expert * CAPACITY + ordinal) * 4,
+                            ROUTES + (expert * CAPACITY + ordinal) * 4,
                             0,
-                            17,
+                            16,
                         )
             complete_stores()
             al.syncthreads()
@@ -239,10 +237,10 @@ def make_direct_push_token_shuffle(layout, threads, words):
             if P == 56:
                 if tid < LE:
                     scratch[tid] = al.amdgpu.raw_buffer_load_x1(
-                        resource, B + rank * SLOT + SEND + (dest * LE + tid) * 8 + parity * 4, 0, 17
+                        resource, SEND + (dest * LE + tid) * 8 + parity * 4, 0, 16
                     )
                     scratch[E + tid] = al.amdgpu.raw_buffer_load_x1(
-                        resource, rank * C + PLAN + (dest * LE + tid) * 8 + parity * 4, 0, 17
+                        resource, rank * C + PLAN + (dest * LE + tid) * 8 + parity * 4, 0, 16
                     )
                 al.syncthreads()
                 for expert in al.range(LE):
@@ -270,10 +268,10 @@ def make_direct_push_token_shuffle(layout, threads, words):
                     expert = task // R
                     if tid == 0:
                         scratch[0] = al.amdgpu.raw_buffer_load_x1(
-                            resource, B + rank * SLOT + SEND + (dest * LE + expert) * 8 + parity * 4, 0, 17
+                            resource, SEND + (dest * LE + expert) * 8 + parity * 4, 0, 16
                         )
                         scratch[1] = al.amdgpu.raw_buffer_load_x1(
-                            resource, rank * C + PLAN + (dest * LE + expert) * 8 + parity * 4, 0, 17
+                            resource, rank * C + PLAN + (dest * LE + expert) * 8 + parity * 4, 0, 16
                         )
                     al.syncthreads()
                     copy_rows(

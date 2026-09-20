@@ -28,10 +28,12 @@ def make_stage1_tile(config):
     L2, SCALES, L2_READY = layout.l2_tokens, layout.l2_scales, layout.l2_ready
     SCALE_COLS = layout.scale_cols
     ROWS_PER_SLICE, SLICES = THREADS // 32, BM // (THREADS // 32)
-    prepare_scales, prefetch_input, read_input = make_mxfp4_packed_input(config, s.hidden, ROW_BYTES, 17)
+    prepare_scales, prefetch_input, read_input = make_mxfp4_packed_input(
+        config, s.hidden, ROW_BYTES, 16 if s.world_size > 1 else 0
+    )
     stage1_compute = make_stage1_compute(config, prefetch_input=prefetch_input, read_input=read_input)
     initialize_w13_resources = make_w13_resources(D, I, E, BN, I)
-    store_intermediate = make_intermediate_store(I, SCALE_COLS, act_aux=17, scale_aux=17)
+    store_intermediate = make_intermediate_store(I, SCALE_COLS, act_aux=16, scale_aux=16)
 
     @avelang.jit
     def run_stage1_tile(
@@ -90,7 +92,7 @@ def make_stage1_tile(config):
         al.syncthreads()
         if tid == 0:
             for subblock in al.range((rows + 31) // 32):
-                al.amdgpu.raw_buffer_atomic_or_u32(1 << tile, resource, L2_READY + (pool // 32 + subblock) * 4, 0, 16)
+                al.amdgpu.raw_buffer_atomic_or_u32(1 << tile, resource, L2_READY + (pool // 32 + subblock) * 4, 0, 0)
         al.syncthreads()
 
     return run_stage1_tile
@@ -138,7 +140,7 @@ def make_stage1(config):
         while active != 0:
             if tid == 0:
                 shard = block % 8
-                ticket = al.amdgpu.raw_buffer_atomic_add_u32(al.convert(1, al.u32), resource, HEADS + shard * 64, 0, 16)
+                ticket = al.amdgpu.raw_buffer_atomic_add_u32(al.convert(1, al.u32), resource, HEADS + shard * 64, 0, 0)
                 storage[WORDS - 1] = shard + ticket * 8
             al.syncthreads()
             logical = storage[WORDS - 1]

@@ -86,6 +86,5 @@ def make_kernels(config):
     from .route_output import make_combine_kernel
     from .stage1 import make_stage1
     from .stage2 import make_stage2
-    from .synchronization import make_global_barrier
 
-    return make_stage1(config), make_stage2(config), make_combine_kernel(config), make_global_barrier(config)
+    return make_stage1(config), make_stage2(config), make_combine_kernel(config)

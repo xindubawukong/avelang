@@ -5,6 +5,7 @@ from functools import cache
 import avelang
 import avelang.language as al
 
+from .synchronization import make_grid_barrier, wait_epoch
 from .workspace import WorkspaceLayout
 
 
@@ -44,7 +45,7 @@ def make_route_reduce(config, blocks, waves):
                                 al.convert(B + rank * SLOT + OUT + (token * TOPK + slot) * D * 2, al.u32)
                             )
                             values[slot] = al.amdgpu.raw_buffer_load_x4(
-                                resource, al.convert(col * 16, al.u32), offset, 17
+                                resource, al.convert(col * 16, al.u32), offset, 18
                             )
                         bf = al.view(values, al.bf16, al.make_layout((TOPK, 4, 2), (8, 2, 1)))
                         accum = al.full((4, 2), 0, al.f32)
@@ -63,7 +64,10 @@ def make_route_reduce(config, blocks, waves):
 @cache
 def make_combine_kernel(config):
     layout = WorkspaceLayout(config)
-    SIZE = layout.workspace_bytes
+    R = config.solution.world_size
+    SIZE, C = layout.workspace_bytes, layout.barrier_record_bytes
+    GATE, GRID = layout.epoch_gate, layout.grid_sync + 4 * 4
+    grid_barrier = make_grid_barrier(128, True)
     reduce_routes = make_route_reduce(config, 128, 8)
 
     @avelang.jit
@@ -71,6 +75,18 @@ def make_combine_kernel(config):
         tid, block = al.convert(al.thread_id(0), al.u32), al.convert(al.block_id(0), al.u32)
         memory = al.make_tensor(heap, al.u8, al.make_layout((SIZE,), (1,)))
         resource = al.amdgpu.make_rsrc(memory, SIZE)
+        epoch = al.amdgpu.raw_buffer_load_x1(resource, rank * C + GATE, 0, 17)
+        grid_barrier(resource, al.convert(GRID, al.u32), block, tid)
+        if tid < 64:
+            if block == 0:
+                al.amdgpu.fence(0, 2)
+                if tid < R:
+                    al.amdgpu.fence(1, 2)
+                    al.amdgpu.raw_buffer_store_x1(epoch, resource, tid * C + 256 + rank * 4, 0, 17)
+                al.amdgpu.s_waitcnt(0, 0, 0)
+            if tid < R:
+                wait_epoch(resource, rank * C + 256 + tid * 4, epoch)
+        al.syncthreads()
         reduce_routes(resource, out, tokens, stride, rank, block, tid)
 
     return combine

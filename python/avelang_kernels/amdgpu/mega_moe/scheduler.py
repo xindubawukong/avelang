@@ -14,7 +14,7 @@ def make_scheduler(layout, tile_m, tile_count):
     LE = layout.config.local_experts
     if LE > 128:
         raise ValueError("MegaMoE scheduler supports at most 128 local experts")
-    B, SLOT, SUM = layout.rank_sym_buffer_base, layout.rank_slot_bytes, layout.recv_sum
+    SUM = layout.recv_sum
 
     if LE <= 64:
 
@@ -22,7 +22,7 @@ def make_scheduler(layout, tile_m, tile_count):
         def load_expert_metadata(resource: al.Tensor((4,), al.u32), rank: al.u32, lane: al.u32) -> (al.u32, al.u32):
             tokens = al.convert(0, al.u32)
             if lane < LE:
-                tokens = al.amdgpu.raw_buffer_load_x1(resource, B + rank * SLOT + SUM + lane * 8, 0, 16)
+                tokens = al.amdgpu.raw_buffer_load_x1(resource, SUM + lane * 8, 0, 16)
             blocks = (tokens + 31) // 32
             inclusive = blocks
             for shift in al.static_range(6):
@@ -86,7 +86,7 @@ def make_scheduler(layout, tile_m, tile_count):
             expert = bank * 64 + lane
             count = al.convert(0, al.u32)
             if expert < LE:
-                count = al.amdgpu.raw_buffer_load_x1(resource, B + rank * SLOT + SUM + expert * 8, 0, 16)
+                count = al.amdgpu.raw_buffer_load_x1(resource, SUM + expert * 8, 0, 16)
             blocks = (count + 31) // 32
             inclusive = blocks
             for shift in al.static_range(6):

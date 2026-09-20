@@ -1,4 +1,4 @@
-"""Byte-exact layout of Petit's VMM workspace and direct-push epoch records."""
+"""Byte-exact layout of Petit's PR38 direct-push VMM workspace."""
 
 from dataclasses import dataclass
 
@@ -23,20 +23,14 @@ class WorkspaceLayout:
             "pool_blocks": pool // 32,
             "scale_rows": align_up(pool, 256),
             "scale_cols": (s.intermediate + 255) // 256 * 8,
-            "barrier_record_bytes": (
-                16384 if experts > 512 else 8192 if experts > 128 else 4096
-            ),
+            "barrier_record_bytes": 16384 if experts > 512 else 8192 if experts > 128 else 4096,
         }
         # Offsets relative to the beginning of a rank slot.
         cursor = 0
         for name, size in (
-            ("send_counts", experts * 8),
             ("recv_counts", ranks * local * 8),
-            ("recv_sum", local * 8),
-            ("recv_tokens", ranks * local * cap * 4),
-            ("input_weights", cap * topk * 4),
-            ("input_tokens", cap * self.config.input_token_bytes),
             ("route_output", cap * topk * s.hidden * 2),
+            ("route_ready", 2 * cap * 4),
             ("l1_ready", pool // 32 * 4),
             ("metadata", pool * 8),
             ("l1_tokens", pool * self.config.input_token_bytes),
@@ -51,8 +45,14 @@ class WorkspaceLayout:
         )
         cursor = fields["local_offset"]
         for name, size in (
+            ("grid_sync", 128),
             ("work_heads", 1024),
             ("input_ids", cap * topk * 4),
+            ("send_counts", experts * 8),
+            ("recv_sum", local * 8),
+            ("recv_tokens", ranks * local * cap * 4),
+            ("input_weights", cap * topk * 4),
+            ("input_tokens", cap * self.config.input_token_bytes),
             ("l2_ready", pool // 32 * 4),
             ("l2_tokens", pool * s.intermediate // 2),
             ("l2_scales", fields["scale_rows"] * fields["scale_cols"]),
@@ -68,6 +68,7 @@ class WorkspaceLayout:
             ("plan_base", experts * 8),
             ("count_done", 2 * ranks * 4),
             ("plan_ready", 2 * ranks * 4),
+            ("payload_ready", 2 * local * 4),
             ("epoch_gate", 4),
             ("launch_ready", ranks * 4),
         ):
