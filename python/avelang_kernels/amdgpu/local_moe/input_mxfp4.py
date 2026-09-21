@@ -1,4 +1,4 @@
-"""Direct buffer-to-LDS copies into alternating XOR-swizzled Stage1 input tiles."""
+"""Stage1 access to routed MXFP4 activations and native E8M0 scales."""
 
 from functools import cache
 
@@ -8,55 +8,57 @@ import avelang.language as al
 
 @cache
 def make_mxfp4_input(config):
-    D, BM, TOPK = config.hidden, config.stage1_tile_m, config.topk
-    WM, WN = config.stage1_wave_m, config.stage1_warps_n
-    MR, WORDS = WM // 16, config.stage1_lds_words
-    LOADS, TB = BM // 32, BM // 4
-    ACT_WORDS = BM * 32
-    STRIDE = config.stage1_input_stage_words
+    """Local routed input: issue DMA without waiting; read after caller's barrier.
+
+    LDS act is [stage, row, vector8, word4], with XOR row swizzle.
+    Scale words follow each stage's act. Each u32 packs four E8M0 scales.
+    """
+    D = config.compute_hidden
+    BM, WN, WM = config.stage1_tile_m, config.stage1_warps_n, config.stage1_wave_m
+    MR = WM // 16
+    SX, TB = WM // 32, BM // 4
+    LOADS, WORDS = BM // 32, config.stage1_lds_words
+    STRIDE, ACT_WORDS = config.stage1_input_stage_words, BM * 32
 
     @avelang.jit
     def prefetch_input(
-        act: al.Tensor((4,), al.u32),
-        scales: al.Tensor((4,), al.u32),
-        routes: al.Tensor((4,), al.u32),
+        act_resource: al.Tensor((4,), al.u32),
+        act_scale_resource: al.Tensor((4,), al.u32),
         storage: al.Tensor((WORDS,), al.u32),
-        tokens: al.u32,
+        input_offsets: al.Tensor((2,), al.u32),
         block: al.u32,
         k: al.u32,
         wave: al.u32,
         lane: al.u32,
     ):
+        stage = k % 2
         for load in al.static_range(LOADS):
-            row, vector = wave * TB + load * 8 + lane // 8, lane % 8
-            route = al.amdgpu.raw_buffer_load_x1(routes, row * 4, 0, 0)
-            token, slot = route & 0xFFFFFF, route >> 24
-            offset = al.select(
-                token < tokens and slot < TOPK,
-                token * (D // 2) + k * 128 + (vector ^ (row & 7)) * 16,
-                al.convert(0xFFFFFFF0, al.u32),
-            )
-            destination = (k % 2 * STRIDE + wave * TB * 32 + load * 256) * 4
-            al.amdgpu.raw_buffer_load_x4_lds(act, storage, 16, offset, 0, destination, 0)
+            offset = input_offsets[load] + k * 128
+            destination = (stage * STRIDE + wave * TB * 32 + load * 256) * 4
+            al.amdgpu.raw_buffer_load_x4_lds(act_resource, storage, 16, offset, 0, destination, 0)
+        # Issue all act copies before the scale copies.
         if wave < BM // 32:
             offset_s = ((block * (BM // 32) + wave) * (D // 256) + k) * 256 + lane * 4
-            destination_s = (k % 2 * STRIDE + ACT_WORDS + wave * 64) * 4
-            al.amdgpu.raw_buffer_load_x1_lds(scales, storage, 4, offset_s, 0, destination_s, 0)
+            destination_s = (stage * STRIDE + ACT_WORDS + wave * 64) * 4
+            al.amdgpu.raw_buffer_load_x1_lds(act_scale_resource, storage, 4, offset_s, 0, destination_s, 0)
 
     @avelang.jit
     def read_input(
         storage: al.Tensor((WORDS,), al.u32),
         fragments: al.Tensor((MR, 2, 4), al.u32),
+        scales: al.Tensor((2,), al.u32),
         k: al.u32,
         wave: al.u32,
         lane: al.u32,
-    ) -> al.u32:
+    ):
+        stage = k % 2
         lds = al.view(storage, al.u32, al.make_layout((2, BM, 8, 4), (STRIDE, 32, 4, 1)))
+        wave_m = wave // WN
         for m in al.static_range(MR):
             for half_k in al.static_range(2):
-                fragments[m, half_k] = lds[
-                    k % 2, (wave // WN) * WM + m * 16 + lane % 16, (lane // 16 + half_k * 4) ^ (lane & 7)
-                ]
-        return storage[k % 2 * STRIDE + ACT_WORDS + (wave // WN) * 64 + lane]
+                row = wave_m * WM + m * 16 + lane % 16
+                fragments[m, half_k] = lds[stage, row, (lane // 16 + half_k * 4) ^ (row & 7)]
+        for m32 in al.static_range(SX):
+            scales[m32] = storage[stage * STRIDE + ACT_WORDS + (wave_m * SX + m32) * 64 + lane]
 
     return prefetch_input, read_input

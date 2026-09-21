@@ -31,32 +31,30 @@ def load_weight_scales(
 
 
 @cache
-def make_w13_resources(config):
-    E, BN = config.experts, config.stage1_projection_n
+def make_w13_resources(hidden, intermediate, experts, projection_n, bias_stride):
+    D, I, E, BN, BIAS_STRIDE = hidden, intermediate, experts, projection_n, bias_stride
 
     @avelang.jit
     def initialize_w13_resources(
         weight: al.Pointer(al.u32),
-        scales: al.Pointer(al.u32),
-        bias: al.Pointer(al.bf16),
+        ws: al.Pointer(al.u32),
+        bias_ptr: al.Pointer(al.bf16),
         expert: al.u32,
         tile: al.u32,
-        hidden: al.u32,
-        intermediate: al.u32,
-        projection: al.u32,
+        bias_enabled: al.u32,
     ) -> (al.Tensor((4,), al.u32), al.Tensor((4,), al.u32), al.Tensor((4,), al.u32)):
-        values = al.make_tensor(weight, al.u32, al.make_layout((E * intermediate * hidden // 4,), (1,)))
-        scale_values = al.make_tensor(scales, al.u32, al.make_layout((E * intermediate * hidden // 64,), (1,)))
-        base_n = (expert * 2 + projection) * intermediate + tile * BN
-        w_view = al.subview(values, (base_n * hidden // 8,), (BN * hidden // 8,), (1,))
-        s_view = al.subview(scale_values, (base_n * hidden // 128,), (BN * hidden // 128,), (1,))
-        biases = al.make_tensor(bias, al.bf16, al.make_layout((E * 2 * intermediate,), (1,)))
-        b_view = al.subview(biases, (expert * 2 * intermediate + tile * BN,), (2 * intermediate - tile * BN,), (1,))
-        return (
-            al.amdgpu.make_rsrc(w_view, BN * hidden // 2),
-            al.amdgpu.make_rsrc(s_view, BN * hidden // 32),
-            al.amdgpu.make_rsrc(b_view, (2 * intermediate - tile * BN) * 2),
+        weights = al.make_tensor(weight, al.u32, al.make_layout((E * (I * D // 4),), (1,)))
+        scales = al.make_tensor(ws, al.u32, al.make_layout((E * (I * D // 64),), (1,)))
+        weight_view = al.subview(weights, (expert * (I * D // 4) + tile * BN * D // 8,), ((I + BN) * D // 8,), (1,))
+        scale_view = al.subview(scales, (expert * (I * D // 64) + tile * BN * D // 128,), ((I + BN) * D // 128,), (1,))
+        weight_resource = al.amdgpu.make_rsrc(weight_view, (I + BN) * D // 2)
+        scale_resource = al.amdgpu.make_rsrc(scale_view, (I + BN) * D // 32)
+        biases = al.make_tensor(bias_ptr, al.bf16, al.make_layout((E * 2 * BIAS_STRIDE,), (1,)))
+        bias_view = al.subview(biases, (expert * 2 * BIAS_STRIDE + tile * BN,), (BN,), (1,))
+        bias_resource = al.amdgpu.make_rsrc(
+            bias_view, al.select(bias_enabled != 0, (2 * BIAS_STRIDE - tile * BN) * 2, al.convert(0, al.u32))
         )
+        return weight_resource, scale_resource, bias_resource
 
     return initialize_w13_resources
 
@@ -96,29 +94,31 @@ def make_w2_resources(config):
 
 @cache
 def make_w13_weight_loads(config):
-    D, NR = config.hidden, config.stage1_wave_n // 16
-    WN = config.stage1_warps_n
-    NS = NR // 2
+    """Fill [projection, half_k, n_fragment, word4] registers; caller owns waits."""
+    D, I = config.compute_hidden, config.intermediate
+    WN, NR = config.stage1_warps_n, config.stage1_wave_n // 16
+    NS, CACHE = NR // 2, config.weight_load_aux
 
     @avelang.jit
     def load_weights(
-        gate: al.Tensor((4,), al.u32),
-        gate_scales: al.Tensor((4,), al.u32),
-        up: al.Tensor((4,), al.u32),
-        up_scales: al.Tensor((4,), al.u32),
-        weights: al.Tensor((2, 2, NR, 4), al.u32),
+        w: al.Tensor((4,), al.u32),
+        ws: al.Tensor((4,), al.u32),
+        values: al.Tensor((2, 2, NR, 4), al.u32),
         scales: al.Tensor((2, NS), al.u32),
         k: al.u32,
         wave: al.u32,
         lane: al.u32,
     ):
-        for half_k in al.static_range(2):
-            for n in al.static_range(NR):
-                n16 = wave % WN * NR + n
-                weights[0, half_k, n] = load_weight_values(gate, D, n16, k * 2 + half_k, lane)
-                weights[1, half_k, n] = load_weight_values(up, D, n16, k * 2 + half_k, lane)
-        for n in al.static_range(NS):
-            scales[0, n] = load_weight_scales(gate_scales, D, wave % WN * NS + n, k, lane)
-            scales[1, n] = load_weight_scales(up_scales, D, wave % WN * NS + n, k, lane)
+        wave_n = wave % WN
+        for projection in al.static_range(2):
+            for half_k in al.static_range(2):
+                for n in al.static_range(NR):
+                    offset = (
+                        (wave_n * (NR * 16) + n * 16) * (D // 2) + lane * 16 + half_k * 1024 + projection * I * D // 2
+                    )
+                    values[projection, half_k, n] = al.amdgpu.raw_buffer_load_x4(w, offset + k * 2048, 0, CACHE)
+            for n in al.static_range(NS):
+                offset_s = (wave_n * NS + n) * D + lane * 4 + projection * I * D // 32
+                scales[projection, n] = al.amdgpu.raw_buffer_load_x1(ws, offset_s + k * 256, 0, 0)
 
     return load_weights

@@ -20,13 +20,13 @@ def make_stage2_compute(config):
     @avelang.jit
     def stage2_compute(
         act: al.Tensor((4,), al.u32),
-        routes: al.Tensor((4,), al.u32),
         weight: al.Tensor((4,), al.u32),
         scales: al.Tensor((4,), al.u32),
         bias: al.Tensor((4,), al.u32),
         route_weights: al.Tensor((4,), al.u32),
         storage: al.Tensor((4160,), al.u32),
-        tokens: al.u32,
+        act_offset: al.u32,
+        input_valid: al.u1,
         block: al.u32,
         scale_base: al.u32,
         tile: al.u32,
@@ -46,11 +46,12 @@ def make_stage2_compute(config):
             for n in al.static_range(4):
                 col = tile * 256 + wave * 64 + n * 4 + lane // 16 * 16
                 packed_bias[n] = al.amdgpu.raw_buffer_load_x2(bias, col * 2, 0, 0)
+        input_row, vector = wave * 8 + lane // 8, lane % 8
+        lds = al.view(storage, al.u32, al.make_layout((2, 32, 16, 4), (2048, 64, 4, 1)))
         for k in al.static_range(K_TILES):
             ki = al.convert(k, al.u32)
-            input_scale = prefetch_stage2_input(
-                act, routes, storage, tokens, block, ki, lane, wave * 64 + lane, scale_base
-            )
+            prefetched, input_scale = prefetch_stage2_input(act, act_offset, input_valid, block, ki, lane, scale_base)
+            lds[k % 2, input_row, vector ^ (input_row & 15)] = prefetched
             al.amdgpu.s_waitcnt(0, 0, 0)
             al.syncthreads()
             read_stage2_input(storage, fragments, ki, lane)
@@ -147,15 +148,20 @@ def make_stage2_kernel(config):
                         metadata_token * D * 2,
                         tokens * D * 2,
                     )
+                input_row, vector = tid // 8, tid % 8
+                input_route = al.amdgpu.raw_buffer_load_x1(route_resource, input_row * 4, 0, 0)
+                input_token, input_slot = input_route & 0xFFFFFF, input_route >> 24
+                input_valid = input_token < tokens and input_slot < TOPK
+                act_offset = (input_token * TOPK + input_slot) * (I // 2) + vector * 16
                 stage2_compute(
                     act_resource,
-                    route_resource,
                     wr,
                     sr,
                     br,
                     rw_resource,
                     storage,
-                    tokens,
+                    act_offset,
+                    input_valid,
                     group,
                     scale_base,
                     tile,

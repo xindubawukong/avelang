@@ -73,36 +73,27 @@ def make_intermediate_store():
 
 @cache
 def make_stage2_input(config):
-    I, TOPK = config.intermediate, config.topk
+    I = config.intermediate
 
     @avelang.jit
     def prefetch_stage2_input(
         act: al.Tensor((4,), al.u32),
-        routes: al.Tensor((4,), al.u32),
-        storage: al.Tensor((4160,), al.u32),
-        tokens: al.u32,
+        act_offset: al.u32,
+        input_valid: al.u1,
         block: al.u32,
         k: al.u32,
         lane: al.u32,
-        tid: al.u32,
         scale_base: al.u32,
-    ) -> al.u32:
-        row, vector = tid // 8, tid % 8
-        route = al.amdgpu.raw_buffer_load_x1(routes, row * 4, 0, 0)
-        token, slot = route & 0xFFFFFF, route >> 24
-        values = al.full((4,), 0, al.u32)
-        if token < tokens and slot < TOPK:
-            offset = (token * TOPK + slot) * (I // 2) + k * 128 + vector * 16
-            values = al.amdgpu.raw_buffer_load_x4(act, offset, 0, 0)
-        lds = al.view(storage, al.u32, al.make_layout((2, 32, 16, 4), (2048, 64, 4, 1)))
-        lds[k % 2, row, vector ^ (row & 15)] = values
+    ) -> (al.Tensor((4,), al.u32), al.u32):
+        offset = al.select(input_valid, act_offset + k * 128, al.convert(0xFFFFFFF0, al.u32))
+        values = al.amdgpu.raw_buffer_load_x4(act, offset, 0, 0)
         scale = al.convert(0, al.u32)
         for byte in al.static_range(4):
             scale_row = block * 32 + lane % 16 + (byte % 2) * 16
             col = k * 8 + lane // 16 + (byte // 2) * 4
             value = load_scale_byte(act, scale_base + scale_row * (I // 32) + col)
             scale = scale | (value << (byte * 8))
-        return scale
+        return values, scale
 
     @avelang.jit
     def read_stage2_input(
