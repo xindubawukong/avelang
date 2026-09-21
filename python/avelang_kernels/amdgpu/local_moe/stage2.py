@@ -19,6 +19,19 @@ STAGE2_K256_ARENA_WORDS = 4096
 STAGE2_K256_LDS_WORDS = 4160
 
 
+@avelang.jit
+def _pack_weighted_bf16_pair(first: al.f32, second: al.f32, route_weight: al.f32) -> al.u32:
+    """Pack one pair without passing the complete accumulator through a helper."""
+    values = al.make_local((1, 2), al.f32)
+    values[0, 0] = first * route_weight
+    values[0, 1] = second * route_weight
+    packed = al.make_local((1, 2), al.bf16)
+    packed[0] = al.convert(values[0], al.bf16)
+    # Two BF16 values occupy one u32; a one-element view is scalar.
+    word = al.view(packed, al.u32, al.make_layout((1,), (1,)))
+    return word
+
+
 @cache
 def make_stage2_compute_k256(intermediate, bias, weight_cache, words=STAGE2_K256_LDS_WORDS):
     """Write weighted BF16 [32, 256] output into linear LDS and synchronize."""
@@ -31,6 +44,7 @@ def make_stage2_compute_k256(intermediate, bias, weight_cache, words=STAGE2_K256
         weight_resource: al.Tensor((4,), al.u32),
         scale_resource: al.Tensor((4,), al.u32),
         bias_resource: al.Tensor((4,), al.u32),
+        rw_resource: al.Tensor((4,), al.u32),
         storage: al.Tensor((words,), al.u32),
         act_offset: al.u32,
         act_base: al.u32,
@@ -49,6 +63,13 @@ def make_stage2_compute_k256(intermediate, bias, weight_cache, words=STAGE2_K256
         fragments = al.make_local((2, 2, 4), al.u32)
         packed_bias = al.make_local((4, 2), al.u32)
         route_weights = al.make_local((2,), al.f32)
+        for m in al.static_range(2):
+            bits = al.amdgpu.raw_buffer_load_x1(rw_resource, (m * 16 + lane % 16) * 4, 0, 0)
+            route_weights[m] = al.bitcast(bits, al.f32)
+        if BIAS:
+            for n in al.static_range(4):
+                offset = (tile * 256 + wave * 64 + n * 4 + (lane // 16) * 16) * 2
+                packed_bias[n] = al.amdgpu.raw_buffer_load_x2(bias_resource, offset, 0, 0)
         for k in al.static_range(K_TILES):
             stage = k % 2
             prefetched, scale = prefetch_stage2_input(
@@ -79,27 +100,23 @@ def make_stage2_compute_k256(intermediate, bias, weight_cache, words=STAGE2_K256
                             2 * half_k + n % 2,
                             2 * half_k + m,
                         )
-            if k + 1 == K_TILES:
-                for m in al.static_range(2):
-                    route_weights[m] = al.bitcast(storage[4128 + m * 16 + lane % 16], al.f32)
-                if BIAS:
-                    for n in al.static_range(4):
-                        offset = (tile * 256 + wave * 64 + n * 4 + (lane // 16) * 16) * 2
-                        packed_bias[n] = al.amdgpu.raw_buffer_load_x2(bias_resource, offset, 0, 0)
 
         al.syncthreads()
-        al.amdgpu.s_setprio(0)
         bias_values = al.view(packed_bias, al.bf16, al.make_layout((4, 4), (4, 1)))
-        shared = al.view(storage, al.bf16, al.make_layout((32, 256), (256, 1)))
+        pairs = al.make_local((2,), al.u32)
         for m in al.static_range(2):
+            row = m * 16 + lane % 16
             for n in al.static_range(4):
-                for c in al.static_range(4):
-                    value = accum[n, m, c]
+                for pair in al.static_range(2):
+                    first, second = accum[n, m, pair * 2], accum[n, m, pair * 2 + 1]
                     if BIAS:
-                        value = value + al.convert(bias_values[n, c], al.f32)
-                    shared[m * 16 + lane % 16, wave * 64 + n * 16 + lane // 16 * 4 + c] = al.convert(
-                        value * route_weights[m], al.bf16
-                    )
+                        first = first + al.convert(bias_values[n, pair * 2], al.f32)
+                        second = second + al.convert(bias_values[n, pair * 2 + 1], al.f32)
+                    pairs[pair] = _pack_weighted_bf16_pair(first, second, route_weights[m])
+                index = (row * 256 + wave * 64 + n * 16 + (lane // 16) * 4) // 2
+                storage[index] = pairs[0]
+                storage[index + 1] = pairs[1]
+
         al.syncthreads()
 
     return stage2_compute_k256
@@ -131,6 +148,8 @@ def make_stage2_kernel(config: MoeConfig):
     ):
         tile, worker = al.block_id(0), al.block_id(1)
         tid = al.thread_id(0)
+        lane = tid % 64
+        wave = al.amdgpu.readfirstlane(al.convert(tid // 64, al.u32))
         extent, num_tokens = al.amdgpu.readfirstlane(counts[0]), al.amdgpu.readfirstlane(counts[1])
         groups = (extent + 31) // 32
         quotient, remainder = groups // WORKERS, groups % WORKERS
@@ -168,12 +187,12 @@ def make_stage2_kernel(config: MoeConfig):
                     row_offsets[tid] = al.select(
                         metadata_token < num_tokens and metadata_slot < TOPK, metadata_token * D * 2, num_tokens * D * 2
                     )
-                    storage[4128 + tid] = al.amdgpu.raw_buffer_load_x1(rw_resource, al.convert(tid * 4, al.u32), 0, 0)
                 stage2_compute_k256(
                     act_resource,
                     weight_resource,
                     scale_resource,
                     bias_resource,
+                    rw_resource,
                     storage,
                     al.convert((token * TOPK + slot) * (I // 2) + vector * 16, al.u32),
                     al.convert(0, al.u32),
@@ -184,15 +203,14 @@ def make_stage2_kernel(config: MoeConfig):
                     al.convert(tid, al.u32),
                 )
                 shared = al.view(storage, al.bf16, al.make_layout((4096, 2), (2, 1)))
-                m_lane, n_lane = tid // 32, tid % 32
-                for mr in al.static_range(4):
-                    row = m_lane + mr * 8
-                    row_offset = row_offsets[row]
-                    for nr in al.static_range(4):
-                        column = nr * 64 + n_lane * 2
-                        pair = row * 128 + column // 2
-                        offset = al.convert(row_offset + (tile * 256 + column) * 2, al.u32)
-                        al.amdgpu.raw_buffer_atomic_add_bf16x2(shared[pair], output_resource, offset)
+                for m in al.static_range(8):
+                    row = wave * 8 + m
+                    row_offset = al.amdgpu.readfirstlane(row_offsets[row])
+                    if row_offset < counts[1] * D * 2:
+                        offset = al.convert(row_offset + tile * 512 + lane * 4, al.u32)
+                        index = row * 128 + lane
+                        al.amdgpu.raw_buffer_atomic_add_bf16x2(shared[index], output_resource, offset)
+                        al.amdgpu.raw_buffer_atomic_add_bf16x2(shared[index + 64], output_resource, offset + 256)
             # Protect the shared arena before this worker takes its next route tile.
             al.syncthreads()
 
