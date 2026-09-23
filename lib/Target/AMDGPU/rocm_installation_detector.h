@@ -61,9 +61,10 @@ class RocmInstallationDetector {
     std::map<unsigned, std::string> ABIVersionMap;
 
     bool allGenericLibsValid() const {
-        return !OCML.empty() && !OCKL.empty() && WavefrontSize64.isValid() &&
-               FiniteOnly.isValid() && UnsafeMath.isValid() &&
-               DenormalsAreZero.isValid() && CorrectlyRoundedSqrt.isValid();
+        // Newer device-libs dropped the daz_opt and correctly_rounded_sqrt
+        // control libraries (clang's detector likewise only requires these).
+        // The remaining conditional libraries are linked when present.
+        return !OCML.empty() && !OCKL.empty() && WavefrontSize64.isValid();
     }
 
     void scanLibDevicePath(llvm::StringRef Path);
