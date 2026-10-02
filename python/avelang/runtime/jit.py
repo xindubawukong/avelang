@@ -8,10 +8,13 @@ import ast
 import textwrap
 import re
 import hashlib
+import json
+import math
 import copy
 import itertools
 import threading
 from collections import defaultdict
+from dataclasses import fields, is_dataclass
 from functools import cached_property
 from types import ModuleType
 from typing import Any, Dict, Callable, Tuple, Generic, TypeVar
@@ -499,6 +502,39 @@ def _attach_ast_source_metadata(tree, file_name: str, source_code: str):
     return tree
 
 
+def encode_constexpr(value):
+    from ..language.core import constexpr
+
+    if isinstance(value, constexpr):
+        value = value.value
+    if isinstance(value, bool):
+        ty = "i1"
+    elif isinstance(value, int):
+        if not -(1 << 63) <= value < (1 << 63):
+            raise ValueError("constexpr integer is outside the signed 64-bit range")
+        ty = "i32" if -(1 << 31) <= value < (1 << 31) else "i64"
+    elif isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError("constexpr float must be finite")
+        ty = "f64"
+    elif is_dataclass(value) and not isinstance(value, type):
+        cls = type(value)
+        if not cls.__dataclass_params__.frozen:
+            raise ValueError("constexpr dataclass must be frozen")
+        ty, value = "dataclass", {
+            "class": f"{cls.__module__}.{cls.__qualname__}",
+            "fields": {field.name: encode_constexpr(getattr(value, field.name)) for field in fields(value)},
+        }
+    else:
+        raise ValueError(f"Unsupported constexpr type: {type(value)}")
+    return {"type": ty, "value": value}
+
+
+def serialize_constexpr(encoded_value):
+    """Serialize an encoded constexpr to a stable JSON string."""
+    return json.dumps(encoded_value, sort_keys=True, allow_nan=False)
+
+
 class KernelInterface(Generic[T]):
     run: T
 
@@ -555,28 +591,33 @@ class JITCallable:
 
     @property
     def cache_key(self) -> str:
-        # TODO : hash should be attribute of `self`
         with self._hash_lock:
             if self.hash is not None:
                 return self.hash
             # Set a placeholder hash to break recursion in case the function
             # transitively calls itself. The full hash is set after.
             self.hash = f"recursion:{self._fn_name}"
-            nonlocals = inspect.getclosurevars(self.fn).nonlocals
-            dependencies_finder = DependenciesFinder(
-                name=self._fn_name, globals=self.__globals__, nonlocals=nonlocals, src=self.src
-            )
-            dependencies_finder.visit(self.parse())
-            self.hash = dependencies_finder.ret + str(self.starting_line_number)
-            self.used_global_vals = dict(sorted(dependencies_finder.used_global_vals.items()))
-            self._direct_global_names = dependencies_finder.direct_global_names
+            try:
+                nonlocals = inspect.getclosurevars(self.fn).nonlocals
+                dependencies_finder = DependenciesFinder(
+                    name=self._fn_name, globals=self.__globals__, nonlocals=nonlocals, src=self.src
+                )
+                dependencies_finder.visit(self.parse())
+                self.hash = dependencies_finder.ret + str(self.starting_line_number)
+                self.used_global_vals = dict(sorted(dependencies_finder.used_global_vals.items()))
+                self._direct_global_names = dependencies_finder.direct_global_names
 
-            from ..language.core import constexpr
+                from ..language.core import constexpr
 
-            self.hash += str(
-                [(name, val) for (name, _), (val, _) in self.used_global_vals.items() if isinstance(val, constexpr)]
-            )
-            self.hash = hashlib.sha256(self.hash.encode("utf-8")).hexdigest()
+                for (name, _), (value, _) in self.used_global_vals.items():
+                    if isinstance(value, constexpr) or (is_dataclass(value) and not isinstance(value, type)):
+                        self.hash += name + serialize_constexpr(encode_constexpr(value))
+                self.hash = hashlib.sha256(self.hash.encode("utf-8")).hexdigest()
+            except Exception:
+                self.hash = None
+                self.used_global_vals = {}
+                self._direct_global_names = set()
+                raise
         return self.hash
 
     def __hash__(self):
@@ -683,6 +724,10 @@ class KernelParam:
 
 
 def compute_cache_key(kernel_key_cache, specialization, options):
+    specialization = tuple(
+        (kind, serialize_constexpr(value) if kind == "constexpr" else value)
+        for kind, value in specialization
+    )
     key = (tuple(specialization), str(options))
     cache_key = kernel_key_cache.get(key, None)
     if cache_key is not None:
@@ -721,36 +766,19 @@ class JITFunction(JITCallable, KernelInterface[T]):
     def arg_names(self):
         return [p.name for p in self.params]
 
-    def _infer_constexpr_type(self, value):
-        """Infer MLIR type string from Python value."""
-        if isinstance(value, bool):
-            return "i1"
-        elif isinstance(value, int):
-            if -2147483648 <= value <= 2147483647:
-                return "i32"
-            else:
-                return "i64"
-        elif isinstance(value, float):
-            return "f64"
-        else:
-            raise ValueError(f"Unsupported constexpr type: {type(value)}")
-
     def _collect_global_constexprs(self, skip_names=None):
+        from ..language.core import constexpr
+
         _ = self.cache_key
         constexprs = {}
-        skip = set(skip_names or [])
+        skip = skip_names or ()
         scope = self.get_capture_scope()
         for name in sorted(self._direct_global_names):
             if name in skip or name not in scope:
                 continue
             value = scope[name]
-            if hasattr(value, "value"):
-                value = value.value
-            try:
-                constexpr_type = self._infer_constexpr_type(value)
-            except ValueError:
-                continue
-            constexprs[name] = {"type": constexpr_type, "value": value}
+            if isinstance(value, (constexpr, bool, int, float)) or (is_dataclass(value) and not isinstance(value, type)):
+                constexprs[name] = encode_constexpr(value)
         return constexprs
 
     def create_binder(self):
@@ -787,11 +815,9 @@ class JITFunction(JITCallable, KernelInterface[T]):
             param_idx = path[0]
             param_name = self.arg_names[param_idx]
             value = get_iterable_path(list(bound_args.values()), path)
-            # Unwrap constexpr wrapper if present
-            if hasattr(value, "value"):
-                value = value.value
-            constexpr_type = self._infer_constexpr_type(value)
-            constexprs[param_name] = {"type": constexpr_type, "value": value}
+            encoded_value = encode_constexpr(value)
+            constexprs[param_name] = encoded_value
+            specialization[param_idx] = (specialization[param_idx][0], encoded_value)
         global_constexprs = self._collect_global_constexprs(constexprs.keys())
         # attributes
         attrs = None
@@ -819,10 +845,6 @@ class JITFunction(JITCallable, KernelInterface[T]):
 
         # Kernel is not cached; we have to compile.
         if kernel is None:
-            options, signature, constexprs, global_constexprs, attrs = self._pack_args(
-                backend, kwargs, bound_args, specialization, options
-            )
-
             kernel = self._do_compile(key, signature, device, constexprs, global_constexprs, options, attrs)
             if kernel is None:
                 raise RuntimeError(f"Kernel compilation failed for {self.__name__}")

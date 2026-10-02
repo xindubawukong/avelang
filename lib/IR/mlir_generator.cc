@@ -2,6 +2,7 @@
 #include "AST/ast_nodes_expr.h"
 #include "Dialect/AveLang/IR/AveLangOps.h"
 #include "Utils/assert.h"
+#include "constexpr.h"
 #include "generator_context.h"
 #include "mangler.h"
 #include "mlir_generator_impl.h"
@@ -9,7 +10,6 @@
 
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wambiguous-reversed-operator"
-#include <mlir/Dialect/Arith/IR/Arith.h>
 #include <mlir/Dialect/Func/IR/FuncOps.h>
 #include <mlir/Dialect/LLVMIR/LLVMDialect.h>
 #include <mlir/Dialect/SCF/IR/SCF.h>
@@ -29,7 +29,6 @@
 #include <llvm/Support/Error.h>
 #include <llvm/Support/JSON.h>
 
-#include <limits>
 #include <memory>
 #include <string>
 #include <utility>
@@ -82,15 +81,12 @@ static llvm::Error InjectConstexprsIntoModule(MLIRGenerator &Generator,
         return llvm::createStringError(llvm::inconvertibleErrorCode(),
                                        "Expected JSON array for constexprs");
 
-    mlir::OpBuilder builder(IRContext->GetMLIRContext());
-    auto module = Generator.CreateModule();
-    builder.setInsertionPointToStart(module.getBody());
+    mlir::Builder builder(IRContext->GetMLIRContext());
 
     auto *symbolTable = Generator.GetSymbolTable();
     auto &globalFrame = symbolTable->GetCurrentFrame();
 
-    for (size_t index = 0; index < ConstexprsArray->size(); ++index) {
-        const auto &item = (*ConstexprsArray)[index];
+    for (const auto &item : *ConstexprsArray) {
         auto *obj = item.getAsObject();
         if (!obj) {
             return llvm::createStringError(
@@ -99,77 +95,15 @@ static llvm::Error InjectConstexprsIntoModule(MLIRGenerator &Generator,
         }
 
         auto name = obj->getString("name");
-        auto type = obj->getString("type");
-        auto value = obj->get("value");
 
         if (!name || name->empty()) {
             return llvm::createStringError(llvm::inconvertibleErrorCode(),
                                            "constexprs entry missing 'name'");
         }
-        if (!type || type->empty()) {
-            return llvm::createStringError(llvm::inconvertibleErrorCode(),
-                                           "constexprs entry missing 'type'");
-        }
-        if (!value) {
-            return llvm::createStringError(llvm::inconvertibleErrorCode(),
-                                           "constexprs entry missing 'value'");
-        }
-
-        mlir::Value constValue;
-
-        if (*type == "i32") {
-            auto intVal = value->getAsInteger();
-            if (!intVal) {
-                return llvm::createStringError(
-                    llvm::inconvertibleErrorCode(),
-                    "constexpr i32 value must be integer");
-            }
-            if (*intVal < std::numeric_limits<int32_t>::min() ||
-                *intVal > std::numeric_limits<int32_t>::max()) {
-                return llvm::createStringError(
-                    llvm::inconvertibleErrorCode(),
-                    "constexpr i32 value out of range");
-            }
-            auto attr =
-                builder.getI32IntegerAttr(static_cast<int32_t>(*intVal));
-            constValue = mlir::arith::ConstantOp::create(
-                builder, builder.getUnknownLoc(), attr);
-        } else if (*type == "i64") {
-            auto intVal = value->getAsInteger();
-            if (!intVal) {
-                return llvm::createStringError(
-                    llvm::inconvertibleErrorCode(),
-                    "constexpr i64 value must be integer");
-            }
-            auto attr = builder.getI64IntegerAttr(*intVal);
-            constValue = mlir::arith::ConstantOp::create(
-                builder, builder.getUnknownLoc(), attr);
-        } else if (*type == "f64") {
-            auto floatVal = value->getAsNumber();
-            if (!floatVal) {
-                return llvm::createStringError(
-                    llvm::inconvertibleErrorCode(),
-                    "constexpr f64 value must be number");
-            }
-            auto attr = builder.getF64FloatAttr(*floatVal);
-            constValue = mlir::arith::ConstantOp::create(
-                builder, builder.getUnknownLoc(), attr);
-        } else if (*type == "i1") {
-            auto boolVal = value->getAsBoolean();
-            if (!boolVal) {
-                return llvm::createStringError(
-                    llvm::inconvertibleErrorCode(),
-                    "constexpr i1 value must be boolean");
-            }
-            auto attr = builder.getBoolAttr(*boolVal);
-            constValue = mlir::arith::ConstantOp::create(
-                builder, builder.getUnknownLoc(), attr);
-        } else {
-            return llvm::createStringError(llvm::inconvertibleErrorCode(),
-                                           "Unsupported constexpr type");
-        }
-
-        globalFrame.AddValue(name->str(), constValue, /*immutable=*/true);
+        auto constant = ParseConstexpr(*obj, builder);
+        if (!constant)
+            return constant.takeError();
+        globalFrame.AddConstexpr(name->str(), {*constant, {}});
     }
 
     return llvm::Error::success();
@@ -229,37 +163,17 @@ MLIRGeneratorImpl::MLIRGeneratorImpl(GeneratorContext *context)
     named_module_registry_.Initialize();
 }
 
-static llvm::SmallVector<std::pair<std::string, mlir::Attribute>, 4>
-ToAddressSpaceBindings(const ArgAddressSpaceMap *arg_address_spaces) {
-    llvm::SmallVector<std::pair<std::string, mlir::Attribute>, 4> bindings;
-    if (!arg_address_spaces) {
+template <typename T>
+static llvm::SmallVector<std::pair<std::string, T>, 4>
+ToBindings(const std::unordered_map<std::string, T> *values) {
+    llvm::SmallVector<std::pair<std::string, T>, 4> bindings;
+    if (!values) {
         return bindings;
     }
-    for (const auto &[name, address_space] : *arg_address_spaces) {
-        bindings.emplace_back(name, address_space);
-    }
-    return bindings;
-}
-
-static llvm::SmallVector<std::pair<std::string, mlir::Value>, 4>
-ToConstexprBindings(const ConstexprValueMap *constexpr_values) {
-    llvm::SmallVector<std::pair<std::string, mlir::Value>, 4> bindings;
-    if (!constexpr_values) {
-        return bindings;
-    }
-    for (const auto &[name, value] : *constexpr_values) {
+    for (const auto &[name, value] : *values) {
         bindings.emplace_back(name, value);
     }
     return bindings;
-}
-
-std::string MLIRGeneratorImpl::GetFunctionScopeName(
-    ast::FunctionDef *func, const ArgAddressSpaceMap *arg_address_spaces) {
-    if (!func) {
-        return {};
-    }
-    auto address_spaces = ToAddressSpaceBindings(arg_address_spaces);
-    return MangleFunctionName(func, {}, address_spaces, {});
 }
 
 std::string MLIRGeneratorImpl::GetMangledFunctionName(
@@ -276,8 +190,8 @@ std::string MLIRGeneratorImpl::GetMangledFunctionName(
     if (!name_prefix.empty()) {
         scope.push_back(name_prefix.str());
     }
-    auto address_spaces = ToAddressSpaceBindings(arg_address_spaces);
-    auto constexprs = ToConstexprBindings(constexpr_values);
+    auto address_spaces = ToBindings(arg_address_spaces);
+    auto constexprs = ToBindings(constexpr_values);
     return MangleFunctionName(func, scope, address_spaces, constexprs);
 }
 

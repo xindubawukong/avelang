@@ -18,6 +18,8 @@ SymbolScope::Symbol::Symbol(Function ff)
 SymbolScope::Symbol::Symbol(mlir::Type t) : kind(kType), type(t) {}
 
 SymbolScope::Symbol::Symbol(mlir::Value v) : kind(kValue), value(v) {}
+SymbolScope::Symbol::Symbol(ConstexprValue v)
+    : kind(kConstexpr), constexpr_value(v) {}
 
 SymbolScope::Symbol::~Symbol() {
     switch (kind) {
@@ -27,6 +29,9 @@ SymbolScope::Symbol::~Symbol() {
     case kFunction:
         function.~Function();
         break;
+    case kConstexpr:
+        constexpr_value.~ConstexprValue();
+        break;
     case kModule:
     case kType:
     case kValue:
@@ -35,8 +40,7 @@ SymbolScope::Symbol::~Symbol() {
     }
 }
 
-SymbolScope::Symbol::Symbol(const Symbol &other)
-    : kind(other.kind), immutable(other.immutable) {
+SymbolScope::Symbol::Symbol(const Symbol &other) : kind(other.kind) {
     switch (kind) {
     case kModule:
         module = other.module;
@@ -53,6 +57,9 @@ SymbolScope::Symbol::Symbol(const Symbol &other)
     case kValue:
         value = other.value;
         break;
+    case kConstexpr:
+        new (&constexpr_value) ConstexprValue(other.constexpr_value);
+        break;
     }
 }
 
@@ -63,7 +70,6 @@ SymbolScope::Symbol &SymbolScope::Symbol::operator=(const Symbol &other) {
 
         // Copy construct new content
         kind = other.kind;
-        immutable = other.immutable;
         switch (kind) {
         case kModule:
             module = other.module;
@@ -79,6 +85,9 @@ SymbolScope::Symbol &SymbolScope::Symbol::operator=(const Symbol &other) {
             break;
         case kValue:
             value = other.value;
+            break;
+        case kConstexpr:
+            new (&constexpr_value) ConstexprValue(other.constexpr_value);
             break;
         }
     }
@@ -100,15 +109,16 @@ SymbolScope::LookupSymbol(const std::string &name) const {
     return std::nullopt;
 }
 
-void SymbolScope::AddValue(const std::string &name, mlir::Value value,
-                           bool immutable) {
-    Symbol sym(value);
-    sym.immutable = immutable;
-    symbols_[name] = sym;
+void SymbolScope::AddValue(const std::string &name, mlir::Value value) {
+    symbols_[name] = Symbol(value);
 }
 
 void SymbolScope::AddType(const std::string &name, mlir::Type type) {
     symbols_[name] = Symbol(type);
+}
+
+void SymbolScope::AddConstexpr(const std::string &name, ConstexprValue value) {
+    symbols_[name] = Symbol(value);
 }
 
 void SymbolScope::AddModule(const std::string &name, NamedModule *module) {

@@ -2358,13 +2358,11 @@ def kernel(N: S.constexpr, data: S.Tensor((16,), S.i32)):
     builder.setInsertionPointToStart(module.getBody());
 
     auto constAttr = builder.getI32IntegerAttr(32);
-    auto constValue = mlir::arith::ConstantOp::create(
-        builder, builder.getUnknownLoc(), constAttr);
 
     // Add to global frame
     auto *symbol_table = generator.GetSymbolTable();
     auto &global_frame = symbol_table->GetCurrentFrame();
-    global_frame.AddValue("N", constValue, /*immutable=*/true);
+    global_frame.AddConstexpr("N", {constAttr, {}});
 
     // Generate the MLIR from the AST
     module = generator.Generate(root);
@@ -2410,13 +2408,11 @@ def kernel(N: S.constexpr):
     builder.setInsertionPointToStart(module.getBody());
 
     auto constAttr = builder.getI32IntegerAttr(32);
-    auto constValue = mlir::arith::ConstantOp::create(
-        builder, builder.getUnknownLoc(), constAttr);
 
     // Add to global frame
     auto *symbol_table = generator.GetSymbolTable();
     auto &global_frame = symbol_table->GetCurrentFrame();
-    global_frame.AddValue("N", constValue, /*immutable=*/true);
+    global_frame.AddConstexpr("N", {constAttr, {}});
 
     // Generate the MLIR from the AST - should fail with immutable error
     module = generator.Generate(root);

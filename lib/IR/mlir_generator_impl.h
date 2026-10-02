@@ -5,6 +5,7 @@
 #include "AST/ast_nodes_stmt.h"
 #include "AST/visitor.h"
 #include "Basic/diagnostic.h"
+#include "constexpr.h"
 #include "generator_context.h"
 #include "mlir_generator.h"
 #include "named_module.h"
@@ -35,7 +36,7 @@ namespace causalflow::avelang::ir {
 class MLIRGeneratorImpl;
 class FunctionGenerator;
 using ArgAddressSpaceMap = std::unordered_map<std::string, mlir::Attribute>;
-using ConstexprValueMap = std::unordered_map<std::string, mlir::Value>;
+using ConstexprValueMap = std::unordered_map<std::string, ConstexprValue>;
 
 class ExprGenerator : public ast::ASTVisitor<ExprGenerator, mlir::Value> {
   public:
@@ -45,6 +46,7 @@ class ExprGenerator : public ast::ASTVisitor<ExprGenerator, mlir::Value> {
     mlir::Value VisitUnaryOp(ast::UnaryOp *unaryop);
     mlir::Value VisitBoolOp(ast::BoolOp *boolop);
     mlir::Value VisitName(ast::Name *name);
+    mlir::Value VisitAttributeExpr(ast::AttributeExpr *attr);
     mlir::Value VisitSubscript(ast::Subscript *subscript);
     mlir::Value VisitConstant(ast::Constant *constant);
     mlir::Value VisitTuple(ast::Tuple *tuple);
@@ -179,9 +181,6 @@ class MLIRGeneratorImpl {
         const ArgAddressSpaceMap *arg_address_spaces = nullptr,
         llvm::StringRef name_prefix = {},
         const ConstexprValueMap *constexpr_values = nullptr);
-    std::string GetFunctionScopeName(
-        ast::FunctionDef *func,
-        const ArgAddressSpaceMap *arg_address_spaces = nullptr);
     std::string getArgName(ast::ASTNode *arg);
     void HandleImport(ast::Import *import_stmt);
     void HandleImportFrom(ast::ImportFrom *import_from_stmt);

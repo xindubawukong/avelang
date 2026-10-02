@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <optional>
 
+#include <mlir/IR/Attributes.h>
 #include <mlir/IR/Value.h>
 
 namespace causalflow::avelang {
@@ -19,6 +20,7 @@ class ConstantFolder {
     explicit ConstantFolder(GeneratorContext *ctx) : ctx_(ctx) {}
 
     std::optional<int64_t> Evaluate(ast::Expr *expr) const;
+    static mlir::Attribute FoldValue(mlir::Value value);
     static std::optional<int64_t> FoldIntValue(mlir::Value value);
     static std::optional<bool> FoldBoolValue(mlir::Value value);
 

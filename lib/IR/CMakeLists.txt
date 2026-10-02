@@ -51,6 +51,7 @@ add_library(ave-lang-mlir
   named_module.cc
   layout_operation.cc
   constant_folder.cc
+  constexpr.cc
   builtin_module.cc
   type_system.cc
   Intrinsics/intrinsic_support.cc

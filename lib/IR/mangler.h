@@ -1,5 +1,7 @@
 #pragma once
 
+#include "constexpr.h"
+
 #include <string>
 #include <utility>
 
@@ -16,6 +18,7 @@ namespace causalflow::avelang::ir {
 std::string MangleFunctionName(
     ast::FunctionDef *func, llvm::ArrayRef<std::string> scope = {},
     llvm::ArrayRef<std::pair<std::string, mlir::Attribute>> address_spaces = {},
-    llvm::ArrayRef<std::pair<std::string, mlir::Value>> constexpr_values = {});
+    llvm::ArrayRef<std::pair<std::string, ConstexprValue>> constexpr_values =
+        {});
 
 } // namespace causalflow::avelang::ir

@@ -13,14 +13,13 @@ from avelang.runtime.jit import JITCallable
 
 def _load_module_from_path(path: Path):
     """Load a module from a file path."""
-    # Execute the user file so @avelang.jit decorators run and create
-    # JITCallable objects we can inspect. We intentionally avoid inserting the
-    # module into sys.modules to keep the binding module surface minimal.
-    module_name = path.stem
+    # Register the module so dataclasses can resolve postponed annotations.
+    module_name = f"avelang_dump_{path.stem}"
     spec = importlib.util.spec_from_file_location(module_name, path)
     if spec is None or spec.loader is None:
         raise RuntimeError(f"Failed to load module from {path}")
     module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
     spec.loader.exec_module(module)
     return module
 

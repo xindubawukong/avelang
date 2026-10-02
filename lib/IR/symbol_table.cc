@@ -1,5 +1,6 @@
 #include "symbol_table.h"
 #include "Utils/assert.h"
+#include "constexpr.h"
 #include "generator_context.h"
 #include "named_module.h"
 
@@ -231,6 +232,27 @@ mlir::Value SymbolTable::ResolveRefExpr(ast::Expr *expr) {
     auto symbol =
         ResolveSymbol(expr, SymbolKind::kValue, /*report_not_found=*/false);
     return symbol ? symbol->value : mlir::Value();
+}
+
+ConstexprValue SymbolTable::ResolveConstexpr(ast::Expr *expr) {
+    if (auto *name = llvm::dyn_cast_or_null<ast::Name>(expr)) {
+        auto symbol = LookupSymbol(name->GetId());
+        if (symbol && symbol->isa(SymbolKind::kConstexpr))
+            return symbol->constexpr_value;
+    } else if (auto *attr = llvm::dyn_cast_or_null<ast::AttributeExpr>(expr)) {
+        auto record = mlir::dyn_cast_or_null<mlir::DictionaryAttr>(
+            ResolveConstexpr(attr->GetValue()).value);
+        if (!record)
+            return {};
+        auto fields = record.getAs<mlir::DictionaryAttr>("fields");
+        if (auto field = fields.get(attr->GetAttr()))
+            return {field, {}};
+        parent_->diagnostic_manager->Report(
+            basic::DiagnosticCode::kTypeMismatch,
+            expr->GetSourceRange().getBegin())
+            << "Unknown constexpr dataclass field '" + attr->GetAttr() + "'";
+    }
+    return {};
 }
 
 mlir::Type SymbolTable::ResolveBuiltinType(ast::Expr *expr) {

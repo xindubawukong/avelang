@@ -142,8 +142,8 @@ void FunctionGenerator::Generate(ast::FunctionDef *func) {
     mlir::OpBuilder::InsertionGuard insertion_guard(builder_);
 
     current_func_ = func;
-    local_symbol_scope_name_ =
-        parent_.GetFunctionScopeName(func, &argument_address_spaces_);
+    local_symbol_scope_name_ = parent_.GetMangledFunctionName(
+        func, &argument_address_spaces_, {}, &constexpr_values_);
     qualified_scope_prefix_ = name_prefix_;
     if (!local_symbol_scope_name_.empty()) {
         if (!qualified_scope_prefix_.empty()) {
@@ -163,6 +163,11 @@ void FunctionGenerator::Generate(ast::FunctionDef *func) {
                                          func->GetSourceRange().getBegin())
             << error_msg;
         return;
+    }
+
+    SymbolTable::FrameGuard guard(ctx_->syms.get());
+    for (const auto &[name, value] : constexpr_values_) {
+        ctx_->syms->GetCurrentFrame().AddConstexpr(name, value);
     }
 
     // Create function type
@@ -356,7 +361,6 @@ void FunctionGenerator::Generate(ast::FunctionDef *func) {
     auto &body_block = func_op.getFunctionBody().emplaceBlock();
 
     auto generator_guard = ctx_->GetFunctionGeneratorGuard(this);
-    SymbolTable::FrameGuard guard(ctx_->syms.get());
 
     builder_.setInsertionPointToStart(&entry_block);
     mlir::cf::BranchOp::create(
@@ -369,10 +373,6 @@ void FunctionGenerator::Generate(ast::FunctionDef *func) {
     // arguments here are runtime parameters that need to be defined.
     for (size_t i = 0; i < argNames.size(); ++i) {
         ctx_->syms->DefineSymbol(argNames[i], entry_block.getArgument(i));
-    }
-    for (const auto &[name, value] : constexpr_values_) {
-        ctx_->syms->GetCurrentFrame().AddValue(name, value,
-                                               /*immutable=*/true);
     }
 
     for (auto *stmt : func->GetBody()) {
@@ -791,6 +791,42 @@ void FunctionGenerator::VisitAssign(ast::Assign *assign) {
     if (!assign)
         return;
 
+    for (auto *target : assign->GetTargets()) {
+        ast::Expr *base = nullptr;
+        if (auto *attr = llvm::dyn_cast<ast::AttributeExpr>(target))
+            base = attr->GetValue();
+        else if (auto *sub = llvm::dyn_cast<ast::Subscript>(target))
+            base = sub->GetValue();
+        if (base && ctx_->syms->ResolveConstexpr(base)) {
+            ctx_->diagnostic_manager->Report(
+                basic::DiagnosticCode::kTypeMismatch,
+                target->GetSourceRange().getBegin())
+                << "Cannot mutate constexpr data";
+            return;
+        }
+    }
+
+    auto *diagnostics = ctx_->diagnostic_manager->GetEngine();
+    auto errors = diagnostics->getNumErrors();
+    auto constant = ctx_->syms->ResolveConstexpr(assign->GetValue());
+    if (diagnostics->getNumErrors() != errors)
+        return;
+    if (constant && mlir::isa<mlir::DictionaryAttr>(constant.value)) {
+        auto targets = assign->GetTargets();
+        auto *name = targets.size() == 1
+                         ? llvm::dyn_cast<ast::Name>(targets.front())
+                         : nullptr;
+        if (!name || ctx_->syms->LookupSymbol(name->GetId())) {
+            ctx_->diagnostic_manager->Report(
+                basic::DiagnosticCode::kTypeMismatch,
+                assign->GetSourceRange().getBegin())
+                << "constexpr dataclass aliases require a fresh variable name";
+            return;
+        }
+        ctx_->syms->GetCurrentFrame().AddConstexpr(name->GetId(), constant);
+        return;
+    }
+
     // Generate the value expression (right-hand side)
     auto value = GenerateExpr(assign->GetValue());
     if (!value) {
@@ -980,17 +1016,18 @@ bool FunctionGenerator::ResolveNameAssignmentTarget(
     const std::string &target_name = name_target->GetId();
     auto existing_symbol = ctx_->syms->LookupSymbol(target_name);
     if (existing_symbol &&
-        !existing_symbol->isa(SymbolTable::SymbolKind::kValue)) {
-        ctx_->diagnostic_manager->Report(basic::DiagnosticCode::kTypeMismatch,
-                                         source_loc)
-            << "Symbol has wrong type";
-        return false;
-    }
-    if (existing_symbol && existing_symbol->immutable) {
+        existing_symbol->isa(SymbolTable::SymbolKind::kConstexpr)) {
         ctx_->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
                                          source_loc)
             << "Cannot assign to immutable (constexpr) variable '" +
                    target_name + "'";
+        return false;
+    }
+    if (existing_symbol &&
+        !existing_symbol->isa(SymbolTable::SymbolKind::kValue)) {
+        ctx_->diagnostic_manager->Report(basic::DiagnosticCode::kTypeMismatch,
+                                         source_loc)
+            << "Symbol has wrong type";
         return false;
     }
 

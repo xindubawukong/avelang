@@ -27,6 +27,11 @@ def helper_constexpr_value(kSize: S.constexpr) -> S.u32:
 
 
 @avelang.jit
+def helper_constexpr_shift(value: S.constexpr) -> S.u32:
+    return S.convert(value >> 1, S.u32)
+
+
+@avelang.jit
 def helper_constexpr_bool_value(flag: S.constexpr) -> S.u32:
     if flag:
         return S.convert(11, S.u32)
@@ -61,10 +66,17 @@ def kernel_constexpr_return_direct(
 
 @avelang.jit
 def kernel_constexpr_call_expr(
-    out: S.Tensor((4,), S.u32),
+    out: S.Tensor((8,), S.u32),
     kSize: S.constexpr,
 ):
     out[0] = helper_constexpr_value(kSize + 1)
+    out[1] = helper_constexpr_value(S.convert(kSize + 1, S.i64))
+    out[2] = helper_constexpr_shift(-1)
+    out[3] = helper_constexpr_shift(S.convert(-1, S.u32))
+    out[4] = helper_constexpr_shift(S.bitcast(-1, S.u32))
+    out[5] = helper_constexpr_value(S.convert(4.0, S.u32))
+    out[6] = helper_constexpr_shift(S.convert(S.convert(S.convert(-1, S.u8), S.u16), S.u32))
+    out[7] = helper_constexpr_shift(S.convert(S.convert(S.convert(-1, S.i8), S.i16), S.i32))
 
 
 @avelang.jit
@@ -108,14 +120,14 @@ class TestConstexprResolve(unittest.TestCase):
         self.assertEqual(out.cpu()[0], 256.0)
 
     def test_constexpr_call_expr_materializes_in_callee(self):
-        out = torch.zeros((4,), dtype=torch.int32, device="cuda")
+        out = torch.zeros((8,), dtype=torch.int32, device="cuda")
         kernel_constexpr_call_expr[lambda: ((1, 1, 1), (1, 1, 1))](
             out,
             3,
         )
         torch.cuda.synchronize()
 
-        self.assertEqual(out.cpu()[0], 4)
+        self.assertEqual(out.cpu().tolist(), [4, 4, -1, 2147483647, 2147483647, 4, 127, -1])
 
     def test_constexpr_branch_in_loop(self):
         for flag, expected in ((True, [11, 12, 11, 12]), (False, [21, 22, 21, 22])):

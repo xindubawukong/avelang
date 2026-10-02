@@ -1,5 +1,6 @@
 #include "Utils/assert.h"
 #include "constant_folder.h"
+#include "constexpr.h"
 #include "layout_operation.h"
 #include "mlir_generator_impl.h"
 #include "parsing_utils.h"
@@ -116,7 +117,10 @@ ResolveCallerArgs(ExprGenerator *gen, ast::Call *call, ast::FunctionDef *callee,
         auto value = call_args[index];
         auto *annotation = calleeArg->GetAnnotation();
         if (IsConstexprAnnotation(annotation)) {
-            if (!value) {
+            auto constant = ctx->syms->ResolveConstexpr(argExpr);
+            if (!constant)
+                constant = {ConstantFolder::FoldValue(value), GetTypeInfo(value)};
+            if (!constant) {
                 Report(gen, basic::DiagnosticCode::kUnimplemented,
                        call->GetSourceRange().getBegin())
                     << "Failed to resolve constexpr argument '"
@@ -124,7 +128,7 @@ ResolveCallerArgs(ExprGenerator *gen, ast::Call *call, ast::FunctionDef *callee,
                     << callee->GetName() << "'";
                 return std::nullopt;
             }
-            result.constexpr_values.emplace(calleeArg->GetArgName(), value);
+            result.constexpr_values.emplace(calleeArg->GetArgName(), constant);
             continue;
         }
 
@@ -1000,41 +1004,14 @@ mlir::Value ExprGenerator::VisitName(ast::Name *name) {
     if (!name)
         return nullptr;
 
+    if (auto constant = parent_->GetContext()->syms->ResolveConstexpr(name))
+        return MaterializeConstexpr(constant, parent_->GetBuilder(),
+                                    GetMLIRLocation(name));
+
     // Use ResolveRefExpr to look up the symbol
     auto value = parent_->GetContext()->syms->ResolveRefExpr(name);
     if (!value)
         return nullptr;
-
-    // Check if this is an immutable (constexpr) constant that needs to be
-    // cloned
-    auto symbol = parent_->GetContext()->syms->ResolveSymbol(
-        name, ir::SymbolScope::SymbolKind::kValue, false);
-    if (symbol && symbol->immutable && value.getDefiningOp()) {
-        auto &builder = parent_->GetBuilder();
-        auto location = GetMLIRLocation(name);
-
-        // This is a constexpr value. Re-materialize it in the current
-        // insertion point so helper functions do not capture values defined in
-        // their caller's region.
-        if (auto intValue = ConstantFolder::FoldIntValue(value)) {
-            if (value.getType().isIndex()) {
-                value = mlir::arith::ConstantIndexOp::create(
-                    builder, location, *intValue);
-            } else if (value.getType().isInteger()) {
-                value = mlir::arith::ConstantOp::create(
-                    builder, location,
-                    builder.getIntegerAttr(value.getType(), *intValue));
-            }
-            if (value) {
-                SetTypeInfo(value, GetTypeInfo(symbol->value));
-            }
-        } else if (auto constOp = mlir::dyn_cast<mlir::arith::ConstantOp>(
-                       value.getDefiningOp())) {
-            value = mlir::arith::ConstantOp::create(builder, location,
-                                                    constOp.getValue());
-            SetTypeInfo(value, GetTypeInfo(symbol->value));
-        }
-    }
 
     // If the symbol is a scalar memref (created by variable assignment), load
     // from it. Keep scalar memref block arguments as memrefs so call sites can
@@ -1056,6 +1033,13 @@ mlir::Value ExprGenerator::VisitName(ast::Name *name) {
 
     // For non-scalar memrefs or other types, return as-is
     return value;
+}
+
+mlir::Value ExprGenerator::VisitAttributeExpr(ast::AttributeExpr *attr) {
+    if (auto constant = parent_->GetContext()->syms->ResolveConstexpr(attr))
+        return MaterializeConstexpr(constant, parent_->GetBuilder(),
+                                    GetMLIRLocation(attr));
+    return {};
 }
 
 mlir::Value ExprGenerator::VisitSubscript(ast::Subscript *subscript) {
@@ -1639,13 +1623,19 @@ mlir::Value ExprGenerator::VisitCall(ast::Call *call) {
     if (!call)
         return nullptr;
 
+    auto *diagnostics = parent_->GetContext()->diagnostic_manager->GetEngine();
+
     // Resolve positional arguments once at the call site
     llvm::SmallVector<mlir::Value> resolved_args;
     resolved_args.reserve(call->GetArgs().size());
     for (auto *arg_expr : call->GetArgs()) {
         // Skip dispatch for type-like expressions (attribute access such as
         // avelang.f32 or factory calls like avelang.Tensor(...))
-        if (llvm::isa<ast::AttributeExpr>(arg_expr)) {
+        auto errors = diagnostics->getNumErrors();
+        if (llvm::isa<ast::AttributeExpr>(arg_expr) &&
+            !parent_->GetContext()->syms->ResolveConstexpr(arg_expr)) {
+            if (diagnostics->getNumErrors() != errors)
+                return {};
             resolved_args.emplace_back();
             continue;
         }

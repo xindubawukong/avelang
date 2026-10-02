@@ -10,7 +10,9 @@
 #include <mlir/Dialect/Arith/IR/Arith.h>
 #include <mlir/Dialect/MemRef/IR/MemRef.h>
 #include <mlir/IR/BuiltinAttributes.h>
+#include <mlir/IR/Operation.h>
 
+#include <llvm/ADT/SmallVector.h>
 #include <llvm/Support/Casting.h>
 
 namespace causalflow::avelang::ir {
@@ -273,6 +275,37 @@ static int64_t NormalizeBitcastIntegerValue(int64_t value,
 
 } // namespace
 
+mlir::Attribute ConstantFolder::FoldValue(mlir::Value value) {
+    if (!value)
+        return {};
+    if (auto op = value.getDefiningOp<mlir::arith::ConstantOp>())
+        return op.getValue();
+    if (auto *op = value.getDefiningOp(); op && op->getNumResults() == 1) {
+        while (true) {
+            llvm::SmallVector<mlir::Attribute> operands;
+            for (auto operand : op->getOperands())
+                operands.push_back(FoldValue(operand));
+            llvm::SmallVector<mlir::OpFoldResult> results;
+            if (mlir::failed(op->fold(operands, results)))
+                break;
+            // An empty result means the operation was folded in place.
+            if (results.empty())
+                continue;
+            if (auto attr = mlir::dyn_cast<mlir::Attribute>(results.front()))
+                return attr;
+            auto folded = mlir::cast<mlir::Value>(results.front());
+            if (folded != value)
+                return FoldValue(folded);
+            break;
+        }
+    }
+    if (value.getType().isIntOrIndex()) {
+        if (auto v = FoldIntValue(value))
+            return mlir::IntegerAttr::get(value.getType(), *v);
+    }
+    return {};
+}
+
 std::optional<int64_t> ConstantFolder::GetConstantIntValue(mlir::Value value) {
     if (!value) {
         return std::nullopt;
@@ -463,6 +496,11 @@ ConstantFolder::ResolveConstantReference(ast::Expr *expr) const {
     if (!ctx_ || !ctx_->syms || !expr) {
         return std::nullopt;
     }
+
+    if (auto value = mlir::dyn_cast_or_null<mlir::IntegerAttr>(
+            ctx_->syms->ResolveConstexpr(expr).value))
+        return value.getType().isInteger(1) ? value.getValue().getZExtValue()
+                                            : value.getInt();
 
     if (auto *name = llvm::dyn_cast<ast::Name>(expr)) {
         auto symbol = ctx_->syms->LookupSymbol(name->GetId());

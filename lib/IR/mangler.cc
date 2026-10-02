@@ -2,29 +2,25 @@
 
 #include "AST/ast_nodes_expr.h"
 #include "AST/ast_nodes_stmt.h"
-#include "Dialect/AveLang/IR/AveLangOps.h"
-#include "constant_folder.h"
 
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wambiguous-reversed-operator"
-#include <mlir/Dialect/Arith/IR/Arith.h>
 #include <mlir/Dialect/GPU/IR/GPUDialect.h>
-#include <mlir/IR/BuiltinTypes.h>
-#include <mlir/IR/Operation.h>
+#include <mlir/IR/BuiltinAttributes.h>
 #pragma clang diagnostic pop
 
 #include <cctype>
 #include <optional>
 
 #include <llvm/ADT/SmallVector.h>
+#include <llvm/ADT/StringExtras.h>
 #include <llvm/Support/Casting.h>
+#include <llvm/Support/SHA256.h>
 #include <llvm/Support/raw_ostream.h>
 
 namespace causalflow::avelang::ir {
 
 namespace {
-
-namespace cf = causalflow::avelang::dialect;
 
 std::string SanitizeManglePart(llvm::StringRef value) {
     std::string result;
@@ -68,87 +64,13 @@ std::string MangleAddressSpace(mlir::Attribute memorySpace) {
     return "unknown";
 }
 
-std::string MangleType(mlir::Type type) {
-    if (!type) {
-        return "unknown";
-    }
-    if (type.isIndex()) {
-        return "index";
-    }
-    if (auto intType = mlir::dyn_cast<mlir::IntegerType>(type)) {
-        return "i" + std::to_string(intType.getWidth());
-    }
-    if (auto floatType = mlir::dyn_cast<mlir::FloatType>(type)) {
-        return "f" + std::to_string(floatType.getWidth());
-    }
-    if (auto vectorType = mlir::dyn_cast<mlir::VectorType>(type)) {
-        std::string result = "vec";
-        for (auto dim : vectorType.getShape()) {
-            if (result.size() > 3) {
-                result.push_back('x');
-            }
-            result.append(std::to_string(dim));
-        }
-        result.push_back('x');
-        result.append(MangleType(vectorType.getElementType()));
-        return result;
-    }
-    if (auto memrefType = mlir::dyn_cast<cf::MemRefType>(type)) {
-        std::string result = "memref";
-        result.append(std::to_string(memrefType.getRank()));
-        result.append("d_");
-        result.append(MangleType(memrefType.getElementType()));
-        return result;
-    }
-    if (auto functionType = mlir::dyn_cast<mlir::FunctionType>(type)) {
-        std::string result = "func";
-        for (auto input : functionType.getInputs()) {
-            result.push_back('_');
-            result.append(MangleType(input));
-        }
-        return result;
-    }
-
+std::string MangleConstexprValueTag(ConstexprValue value) {
     std::string storage;
     llvm::raw_string_ostream os(storage);
-    type.print(os);
-    return SanitizeManglePart(os.str());
-}
-
-std::optional<std::string> MangleConstexprValueTag(mlir::Value value) {
-    if (!value) {
-        return std::nullopt;
-    }
-
-    std::string type = MangleType(value.getType());
-    if (value.getType().isInteger(1)) {
-        if (auto boolValue = ConstantFolder::FoldBoolValue(value)) {
-            return type + "_" + (*boolValue ? "1" : "0");
-        }
-    }
-    if (value.getType().isIntOrIndex()) {
-        if (auto intValue = ConstantFolder::FoldIntValue(value)) {
-            return type + "_" + SanitizeManglePart(std::to_string(*intValue));
-        }
-    }
-    if (auto constOp = value.getDefiningOp<mlir::arith::ConstantOp>()) {
-        if (auto floatAttr =
-                mlir::dyn_cast<mlir::FloatAttr>(constOp.getValue())) {
-            std::string storage;
-            llvm::raw_string_ostream os(storage);
-            floatAttr.print(os);
-            return type + "_" + SanitizeManglePart(os.str());
-        }
-    }
-
-    std::string storage;
-    llvm::raw_string_ostream os(storage);
-    if (auto *op = value.getDefiningOp()) {
-        op->print(os);
-    } else {
-        value.print(os);
-    }
-    return type + "_expr_" + SanitizeManglePart(os.str());
+    value.value.print(os);
+    os << ";unsigned=" << value.type_info.is_unsigned_integer.value_or(false);
+    auto digest = llvm::SHA256::hash(llvm::arrayRefFromStringRef(storage));
+    return llvm::toHex(llvm::ArrayRef(digest), /*LowerCase=*/true);
 }
 
 template <typename T>
@@ -228,7 +150,7 @@ std::string BuildMangledName(llvm::ArrayRef<std::string> scope,
 std::string MangleFunctionName(
     ast::FunctionDef *func, llvm::ArrayRef<std::string> scope,
     llvm::ArrayRef<std::pair<std::string, mlir::Attribute>> addressSpaces,
-    llvm::ArrayRef<std::pair<std::string, mlir::Value>> constexprValues) {
+    llvm::ArrayRef<std::pair<std::string, ConstexprValue>> constexprValues) {
     if (!func) {
         return {};
     }
@@ -242,14 +164,9 @@ std::string MangleFunctionName(
             }
             const auto &argName = arg->GetArgName();
             if (IsConstexprArg(arg)) {
-                auto value = FindBinding(constexprValues, argName);
-                if (!value) {
-                    continue;
-                }
-                auto tag = MangleConstexprValueTag(*value);
-                if (tag) {
+                if (auto value = FindBinding(constexprValues, argName)) {
                     constexprTags.push_back(SanitizeManglePart(argName) + "_" +
-                                            *tag);
+                                            MangleConstexprValueTag(*value));
                 }
                 continue;
             }

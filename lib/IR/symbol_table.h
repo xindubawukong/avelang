@@ -45,6 +45,7 @@ class SymbolTable {
     mlir::Type ResolveBuiltinType(ast::Expr *annotation);
     // Resolve a reference expression to a value. return a null value if failed.
     mlir::Value ResolveRefExpr(ast::Expr *expr);
+    ConstexprValue ResolveConstexpr(ast::Expr *expr);
     // Resolve a registered function for calling functions
     NamedModule::Function ResolveFunction(ast::Expr *expr);
 

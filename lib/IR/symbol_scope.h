@@ -1,5 +1,6 @@
 #pragma once
 
+#include <mlir/IR/Attributes.h>
 #include <mlir/IR/Types.h>
 #include <mlir/IR/Value.h>
 
@@ -11,6 +12,7 @@
 #include <llvm/ADT/ArrayRef.h>
 
 #include "AST/ast_nodes_expr.h"
+#include "constexpr.h"
 
 namespace causalflow::avelang::ir {
 
@@ -26,6 +28,7 @@ class SymbolScope {
         kFunction,
         kType,
         kValue,
+        kConstexpr,
     };
 
     using TypeFactoryFunction = std::function<mlir::Type(
@@ -67,13 +70,13 @@ class SymbolScope {
     // FIXME: This is broken in terms of lifecycle management
     struct Symbol {
         SymbolKind kind;
-        bool immutable = false; // Track whether this symbol is immutable
         union {
             NamedModule *module;
             TypeFactoryFunction type_factory;
             Function function;
             mlir::Type type;
             mlir::Value value;
+            ConstexprValue constexpr_value;
         };
 
         Symbol();
@@ -82,6 +85,7 @@ class SymbolScope {
         Symbol(Function ff);
         Symbol(mlir::Type t);
         Symbol(mlir::Value v);
+        Symbol(ConstexprValue v);
 
         ~Symbol();
 
@@ -96,8 +100,8 @@ class SymbolScope {
     std::optional<Symbol> LookupSymbol(const std::string &name) const;
 
     // Convenience methods for different symbol types
-    void AddValue(const std::string &name, mlir::Value value,
-                  bool immutable = false);
+    void AddValue(const std::string &name, mlir::Value value);
+    void AddConstexpr(const std::string &name, ConstexprValue value);
     void AddType(const std::string &name, mlir::Type type);
     void AddModule(const std::string &name, NamedModule *module);
     void AddTypeFactory(const std::string &name, TypeFactoryFunction factory);

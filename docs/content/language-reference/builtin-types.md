@@ -120,3 +120,46 @@ Here `A_vec[row, vec]` is four contiguous `i32` words, representing eight BF16 v
 def tiled(x: al.Pointer(al.i32), BLOCK: al.constexpr):
     smem = al.make_shared((BLOCK,), al.i32)
 ```
+
+Parameters may also be frozen dataclass instances, recursively containing
+`bool`, signed 64-bit `int`, `float`, and frozen dataclasses. This lets a
+kernel and its JIT helpers share a single configuration:
+
+```python
+from dataclasses import dataclass
+
+@dataclass(frozen=True)
+class Config:
+    m: int = 16
+    n: int = 64
+    enabled: bool = True
+
+@avelang.jit
+def helper(x: al.i32, cfg: al.constexpr) -> al.i32:
+    if cfg.enabled:
+        return x + cfg.m * cfg.n
+    return x
+
+@avelang.jit
+def configured(out: al.Tensor((1,), al.i32), cfg: al.constexpr):
+    smem = al.make_shared((cfg.m, cfg.n), al.i32)
+    out[0] = helper(0, cfg)
+```
+
+Fields are resolved in the compiler frontend. Configuration objects are read-only
+and do not become runtime kernel arguments; local configuration aliases cannot be
+rebound. Passing a different configuration selects another compiled specialization;
+equivalent contents reuse the same JIT cache entry. Dataclass construction and
+methods are not supported inside JIT functions.
+
+For Tensor parameter shapes that reference a configuration parameter, add
+`from __future__ import annotations` at the top of the file:
+
+```python
+@avelang.jit
+def helper(x: al.Tensor((cfg.m, cfg.n), al.i32), cfg: al.constexpr):
+    x[cfg.m - 1, cfg.n - 1] = 1
+```
+
+Tuples are not supported as constexpr parameters or dataclass fields; ordinary
+tuple expressions such as the shared-memory shape above still work.
