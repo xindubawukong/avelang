@@ -120,6 +120,11 @@ def cvt_pk_bf16_f32(src0, src1):
     pass
 
 
+def cvt_scalef32_pk_fp4_f32(old, a, b, scale, byte_sel):
+    """Quantize two f32 values with scale into byte_sel (constant 0–3) of old."""
+    pass
+
+
 def cvt_pk_fp8_f32(src0, src1, old, word_sel):
     pass
 

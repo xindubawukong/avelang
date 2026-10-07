@@ -163,6 +163,9 @@ class AMDGPUIntrinsic : public NamedModule {
     mlir::Value CreateCvtPkBf16F32Function(
         ast::Call *call_expr, GeneratorContext *ctx,
         llvm::ArrayRef<mlir::Value> resolved_args) const;
+    mlir::Value CreateCvtScaleF32PkFp4F32Function(
+        ast::Call *call_expr, GeneratorContext *ctx,
+        llvm::ArrayRef<mlir::Value> resolved_args) const;
     mlir::Value
     CreateSetPrioFunction(ast::Call *call_expr, GeneratorContext *ctx,
                           llvm::ArrayRef<mlir::Value> resolved_args) const;
@@ -245,6 +248,9 @@ class AMDGPUIntrinsic : public NamedModule {
         ast::Call *call_expr, GeneratorContext *ctx,
         llvm::ArrayRef<mlir::Value> resolved_args,
         llvm::StringRef intrinsic_name) const;
+    bool CheckCvtScaleF32PkFp4F32Function(
+        ast::Call *call_expr, GeneratorContext *ctx,
+        llvm::ArrayRef<mlir::Value> resolved_args) const;
     bool CheckSetPrioFunction(
         ast::Call *call_expr, GeneratorContext *ctx,
         llvm::ArrayRef<mlir::Value> resolved_args) const;
@@ -543,6 +549,19 @@ void AMDGPUIntrinsic::Initialize() {
                llvm::ArrayRef<mlir::Value> resolved_args) -> bool {
             return CheckCvtPk16F32Function(
                 call_expr, gen_ctx, resolved_args, "cvt_pk_bf16_f32");
+        });
+
+    AddFunction(
+        "cvt_scalef32_pk_fp4_f32",
+        [this](ast::Call *call_expr, GeneratorContext *gen_ctx,
+               llvm::ArrayRef<mlir::Value> resolved_args) -> mlir::Value {
+            return CreateCvtScaleF32PkFp4F32Function(
+                call_expr, gen_ctx, resolved_args);
+        },
+        [this](ast::Call *call_expr, GeneratorContext *gen_ctx,
+               llvm::ArrayRef<mlir::Value> resolved_args) -> bool {
+            return CheckCvtScaleF32PkFp4F32Function(
+                call_expr, gen_ctx, resolved_args);
         });
 
     AddFunction(
@@ -1251,6 +1270,25 @@ mlir::Value AMDGPUIntrinsic::CreateCvtPkBf16F32Function(
     ast::Call *call_expr, GeneratorContext *ctx,
     llvm::ArrayRef<mlir::Value> resolved_args) const {
     return CreateCvtPk16F32<mlir::BFloat16Type>(call_expr, ctx, resolved_args);
+}
+
+mlir::Value AMDGPUIntrinsic::CreateCvtScaleF32PkFp4F32Function(
+    ast::Call *call_expr, GeneratorContext *ctx,
+    llvm::ArrayRef<mlir::Value> resolved_args) const {
+    auto &builder = ctx->GetCurrentFunctionGenerator()->GetBuilder();
+    auto location = GetCallLocation(ctx, call_expr);
+    auto old = resolved_args[0];
+    auto src0 = resolved_args[1];
+    auto src1 = resolved_args[2];
+    auto scale = resolved_args[3];
+    auto byteSel = ConstantFolder::FoldIntValue(resolved_args[4]);
+    SS_ASSERT(byteSel && *byteSel >= 0 && *byteSel < 4);
+
+    auto op = mlir::ROCDL::CvtScaleF32PkFp4F32Op::create(
+        builder, location, builder.getI32Type(), old, src0, src1, scale,
+        builder.getI32IntegerAttr(*byteSel));
+    SetTypeInfo(op.getResult(), TypeInfo{true});
+    return op.getResult();
 }
 
 mlir::Value AMDGPUIntrinsic::CreateSetPrioFunction(
@@ -2015,6 +2053,28 @@ bool AMDGPUIntrinsic::CheckCvtPkF32Bf8Function(
         return false;
     }
     return true;
+}
+
+bool AMDGPUIntrinsic::CheckCvtScaleF32PkFp4F32Function(
+    ast::Call *call_expr, GeneratorContext *ctx,
+    llvm::ArrayRef<mlir::Value> resolved_args) const {
+    if (resolved_args.size() == 5 &&
+        llvm::all_of(resolved_args, [](mlir::Value value) { return bool(value); })) {
+        auto byteSel = ConstantFolder::FoldIntValue(resolved_args[4]);
+        if (resolved_args[0].getType().isInteger(32) &&
+            resolved_args[1].getType().isF32() &&
+            resolved_args[2].getType().isF32() &&
+            resolved_args[3].getType().isF32() &&
+            resolved_args[4].getType().isIntOrIndex() &&
+            byteSel && *byteSel >= 0 && *byteSel < 4) {
+            return true;
+        }
+    }
+    ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
+                                    call_expr->GetSourceRange().getBegin())
+        << "cvt_scalef32_pk_fp4_f32(old, a, b, scale, byte_sel) expects "
+           "i32 old, f32 values/scale and a compile-time byte_sel in [0, 3]";
+    return false;
 }
 
 bool AMDGPUIntrinsic::CheckCvtPk16F32Function(
