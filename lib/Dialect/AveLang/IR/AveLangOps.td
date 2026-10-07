@@ -293,6 +293,38 @@ def AMDGPUMfmaOp : AveLang_GPU_Op<"amdgpu_mfma", []> {
     let hasVerifier = 1;
 }
 
+def AMDGPUMfmaScaleOp : AveLang_GPU_Op<"amdgpu_mfma_scale", []> {
+    let summary = "AMDGPU MFMA with E8M0 scales";
+    let description = [{
+        The scale selectors may be dynamic. Lowering dispatches them to native
+        MFMA instructions with immediate selectors.
+    }];
+
+    let arguments = (ins
+        LLVM_AnyVector:$a,
+        I32:$scale_a,
+        LLVM_AnyVector:$b,
+        I32:$scale_b,
+        LLVM_AnyVector:$c,
+        AnySignlessIntegerOrIndex:$opsel_a,
+        AnySignlessIntegerOrIndex:$opsel_b,
+        I32Attr:$m,
+        I32Attr:$n,
+        I32Attr:$k,
+        StrAttr:$type_a,
+        StrAttr:$type_c
+    );
+    let results = (outs LLVM_AnyVector:$result);
+
+    let assemblyFormat = [{
+        $a `,` $scale_a `,` $b `,` $scale_b `,` $c `,` $opsel_a `,` $opsel_b
+        attr-dict `:` type($a) `,` type($scale_a) `,` type($b) `,` type($scale_b)
+        `,` type($c) `,` type($opsel_a) `,` type($opsel_b) `->` type($result)
+    }];
+
+    let hasVerifier = 1;
+}
+
 def AMDGPURawBufferLoadOp : AveLang_GPU_Op<"amdgpu_raw_buffer_load", []> {
     let summary = "AMDGPU Raw Buffer Load operation";
     let description = [{

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <optional>
 
 #include <llvm/ADT/ArrayRef.h>
 #include <llvm/ADT/StringRef.h>
@@ -10,6 +11,7 @@ namespace causalflow::avelang::amdgpu::mfma {
 
 enum class VectorElemKind {
     I32,
+    FP4,
     FP8,
     F16,
     F32,
@@ -26,6 +28,7 @@ struct MFMAConfig {
     llvm::StringRef intrinsic;
     VectorElemKind aElem;
     VectorElemKind cElem;
+    bool isScaled = false;
 
     static constexpr unsigned kWarpSize = 64;
 
@@ -36,6 +39,17 @@ struct MFMAConfig {
     }
 
     unsigned GetCElementCount() const { return (m * n) / kWarpSize; }
+
+    std::optional<int32_t> GetScaleFormat() const {
+        // cbsz/blgp encodings: MFMAScaleFormats in
+        // llvm/lib/Target/AMDGPU/SIDefines.h.
+        switch (aElem) {
+        case VectorElemKind::FP4:
+            return 4; // FP4 E2M1
+        default:
+            return std::nullopt;
+        }
+    }
 
     bool MatchesAType(mlir::Type type) const {
         return MatchesVectorType(type, VectorElemKind::I32,
@@ -130,6 +144,18 @@ struct MFMAConfig {
                 VectorElemKind::FP8,
                 VectorElemKind::F32,
             },
+            {
+                "mfma_scale_16x16x128_fp4",
+                16,
+                16,
+                128,
+                "fp4",
+                "f32",
+                "rocdl.mfma.scale.f32.16x16x128.f8f6f4",
+                VectorElemKind::FP4,
+                VectorElemKind::F32,
+                true,
+            },
         };
 
         return llvm::ArrayRef(kConfigs);
@@ -137,10 +163,10 @@ struct MFMAConfig {
 
     static const MFMAConfig *Find(int64_t m, int64_t n, int64_t k,
                                   llvm::StringRef typeA,
-                                  llvm::StringRef typeC) {
+                                  llvm::StringRef typeC, bool isScaled = false) {
         for (const auto &cfg : GetConfigs()) {
             if (cfg.m == m && cfg.n == n && cfg.k == k && cfg.typeA == typeA &&
-                cfg.typeC == typeC) {
+                cfg.typeC == typeC && cfg.isScaled == isScaled) {
                 return &cfg;
             }
         }
@@ -153,6 +179,8 @@ struct MFMAConfig {
         case VectorElemKind::I32:
         case VectorElemKind::F32:
             return 32;
+        case VectorElemKind::FP4:
+            return 4;
         case VectorElemKind::FP8:
             return 8;
         case VectorElemKind::F16:
@@ -173,6 +201,8 @@ struct MFMAConfig {
         switch (elem) {
         case VectorElemKind::I32:
             return elemType.isInteger(32);
+        case VectorElemKind::FP4:
+            return elemType.isInteger(4);
         case VectorElemKind::FP8:
             return elemType.isInteger(8);
         case VectorElemKind::F16:

@@ -31,6 +31,11 @@ def mfma_f32_32x32x8_bf16(a, b, c):
     pass
 
 
+def mfma_scale_16x16x128_fp4(a, scale_a, b, scale_b, c, opsel_a, opsel_b):
+    """gfx950 FP4 MFMA with packed u32x4 operands and E8M0 scale selectors."""
+    pass
+
+
 def make_rsrc(tensor, range_bytes):
     pass
 

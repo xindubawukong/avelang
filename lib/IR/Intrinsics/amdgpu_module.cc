@@ -33,6 +33,7 @@ extern "C" const unsigned char _binary_amdgpu_intrinsics_mlirbc_start[];
 extern "C" const unsigned char _binary_amdgpu_intrinsics_mlirbc_end[];
 
 #include <llvm/ADT/ArrayRef.h>
+#include <llvm/ADT/STLExtras.h>
 #include <llvm/ADT/SmallVector.h>
 #include <llvm/Support/Casting.h>
 #include <llvm/Support/ErrorHandling.h>
@@ -80,6 +81,10 @@ class AMDGPUIntrinsic : public NamedModule {
     void Initialize() override;
     void DeclareModules(mlir::ModuleOp module) override;
 
+    mlir::Value CreateScaledMfmaFunction(
+        ast::Call *call_expr, GeneratorContext *ctx,
+        llvm::ArrayRef<mlir::Value> resolved_args,
+        const amdgpu_mfma::MFMAConfig &config) const;
     mlir::Value CreateMfmaFunction(ast::Call *call_expr, GeneratorContext *ctx,
                                    llvm::ArrayRef<mlir::Value> resolved_args,
                                    const amdgpu_mfma::MFMAConfig &config) const;
@@ -179,6 +184,10 @@ class AMDGPUIntrinsic : public NamedModule {
     bool
     CheckGenericMFMAFunction(ast::Call *call_expr, GeneratorContext *ctx,
                              llvm::ArrayRef<mlir::Value> resolved_args) const;
+    bool CheckScaledMfmaFunction(
+        ast::Call *call_expr, GeneratorContext *ctx,
+        llvm::ArrayRef<mlir::Value> resolved_args,
+        const amdgpu_mfma::MFMAConfig &config) const;
 
     bool CheckGenericRawBufferLoadFunction(
         ast::Call *call_expr, GeneratorContext *ctx,
@@ -253,8 +262,12 @@ void AMDGPUIntrinsic::Initialize() {
                 return CreateMfmaFunction(call_expr, gen_ctx, resolved_args,
                                           config);
             },
-            [this](ast::Call *call_expr, GeneratorContext *gen_ctx,
-                   llvm::ArrayRef<mlir::Value> resolved_args) -> bool {
+            [this, config](ast::Call *call_expr, GeneratorContext *gen_ctx,
+                           llvm::ArrayRef<mlir::Value> resolved_args) -> bool {
+                if (config.isScaled) {
+                    return CheckScaledMfmaFunction(call_expr, gen_ctx,
+                                                   resolved_args, config);
+                }
                 return CheckGenericMFMAFunction(call_expr, gen_ctx,
                                                 resolved_args);
             });
@@ -614,6 +627,8 @@ mlir::Type GetMfmaElemType(amdgpu_mfma::VectorElemKind kind,
     switch (kind) {
     case amdgpu_mfma::VectorElemKind::I32:
         return builder.getI32Type();
+    case amdgpu_mfma::VectorElemKind::FP4:
+        return builder.getIntegerType(4);
     case amdgpu_mfma::VectorElemKind::FP8:
         return builder.getI8Type();
     case amdgpu_mfma::VectorElemKind::F16:
@@ -736,11 +751,38 @@ mlir::Value AMDGPUIntrinsic::CreateGenericMFMAFunction(
     return mfma_op.getResult();
 }
 
+mlir::Value AMDGPUIntrinsic::CreateScaledMfmaFunction(
+    ast::Call *call_expr, GeneratorContext *ctx,
+    llvm::ArrayRef<mlir::Value> resolved_args,
+    const amdgpu_mfma::MFMAConfig &config) const {
+    auto &builder = ctx->GetCurrentFunctionGenerator()->GetBuilder();
+    auto location = GetCallLocation(ctx, call_expr);
+
+    auto a = resolved_args[0];
+    auto scale_a = resolved_args[1];
+    auto b = resolved_args[2];
+    auto scale_b = resolved_args[3];
+    auto c = resolved_args[4];
+    auto opsel_a = resolved_args[5];
+    auto opsel_b = resolved_args[6];
+
+    auto mfma_op = cf::AMDGPUMfmaScaleOp::create(
+        builder, location, c.getType(),
+        a, scale_a, b, scale_b, c, opsel_a, opsel_b,
+        config.m, config.n, config.k, config.typeA, config.typeC);
+
+    return mfma_op.getResult();
+}
+
 mlir::Value AMDGPUIntrinsic::CreateMfmaFunction(
     ast::Call *call_expr, GeneratorContext *ctx,
     llvm::ArrayRef<mlir::Value> resolved_args,
     const amdgpu_mfma::MFMAConfig &config) const {
-    return CreateGenericMFMAFunction(call_expr, ctx, resolved_args, config);
+    if (config.isScaled) {
+        return CreateScaledMfmaFunction(call_expr, ctx, resolved_args, config);
+    } else {
+        return CreateGenericMFMAFunction(call_expr, ctx, resolved_args, config);
+    }
 }
 
 mlir::Value AMDGPUIntrinsic::CreateRawBufferLoadX1Function(
@@ -1321,6 +1363,34 @@ bool AMDGPUIntrinsic::CheckGenericMFMAFunction(
     }
 
     return true;
+}
+
+bool AMDGPUIntrinsic::CheckScaledMfmaFunction(
+    ast::Call *call_expr, GeneratorContext *ctx,
+    llvm::ArrayRef<mlir::Value> resolved_args,
+    const amdgpu_mfma::MFMAConfig &config) const {
+    auto is_selector = [](mlir::Value value) {
+        auto constant = ConstantFolder::FoldIntValue(value);
+        return value.getType().isIntOrIndex() &&
+               (!constant || (*constant >= 0 && *constant < 4));
+    };
+    if (resolved_args.size() == 7 &&
+        llvm::all_of(resolved_args, [](mlir::Value value) { return bool(value); }) &&
+        config.MatchesAType(resolved_args[0].getType()) &&
+        resolved_args[1].getType().isInteger(32) &&
+        config.MatchesBType(resolved_args[2].getType()) &&
+        resolved_args[3].getType().isInteger(32) &&
+        config.MatchesCType(resolved_args[4].getType()) &&
+        is_selector(resolved_args[5]) && is_selector(resolved_args[6]))
+        return true;
+
+    ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
+                                    call_expr->GetSourceRange().getBegin())
+        << "scaled MFMA expects vector<" << config.GetAStorageElementCount()
+        << "xi32> operands, i32 scales, vector<"
+        << config.GetCElementCount()
+        << "xf32> accumulator and scale selectors in [0, 3]";
+    return false;
 }
 
 bool AMDGPUIntrinsic::CheckGenericRawBufferLoadFunction(

@@ -5,6 +5,7 @@
 #include <mlir/Dialect/Ptr/IR/PtrTypes.h>
 #include <mlir/Dialect/Vector/IR/VectorOps.h>
 #include <mlir/IR/Builders.h>
+#include <mlir/IR/Matchers.h>
 #include <mlir/IR/OpImplementation.h>
 #include <mlir/IR/PatternMatch.h>
 #include <optional>
@@ -127,6 +128,9 @@ static const NvvMmaSignature kNvvmMmaSignatures[] = {
 static std::string BuildAmdgpuMfmaSignatureList() {
     std::string list;
     for (const auto &cfg : amdgpu_mfma::MFMAConfig::GetConfigs()) {
+        if (cfg.isScaled) {
+            continue;
+        }
         if (!list.empty()) {
             list += ", ";
         }
@@ -536,6 +540,33 @@ mlir::LogicalResult AMDGPUMfmaOp::verify() {
                << " " << config->name;
     }
 
+    return mlir::success();
+}
+
+//===----------------------------------------------------------------------===//
+// AMDGPUMfmaScaleOp
+//===----------------------------------------------------------------------===//
+
+mlir::LogicalResult AMDGPUMfmaScaleOp::verify() {
+    auto *config = amdgpu_mfma::MFMAConfig::Find(
+        getM(), getN(), getK(), getTypeA(), getTypeC(), true);
+    if (!config) {
+        return emitOpError("unsupported scaled MFMA configuration");
+    }
+    if (!config->MatchesAType(getA().getType()) ||
+        !config->MatchesBType(getB().getType()) ||
+        !config->MatchesCType(getC().getType()) ||
+        !config->MatchesCType(getResult().getType())) {
+        return emitOpError("operand types do not match scaled MFMA signature")
+               << " " << config->name;
+    }
+    for (auto selector : {getOpselA(), getOpselB()}) {
+        llvm::APInt value;
+        if (mlir::matchPattern(selector, mlir::m_ConstantInt(&value)) &&
+            value.uge(4)) {
+            return emitOpError("scale selectors must be in [0, 3]");
+        }
+    }
     return mlir::success();
 }
 

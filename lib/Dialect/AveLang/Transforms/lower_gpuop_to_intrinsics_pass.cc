@@ -11,10 +11,12 @@
 #include <mlir/Dialect/LLVMIR/NVVMDialect.h>
 #include <mlir/Dialect/LLVMIR/ROCDLDialect.h>
 #include <mlir/Dialect/MemRef/IR/MemRef.h>
+#include <mlir/Dialect/SCF/IR/SCF.h>
 #include <mlir/Dialect/Vector/IR/VectorOps.h>
 #include <mlir/IR/Builders.h>
 #include <mlir/IR/BuiltinOps.h>
 #include <mlir/IR/BuiltinTypes.h>
+#include <mlir/IR/Matchers.h>
 #include <mlir/IR/PatternMatch.h>
 #include <mlir/Pass/Pass.h>
 #include <mlir/Support/LLVM.h>
@@ -22,6 +24,7 @@
 
 #include <llvm/ADT/ArrayRef.h>
 #include <llvm/ADT/STLExtras.h>
+#include <llvm/ADT/STLFunctionalExtras.h>
 #include <llvm/ADT/SmallString.h>
 #include <llvm/ADT/SmallVector.h>
 #include <llvm/Support/Casting.h>
@@ -231,6 +234,8 @@ static mlir::Type getMfmaElemType(amdgpu_mfma::VectorElemKind kind,
     switch (kind) {
     case amdgpu_mfma::VectorElemKind::I32:
         return builder.getI32Type();
+    case amdgpu_mfma::VectorElemKind::FP4:
+        return builder.getIntegerType(4);
     case amdgpu_mfma::VectorElemKind::FP8:
         return builder.getI8Type();
     case amdgpu_mfma::VectorElemKind::F16:
@@ -542,6 +547,76 @@ class AMDGPUMfmaLowering : public mlir::OpRewritePattern<AMDGPUMfmaOp> {
     }
 };
 
+mlir::Value DispatchMfmaByScaleSelector(
+    mlir::PatternRewriter &rewriter, mlir::Location location,
+    mlir::Value selector, mlir::Type resultType,
+    llvm::function_ref<mlir::Value(int64_t)> emit) {
+    llvm::APInt constant;
+    if (mlir::matchPattern(selector, mlir::m_ConstantInt(&constant))) {
+        return emit(constant.getZExtValue());
+    }
+    auto index = selector;
+    if (!index.getType().isIndex()) {
+        index = mlir::arith::IndexCastUIOp::create(
+            rewriter, location, rewriter.getIndexType(), index);
+    }
+    auto dispatch = mlir::scf::IndexSwitchOp::create(
+        rewriter, location, mlir::TypeRange{resultType}, index,
+        rewriter.getDenseI64ArrayAttr({0, 1, 2}), 3);
+
+    mlir::OpBuilder::InsertionGuard guard(rewriter);
+    for (int64_t value = 0; value < 4; ++value) {
+        auto &region = value == 3 ? dispatch.getDefaultRegion()
+                                  : dispatch.getCaseRegions()[value];
+        rewriter.createBlock(&region);
+        mlir::scf::YieldOp::create(rewriter, location, emit(value));
+    }
+    return dispatch.getResult(0);
+}
+
+class AMDGPUMfmaScaleLowering
+    : public mlir::OpRewritePattern<AMDGPUMfmaScaleOp> {
+  public:
+    using mlir::OpRewritePattern<AMDGPUMfmaScaleOp>::OpRewritePattern;
+
+    mlir::LogicalResult
+    matchAndRewrite(AMDGPUMfmaScaleOp op,
+                    mlir::PatternRewriter &rewriter) const override {
+        auto *config = amdgpu_mfma::MFMAConfig::Find(
+            op.getM(), op.getN(), op.getK(), op.getTypeA(), op.getTypeC(), true);
+        if (!config) {
+            return mlir::failure();
+        }
+        auto scaleFormat = config->GetScaleFormat();
+        if (!scaleFormat) {
+            return mlir::failure();
+        }
+        auto format = rewriter.getI32IntegerAttr(*scaleFormat);
+        auto resultType = op.getResult().getType();
+        auto result = DispatchMfmaByScaleSelector(
+            rewriter, op.getLoc(), op.getOpselA(), resultType, [&](int64_t selA) {
+                return DispatchMfmaByScaleSelector(
+                    rewriter, op.getLoc(), op.getOpselB(), resultType,
+                    [&](int64_t selB) -> mlir::Value {
+                        // Native ROCDL ops keep immediate selectors as attributes.
+                        mlir::OperationState state(op.getLoc(), config->intrinsic);
+                        state.addOperands({op.getA(), op.getB(), op.getC(),
+                                           op.getScaleA(), op.getScaleB()});
+                        state.addTypes(resultType);
+                        state.addAttribute("cbsz", format);
+                        state.addAttribute("blgp", format);
+                        state.addAttribute("opselA",
+                                           rewriter.getI32IntegerAttr(selA));
+                        state.addAttribute("opselB",
+                                           rewriter.getI32IntegerAttr(selB));
+                        return rewriter.create(state)->getResult(0);
+                    });
+            });
+        rewriter.replaceOp(op, result);
+        return mlir::success();
+    }
+};
+
 class AMDGPURawBufferLoadLowering
     : public mlir::OpRewritePattern<AMDGPURawBufferLoadOp> {
   public:
@@ -604,6 +679,7 @@ class LowerAveLangGPUToIntrinsicsPass
         mlir::RewritePatternSet patterns(&getContext());
         patterns.add<NVVMMmaLowering, NVVMLdMatrixLowering,
                      NVVMStMatrixLowering, AMDGPUMfmaLowering,
+                     AMDGPUMfmaScaleLowering,
                      AMDGPURawBufferLoadLowering, AMDGPURawBufferStoreLowering>(
             &getContext());
 
