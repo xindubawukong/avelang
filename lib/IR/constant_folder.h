@@ -23,9 +23,6 @@ class ConstantFolder {
     static std::optional<bool> FoldBoolValue(mlir::Value value);
 
   private:
-    static std::optional<int64_t> GetConstantIntValue(mlir::Value value);
-    std::optional<int64_t> ResolveConstantReference(ast::Expr *expr) const;
-
     GeneratorContext *ctx_;
 };
 

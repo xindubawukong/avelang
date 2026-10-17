@@ -1209,6 +1209,69 @@ def aliases(x: Word, y: T((2,), Word), out: T((2,), S.i32)):
     EXPECT_EQ(shifts, 2u);
 }
 
+TEST_F(MLIRGeneratorTest, IntegerShapeFoldingMatchesRuntimeTypes) {
+    const std::string source = R"(
+import avelang
+import avelang.language as S
+@avelang.jit
+def folded_shapes(
+    a: S.Tensor((2 + (S.convert(-4, S.i64) % S.convert(3, S.u32)),), S.i32),
+    b: S.Tensor((1 + ((S.convert(-1, S.u32) + 1) >> 31),), S.i32),
+    c: S.Tensor((1 + (S.convert(S.convert(-1, S.u32), S.i64) >> 32),), S.i32),
+    d: S.Tensor((1 + (S.convert(-1, S.u64) >> 63),), S.i32),
+    e: S.Tensor((1 + ((S.convert(255, S.u8) + S.convert(1, S.u8)) >> 7),), S.i32)
+):
+    a[0] = 0
+)";
+    ast::ASTNode *root = nullptr;
+    TryParse(source, &root);
+    auto context = ir::IRContext::Create();
+    ir::MLIRGenerator generator(context.get(), diagnostics_);
+    auto module = generator.Generate(root);
+    ASSERT_FALSE(diagnostics_->GetEngine()->hasErrorOccurred())
+        << diagHandler_.GetErrorMessages();
+    ASSERT_TRUE(module);
+    EXPECT_TRUE(mlir::succeeded(mlir::verify(module)));
+    bool found = false;
+    module.walk([&](mlir::func::FuncOp func) {
+        if (func.getName() != "folded_shapes")
+            return;
+        found = true;
+        std::vector<int64_t> expected{2, 1, 1, 2, 1};
+        ASSERT_EQ(func.getNumArguments(), expected.size());
+        for (unsigned i = 0; i < expected.size(); ++i) {
+            auto type =
+                mlir::cast<cf::MemRefType>(func.getArgument(i).getType());
+            EXPECT_EQ(type.getShape()[0], expected[i]);
+        }
+    });
+    EXPECT_TRUE(found);
+}
+
+TEST_F(MLIRGeneratorTest, RejectImplicitF16BF16Arithmetic) {
+    RunMLIRGenerationErrorTest(
+        R"(
+import avelang
+import avelang.language as S
+@avelang.jit
+def mixed_floats(a: S.f16, b: S.bf16, out: S.Tensor((2,), S.f32)):
+    out[0] = a + b
+)",
+        "Cannot perform arithmetic with incompatible types");
+}
+
+TEST_F(MLIRGeneratorTest, RejectImplicitBF16F16Arithmetic) {
+    RunMLIRGenerationErrorTest(
+        R"(
+import avelang
+import avelang.language as S
+@avelang.jit
+def mixed_floats(a: S.bf16, b: S.f16, out: S.Tensor((2,), S.f32)):
+    out[0] = a + b
+)",
+        "Cannot perform arithmetic with incompatible types");
+}
+
 TEST_F(MLIRGeneratorTest, GenerateMLIRUnsignedBitcastConstantFoldShape) {
     static const std::string kSourceCode = R"""""(
 import avelang

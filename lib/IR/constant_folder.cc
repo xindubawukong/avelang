@@ -155,438 +155,251 @@ static std::optional<int64_t> FoldScalarMemrefLoadImpl(LoadOpTy load) {
     return foldedValue;
 }
 
-struct IntegerTypeInfo {
-    unsigned bitWidth;
-    bool isUnsigned;
+// Keep widths until the public shape/index boundary. APInt gives the same
+// wrapping arithmetic as arith operations, without host signed-overflow UB.
+struct FoldedInteger {
+    llvm::APInt bits;
+    bool isUnsigned = false;
+
+    int64_t getInt() const {
+        return isUnsigned || bits.getBitWidth() == 1
+                   ? static_cast<int64_t>(bits.getZExtValue())
+                   : bits.getSExtValue();
+    }
+
+    llvm::APInt extend(unsigned width, bool zeroExtend = false) const {
+        return zeroExtend || isUnsigned || bits.getBitWidth() == 1
+                   ? bits.zextOrTrunc(width)
+                   : bits.sextOrTrunc(width);
+    }
 };
 
-static std::optional<IntegerTypeInfo>
-GetBuiltinIntegerTypeInfo(ast::Expr *expr, GeneratorContext *ctx) {
-    auto resolved = ctx->syms->ResolveTypeWithInfo(expr);
-    auto type = mlir::dyn_cast_or_null<mlir::IntegerType>(resolved.type);
-    if (!type || !resolved.info.is_unsigned_integer) {
+static bool IsNamedCall(const ast::Call *call, llvm::StringRef name) {
+    if (auto *func = llvm::dyn_cast<ast::Name>(call->GetFunc()))
+        return func->GetId() == name;
+    if (auto *func = llvm::dyn_cast<ast::AttributeExpr>(call->GetFunc()))
+        return func->GetAttr() == name;
+    return false;
+}
+
+static std::optional<FoldedInteger> EvaluateInteger(ast::Expr *expr,
+                                                    GeneratorContext *ctx) {
+    if (!expr)
+        return std::nullopt;
+    if (auto *constant = llvm::dyn_cast<ast::Constant>(expr)) {
+        if (constant->GetValue() == "True" || constant->GetValue() == "False")
+            return FoldedInteger{
+                llvm::APInt(1, constant->GetValue() == "True")};
+        if (auto value = ParseConstantInteger(constant->GetValue())) {
+            // Shape literals may be i64; runtime literals are checked
+            // separately.
+            unsigned width = llvm::isInt<32>(*value) ? 32 : 64;
+            return FoldedInteger{llvm::APInt(width, *value)};
+        }
         return std::nullopt;
     }
-    return IntegerTypeInfo{type.getWidth(), *resolved.info.is_unsigned_integer};
-}
-
-static bool IsBitcastCall(const ast::Call *call) {
-    if (!call) {
-        return false;
+    if (llvm::isa<ast::Name, ast::AttributeExpr>(expr) && ctx && ctx->syms) {
+        auto symbol = ctx->syms->ResolveSymbol(expr, std::nullopt,
+                                               /*report_not_found=*/false);
+        if (!symbol || !symbol->isa(SymbolTable::SymbolKind::kValue))
+            return std::nullopt;
+        auto value = symbol->value;
+        auto folded = ConstantFolder::FoldIntValue(value);
+        auto type = value.getType();
+        if (!folded) {
+            folded = FoldScalarMemrefValue(value);
+            if (auto memref = mlir::dyn_cast<dialect::MemRefType>(type))
+                type = memref.getElementType();
+            else if (auto memref = mlir::dyn_cast<mlir::MemRefType>(type))
+                type = memref.getElementType();
+        }
+        if (!folded || !type.isIntOrIndex())
+            return std::nullopt;
+        unsigned width = type.isIndex() ? 64 : type.getIntOrFloatBitWidth();
+        return FoldedInteger{
+            llvm::APInt(width, *folded),
+            GetTypeInfo(value).is_unsigned_integer.value_or(false)};
     }
-    auto *func = call->GetFunc();
-    if (auto *name = llvm::dyn_cast<ast::Name>(func)) {
-        return name->GetId() == "bitcast";
-    }
-    if (auto *attr = llvm::dyn_cast<ast::AttributeExpr>(func)) {
-        return attr->GetAttr() == "bitcast";
-    }
-    return false;
-}
-
-static bool IsConvertCall(const ast::Call *call) {
-    if (!call) {
-        return false;
-    }
-    auto *func = call->GetFunc();
-    if (auto *name = llvm::dyn_cast<ast::Name>(func)) {
-        return name->GetId() == "convert";
-    }
-    if (auto *attr = llvm::dyn_cast<ast::AttributeExpr>(func)) {
-        return attr->GetAttr() == "convert";
-    }
-    return false;
-}
-
-static bool IsUnsignedIntegerExpr(ast::Expr *expr, GeneratorContext *ctx) {
     if (auto *call = llvm::dyn_cast<ast::Call>(expr)) {
-        if (call->GetArgs().size() != 2) {
-            return false;
-        }
-        if (IsBitcastCall(call) || IsConvertCall(call)) {
-            auto typeInfo =
-                ctx->syms->ResolveTypeWithInfo(call->GetArgs()[1]).info;
-            return typeInfo.is_unsigned_integer.value_or(false);
-        }
-        return false;
+        bool bitcast = IsNamedCall(call, "bitcast");
+        if ((!bitcast && !IsNamedCall(call, "convert")) ||
+            call->GetArgs().size() != 2 || !ctx || !ctx->syms)
+            return std::nullopt;
+        auto value = EvaluateInteger(call->GetArgs()[0], ctx);
+        auto target = ctx->syms->ResolveTypeWithInfo(call->GetArgs()[1]);
+        auto type = mlir::dyn_cast_or_null<mlir::IntegerType>(target.type);
+        if (!value || !type || !target.info.is_unsigned_integer ||
+            (bitcast && value->bits.getBitWidth() != type.getWidth()))
+            return std::nullopt;
+        return FoldedInteger{value->extend(type.getWidth()),
+                             *target.info.is_unsigned_integer};
     }
-
-    if (auto *binop = llvm::dyn_cast<ast::BinOp>(expr)) {
-        const auto &op = binop->GetOp();
-        if (op == "BitAnd" || op == "BitOr" || op == "BitXor" ||
-            op == "LShift" || op == "RShift" || op == "Add" || op == "Sub" ||
-            op == "Mult" || op == "Div" || op == "Mod" || op == "FloorDiv") {
-            if (IsUnsignedIntegerExpr(binop->GetLeft(), ctx)) {
-                return true;
-            }
-            return IsUnsignedIntegerExpr(binop->GetRight(), ctx);
+    if (auto *unary = llvm::dyn_cast<ast::UnaryOp>(expr)) {
+        auto operand = EvaluateInteger(unary->GetOperand(), ctx);
+        if (!operand)
+            return std::nullopt;
+        if (unary->GetOp() == "UAdd")
+            return operand;
+        if (unary->GetOp() == "USub") {
+            operand->bits.negate();
+            // Match the runtime parser's special case for the i32 minimum.
+            if (auto *literal =
+                    llvm::dyn_cast<ast::Constant>(unary->GetOperand());
+                literal && ParseConstantInteger(literal->GetValue()) ==
+                               int64_t{2147483648})
+                operand->bits = operand->bits.trunc(32);
+            return operand;
         }
+        if (unary->GetOp() == "Invert") {
+            operand->bits.flipAllBits();
+            return operand;
+        }
+        return std::nullopt;
     }
-
-    return false;
+    auto *binop = llvm::dyn_cast<ast::BinOp>(expr);
+    if (!binop)
+        return std::nullopt;
+    auto lhs = EvaluateInteger(binop->GetLeft(), ctx);
+    auto rhs = EvaluateInteger(binop->GetRight(), ctx);
+    if (!lhs || !rhs)
+        return std::nullopt;
+    const auto &op = binop->GetOp();
+    bool shift = op == "LShift" || op == "RShift";
+    bool bitwise = shift || op == "BitAnd" || op == "BitOr" || op == "BitXor";
+    unsigned width = std::max(lhs->bits.getBitWidth(), rhs->bits.getBitWidth());
+    bool isUnsigned =
+        shift ? lhs->isUnsigned : lhs->isUnsigned || rhs->isUnsigned;
+    auto a = lhs->extend(width, bitwise);
+    auto b = rhs->extend(width, bitwise);
+    auto result = [&](llvm::APInt bits) -> std::optional<FoldedInteger> {
+        return FoldedInteger{std::move(bits), isUnsigned};
+    };
+    if (op == "Add")
+        return result(a + b);
+    if (op == "Sub")
+        return result(a - b);
+    if (op == "Mult")
+        return result(a * b);
+    if (op == "BitAnd")
+        return result(a & b);
+    if (op == "BitOr")
+        return result(a | b);
+    if (op == "BitXor")
+        return result(a ^ b);
+    if (shift) {
+        // Oversized (including negative) shifts produce poison at runtime.
+        if (b.uge(width))
+            return std::nullopt;
+        if (op == "LShift")
+            return result(a.shl(b));
+        return result(isUnsigned ? a.lshr(b) : a.ashr(b));
+    }
+    if (op != "Div" && op != "FloorDiv" && op != "Mod")
+        return std::nullopt;
+    if (b.isZero() || (!isUnsigned && a.isMinSignedValue() && b.isAllOnes()))
+        return std::nullopt;
+    if (isUnsigned)
+        return result(op == "Mod" ? a.urem(b) : a.udiv(b));
+    if (op == "Mod")
+        return result(a.srem(b));
+    if (op == "FloorDiv" && !a.srem(b).isZero()) {
+        // Mirror the runtime floor-division expansion, including its widths.
+        auto adjustment = a.srem(b) + b;
+        if (adjustment.isMinSignedValue() && b.isAllOnes())
+            return std::nullopt;
+        a -= adjustment.srem(b);
+        if (a.isMinSignedValue() && b.isAllOnes())
+            return std::nullopt;
+    }
+    return result(a.sdiv(b));
 }
 
-static int64_t NormalizeBitcastIntegerValue(int64_t value,
-                                            const IntegerTypeInfo &typeInfo) {
-    uint64_t bits = static_cast<uint64_t>(value);
-    if (typeInfo.bitWidth < 64) {
-        uint64_t mask = (uint64_t{1} << typeInfo.bitWidth) - 1;
-        bits &= mask;
+// Delegate arithmetic to MLIR's own folders so widths, casts, unsigned
+// predicates and poison cases stay in sync with the emitted instructions.
+static std::optional<llvm::APInt> FoldIntegerBits(mlir::Value value) {
+    if (!value || !value.getType().isIntOrIndex())
+        return std::nullopt;
+    auto *op = value.getDefiningOp();
+    if (!op)
+        return std::nullopt;
+    if (auto constant = mlir::dyn_cast<mlir::arith::ConstantOp>(op)) {
+        if (auto attr = mlir::dyn_cast<mlir::IntegerAttr>(constant.getValue()))
+            return attr.getValue();
     }
-
-    if (typeInfo.isUnsigned || typeInfo.bitWidth == 64) {
-        return static_cast<int64_t>(bits);
+    if (auto cast = mlir::dyn_cast<mlir::UnrealizedConversionCastOp>(op)) {
+        if (cast.getNumOperands() == 1 && cast.getNumResults() == 1 &&
+            cast.getOperand(0).getType() == value.getType())
+            return FoldIntegerBits(cast.getOperand(0));
+        return std::nullopt;
     }
-
-    uint64_t signBit = uint64_t{1} << (typeInfo.bitWidth - 1);
-    if (bits & signBit) {
-        uint64_t extendMask = ~((uint64_t{1} << typeInfo.bitWidth) - 1);
-        bits |= extendMask;
+    std::optional<int64_t> loaded;
+    if (auto load = mlir::dyn_cast<dialect::AveLangMemRefLoadOp>(op))
+        loaded = FoldScalarMemrefLoadImpl(load);
+    else if (auto load = mlir::dyn_cast<mlir::memref::LoadOp>(op))
+        loaded = FoldScalarMemrefLoadImpl(load);
+    if (loaded) {
+        unsigned width = value.getType().isIndex()
+                             ? 64
+                             : value.getType().getIntOrFloatBitWidth();
+        return llvm::APInt(width, *loaded);
     }
-    return static_cast<int64_t>(bits);
+    if (auto select = mlir::dyn_cast<mlir::arith::SelectOp>(op)) {
+        if (auto cond = ConstantFolder::FoldBoolValue(select.getCondition()))
+            return FoldIntegerBits(*cond ? select.getTrueValue()
+                                         : select.getFalseValue());
+        return std::nullopt;
+    }
+    if (op->getName().getDialectNamespace() != "arith" ||
+        op->getNumResults() != 1)
+        return std::nullopt;
+    llvm::SmallVector<mlir::Attribute> operands;
+    for (auto operand : op->getOperands()) {
+        auto bits = FoldIntegerBits(operand);
+        if (!bits)
+            return std::nullopt;
+        operands.push_back(mlir::IntegerAttr::get(operand.getType(), *bits));
+    }
+    // Folders may also perform in-place canonicalizations. Fold a temporary
+    // operation with abstract operands so this query never mutates source IR.
+    mlir::Block scratch;
+    for (auto operand : op->getOperands())
+        scratch.addArgument(operand.getType(), op->getLoc());
+    auto *copy = op->clone();
+    scratch.push_back(copy);
+    copy->setOperands(scratch.getArguments());
+    llvm::SmallVector<mlir::OpFoldResult> results;
+    if (mlir::failed(copy->fold(operands, results)) || results.size() != 1)
+        return std::nullopt;
+    if (auto attr = mlir::dyn_cast_if_present<mlir::IntegerAttr>(
+            results[0].dyn_cast<mlir::Attribute>()))
+        return attr.getValue();
+    if (auto folded = mlir::dyn_cast_if_present<mlir::BlockArgument>(
+            results[0].dyn_cast<mlir::Value>());
+        folded && folded.getOwner() == &scratch)
+        return mlir::cast<mlir::IntegerAttr>(operands[folded.getArgNumber()])
+            .getValue();
+    return std::nullopt;
 }
 
 } // namespace
 
-std::optional<int64_t> ConstantFolder::GetConstantIntValue(mlir::Value value) {
-    if (!value) {
-        return std::nullopt;
-    }
-
-    if (auto const_op = value.getDefiningOp<mlir::arith::ConstantOp>()) {
-        if (auto int_attr =
-                mlir::dyn_cast<mlir::IntegerAttr>(const_op.getValue())) {
-            return int_attr.getInt();
-        }
-    }
-
-    return std::nullopt;
-}
-
 std::optional<bool> ConstantFolder::FoldBoolValue(mlir::Value value) {
-    if (!value) {
-        return std::nullopt;
-    }
-
-    if (auto constant = GetConstantIntValue(value)) {
-        return *constant != 0;
-    }
-
-    if (auto cmp = value.getDefiningOp<mlir::arith::CmpIOp>()) {
-        auto lhs = FoldIntValue(cmp.getLhs());
-        auto rhs = FoldIntValue(cmp.getRhs());
-        if (!lhs || !rhs) {
-            return std::nullopt;
-        }
-        switch (cmp.getPredicate()) {
-        case mlir::arith::CmpIPredicate::eq:
-            return *lhs == *rhs;
-        case mlir::arith::CmpIPredicate::ne:
-            return *lhs != *rhs;
-        case mlir::arith::CmpIPredicate::slt:
-            return *lhs < *rhs;
-        case mlir::arith::CmpIPredicate::sle:
-            return *lhs <= *rhs;
-        case mlir::arith::CmpIPredicate::sgt:
-            return *lhs > *rhs;
-        case mlir::arith::CmpIPredicate::sge:
-            return *lhs >= *rhs;
-        case mlir::arith::CmpIPredicate::ult:
-            return static_cast<uint64_t>(*lhs) < static_cast<uint64_t>(*rhs);
-        case mlir::arith::CmpIPredicate::ule:
-            return static_cast<uint64_t>(*lhs) <= static_cast<uint64_t>(*rhs);
-        case mlir::arith::CmpIPredicate::ugt:
-            return static_cast<uint64_t>(*lhs) > static_cast<uint64_t>(*rhs);
-        case mlir::arith::CmpIPredicate::uge:
-            return static_cast<uint64_t>(*lhs) >= static_cast<uint64_t>(*rhs);
-        }
-    }
-
+    if (auto bits = FoldIntegerBits(value))
+        return !bits->isZero();
     return std::nullopt;
 }
 
 std::optional<int64_t> ConstantFolder::FoldIntValue(mlir::Value value) {
-    if (!value) {
-        return std::nullopt;
-    }
-
-    if (auto constant = GetConstantIntValue(value)) {
-        return constant;
-    }
-
-    if (auto cast_op = value.getDefiningOp<mlir::arith::IndexCastOp>()) {
-        return FoldIntValue(cast_op.getIn());
-    }
-
-    if (auto load = value.getDefiningOp<
-                    causalflow::avelang::dialect::AveLangMemRefLoadOp>()) {
-        if (auto folded = FoldScalarMemrefLoadImpl(load)) {
-            return folded;
-        }
-    }
-
-    if (auto load = value.getDefiningOp<mlir::memref::LoadOp>()) {
-        if (auto folded = FoldScalarMemrefLoadImpl(load)) {
-            return folded;
-        }
-    }
-
-    if (auto add = value.getDefiningOp<mlir::arith::AddIOp>()) {
-        auto lhs = FoldIntValue(add.getLhs());
-        auto rhs = FoldIntValue(add.getRhs());
-        if (lhs && rhs) {
-            return *lhs + *rhs;
-        }
-        return std::nullopt;
-    }
-
-    if (auto sub = value.getDefiningOp<mlir::arith::SubIOp>()) {
-        auto lhs = FoldIntValue(sub.getLhs());
-        auto rhs = FoldIntValue(sub.getRhs());
-        if (lhs && rhs) {
-            return *lhs - *rhs;
-        }
-        return std::nullopt;
-    }
-
-    if (auto mul = value.getDefiningOp<mlir::arith::MulIOp>()) {
-        auto lhs = FoldIntValue(mul.getLhs());
-        auto rhs = FoldIntValue(mul.getRhs());
-        if (lhs && rhs) {
-            return *lhs * *rhs;
-        }
-        return std::nullopt;
-    }
-
-    if (auto div = value.getDefiningOp<mlir::arith::DivSIOp>()) {
-        auto lhs = FoldIntValue(div.getLhs());
-        auto rhs = FoldIntValue(div.getRhs());
-        if (lhs && rhs && *rhs != 0) {
-            return *lhs / *rhs;
-        }
-        return std::nullopt;
-    }
-
-    if (auto div = value.getDefiningOp<mlir::arith::DivUIOp>()) {
-        auto lhs = FoldIntValue(div.getLhs());
-        auto rhs = FoldIntValue(div.getRhs());
-        if (lhs && rhs && *rhs != 0) {
-            return static_cast<uint64_t>(*lhs) / static_cast<uint64_t>(*rhs);
-        }
-        return std::nullopt;
-    }
-
-    if (auto rem = value.getDefiningOp<mlir::arith::RemSIOp>()) {
-        auto lhs = FoldIntValue(rem.getLhs());
-        auto rhs = FoldIntValue(rem.getRhs());
-        if (lhs && rhs && *rhs != 0) {
-            return *lhs % *rhs;
-        }
-        return std::nullopt;
-    }
-
-    if (auto rem = value.getDefiningOp<mlir::arith::RemUIOp>()) {
-        auto lhs = FoldIntValue(rem.getLhs());
-        auto rhs = FoldIntValue(rem.getRhs());
-        if (lhs && rhs && *rhs != 0) {
-            return static_cast<uint64_t>(*lhs) % static_cast<uint64_t>(*rhs);
-        }
-        return std::nullopt;
-    }
-
-    if (auto shl = value.getDefiningOp<mlir::arith::ShLIOp>()) {
-        auto lhs = FoldIntValue(shl.getLhs());
-        auto rhs = FoldIntValue(shl.getRhs());
-        if (lhs && rhs) {
-            return *lhs << *rhs;
-        }
-        return std::nullopt;
-    }
-
-    if (auto shr = value.getDefiningOp<mlir::arith::ShRSIOp>()) {
-        auto lhs = FoldIntValue(shr.getLhs());
-        auto rhs = FoldIntValue(shr.getRhs());
-        if (lhs && rhs) {
-            return *lhs >> *rhs;
-        }
-        return std::nullopt;
-    }
-
-    if (auto shr = value.getDefiningOp<mlir::arith::ShRUIOp>()) {
-        auto lhs = FoldIntValue(shr.getLhs());
-        auto rhs = FoldIntValue(shr.getRhs());
-        if (lhs && rhs) {
-            return static_cast<uint64_t>(*lhs) >> static_cast<uint64_t>(*rhs);
-        }
-        return std::nullopt;
-    }
-
-    if (auto select = value.getDefiningOp<mlir::arith::SelectOp>()) {
-        auto cond = FoldBoolValue(select.getCondition());
-        if (!cond) {
-            return std::nullopt;
-        }
-        return *cond ? FoldIntValue(select.getTrueValue())
-                     : FoldIntValue(select.getFalseValue());
-    }
-
-    return std::nullopt;
-}
-
-std::optional<int64_t>
-ConstantFolder::ResolveConstantReference(ast::Expr *expr) const {
-    if (!ctx_ || !ctx_->syms || !expr) {
-        return std::nullopt;
-    }
-
-    if (auto *name = llvm::dyn_cast<ast::Name>(expr)) {
-        auto symbol = ctx_->syms->LookupSymbol(name->GetId());
-        if (!symbol || !symbol->isa(SymbolTable::SymbolKind::kValue)) {
-            return std::nullopt;
-        }
-        if (auto value = FoldIntValue(symbol->value)) {
-            return value;
-        }
-        return FoldScalarMemrefValue(symbol->value);
-    }
-
-    if (auto *attr = llvm::dyn_cast<ast::AttributeExpr>(expr)) {
-        auto symbol = ctx_->syms->ResolveSymbol(attr, std::nullopt,
-                                                /*report_not_found=*/false);
-        if (!symbol || !symbol->isa(SymbolTable::SymbolKind::kValue)) {
-            return std::nullopt;
-        }
-        if (auto value = FoldIntValue(symbol->value)) {
-            return value;
-        }
-        return FoldScalarMemrefValue(symbol->value);
-    }
-
+    if (auto bits = FoldIntegerBits(value))
+        return FoldedInteger{
+            *bits, GetTypeInfo(value).is_unsigned_integer.value_or(false)}
+            .getInt();
     return std::nullopt;
 }
 
 std::optional<int64_t> ConstantFolder::Evaluate(ast::Expr *expr) const {
-    if (!expr) {
-        return std::nullopt;
-    }
-
-    if (auto *constant = llvm::dyn_cast<ast::Constant>(expr)) {
-        return ParseConstantInteger(constant->GetValue());
-    }
-
-    if (auto value = ResolveConstantReference(expr)) {
-        return value;
-    }
-
-    if (auto *call = llvm::dyn_cast<ast::Call>(expr)) {
-        if ((IsBitcastCall(call) || IsConvertCall(call)) &&
-            call->GetArgs().size() == 2) {
-            auto value = Evaluate(call->GetArgs()[0]);
-            auto typeInfo = GetBuiltinIntegerTypeInfo(call->GetArgs()[1], ctx_);
-            if (!value || !typeInfo) {
-                return std::nullopt;
-            }
-            return NormalizeBitcastIntegerValue(*value, *typeInfo);
-        }
-        return std::nullopt;
-    }
-
-    if (auto *unary = llvm::dyn_cast<ast::UnaryOp>(expr)) {
-        auto operand = Evaluate(unary->GetOperand());
-        if (!operand) {
-            return std::nullopt;
-        }
-        const auto &op = unary->GetOp();
-        if (op == "UAdd") {
-            return *operand;
-        }
-        if (op == "USub") {
-            return -*operand;
-        }
-        return std::nullopt;
-    }
-
-    if (auto *binop = llvm::dyn_cast<ast::BinOp>(expr)) {
-        auto lhs = Evaluate(binop->GetLeft());
-        auto rhs = Evaluate(binop->GetRight());
-        if (!lhs || !rhs) {
-            return std::nullopt;
-        }
-
-        const auto &op = binop->GetOp();
-        if (op == "Add") {
-            return *lhs + *rhs;
-        }
-        if (op == "Sub") {
-            return *lhs - *rhs;
-        }
-        if (op == "Mult") {
-            return *lhs * *rhs;
-        }
-        if (op == "FloorDiv") {
-            if (*rhs == 0) {
-                return std::nullopt;
-            }
-            if (IsUnsignedIntegerExpr(binop->GetLeft(), ctx_)) {
-                return static_cast<uint64_t>(*lhs) /
-                       static_cast<uint64_t>(*rhs);
-            }
-            int64_t quotient = *lhs / *rhs;
-            int64_t remainder = *lhs % *rhs;
-            if (remainder != 0 && ((remainder > 0) != (*rhs > 0))) {
-                --quotient;
-            }
-            return quotient;
-        }
-        if (op == "Div") {
-            if (*rhs == 0) {
-                return std::nullopt;
-            }
-            if (IsUnsignedIntegerExpr(binop->GetLeft(), ctx_)) {
-                if ((static_cast<uint64_t>(*lhs) %
-                     static_cast<uint64_t>(*rhs)) != 0) {
-                    return std::nullopt;
-                }
-                return static_cast<uint64_t>(*lhs) /
-                       static_cast<uint64_t>(*rhs);
-            }
-            if ((*lhs % *rhs) != 0) {
-                return std::nullopt;
-            }
-            return *lhs / *rhs;
-        }
-        if (op == "Mod") {
-            if (*rhs == 0) {
-                return std::nullopt;
-            }
-            if (IsUnsignedIntegerExpr(binop->GetLeft(), ctx_)) {
-                return static_cast<uint64_t>(*lhs) %
-                       static_cast<uint64_t>(*rhs);
-            }
-            return *lhs % *rhs;
-        }
-        if (op == "LShift") {
-            return *lhs << *rhs;
-        }
-        if (op == "RShift") {
-            if (IsUnsignedIntegerExpr(binop->GetLeft(), ctx_)) {
-                return static_cast<int64_t>(static_cast<uint64_t>(*lhs) >>
-                                            static_cast<uint64_t>(*rhs));
-            }
-            return *lhs >> *rhs;
-        }
-        if (op == "BitAnd") {
-            return *lhs & *rhs;
-        }
-        if (op == "BitOr") {
-            return *lhs | *rhs;
-        }
-        if (op == "BitXor") {
-            return *lhs ^ *rhs;
-        }
-        return std::nullopt;
-    }
-
+    if (auto value = EvaluateInteger(expr, ctx_))
+        return value->getInt();
     return std::nullopt;
 }
 

@@ -21,6 +21,19 @@ in annotations and explicit dtype arguments.
 
 Value conversion is described in [Builtin Functions](../builtin-functions/).
 
+Integer arithmetic and comparisons use the wider operand width. The common
+type is unsigned if either operand is unsigned, including when a signed
+operand is wider. For example, both `i64 + u32` and `u32 + i64` produce `u64`.
+Widening extends each operand according to its original signedness; the
+result uses the common type. Boolean values widen as `0` or `1`.
+
+`al.convert(value, dtype)` uses the source signedness to extend the value and
+the target signedness to interpret the result. Thus `al.convert(-1, al.u64)`
+is `2**64 - 1`, and shifting it right by one produces `2**63 - 1`.
+Bitwise operations retain zero extension when widening; a shift's signedness
+comes from its left operand. Compile-time integer folding follows the same
+width, wrapping, and signedness rules as runtime operations.
+
 ## Tensor Types
 
 `al.Tensor(shape, type)` denotes the type of a tensor. A tensor is a multidimensional view over a memory region. The shape describes the logical dimensions of the tensor, and the type describes the value type of each element. For example, `al.Tensor((16, 16), al.f32)` denotes a two-dimensional tensor with 16 rows and 16 columns of 32-bit floating point values.

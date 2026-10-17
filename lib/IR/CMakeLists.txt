@@ -108,6 +108,6 @@ target_link_libraries(ave-lang-mlir
   MLIRControlFlowTransforms
 )
 
-add_executable(mlir_generator_test mlir_generator_test.cc)
+add_executable(mlir_generator_test mlir_generator_test.cc integer_signedness_test.cc)
 target_link_libraries(mlir_generator_test ave-lang-frontend ave-lang-mlir ave-lang-dialect-transforms GTest::gtest_main)
 add_test(mlir_generator_test mlir_generator_test)

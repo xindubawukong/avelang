@@ -26,9 +26,8 @@ namespace causalflow::avelang::ir {
 /// float->int).
 ///                       If false, only performs safe promotions to prevent
 ///                       data loss.
-/// @return The converted value, or the original value if conversion would cause
-/// demotion
-///         when allow_demotion=false, or nullptr if conversion is not supported
+/// @return A value with the target type, or nullptr for a disallowed or
+/// unsupported conversion.
 mlir::Value
 CreateTypeConversion(mlir::Value value, mlir::Type source_type,
                      mlir::Type target_type, mlir::Location location,
@@ -38,7 +37,8 @@ CreateTypeConversion(mlir::Value value, mlir::Type source_type,
 
 /// Converts two values to compatible types for arithmetic operations.
 /// This function promotes both operands to a common type following these rules:
-/// - Integer types are promoted to the wider integer type
+/// - Integer types use the wider width and are unsigned if either operand is
+/// unsigned
 /// - Float types are promoted to the wider float type
 /// - Integer operands are promoted to float when mixed with float operands
 /// - Index types are converted to integer types
