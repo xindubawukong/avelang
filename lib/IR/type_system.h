@@ -1,7 +1,5 @@
 #pragma once
 
-#include "AST/ast_nodes_expr.h"
-
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wambiguous-reversed-operator"
 #include <mlir/IR/Value.h>
@@ -15,11 +13,17 @@ struct TypeInfo {
     std::optional<bool> is_unsigned_integer;
 };
 
+// Keep the MLIR representation and its integer interpretation together when
+// resolving a declared type. Expression generation still uses mlir::Value.
+struct ResolvedType {
+    mlir::Type type;
+    TypeInfo info;
+};
+
 bool IsIntegerValueOrVectorOfIntegers(mlir::Type type);
 bool IsMemRefWithIntegerElements(mlir::Type type);
 
 TypeInfo GetTypeInfo(mlir::Value value);
-TypeInfo GetTypeInfo(ast::Expr *expr);
 void SetTypeInfo(mlir::Value value, const TypeInfo &typeInfo);
 
 } // namespace causalflow::avelang::ir

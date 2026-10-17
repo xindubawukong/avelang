@@ -49,7 +49,7 @@ class NamedModule {
 
     // Helper methods for adding symbols
     void AddSymbol(const std::string &name, mlir::Value value);
-    void AddType(const std::string &name, mlir::Type type);
+    void AddType(const std::string &name, mlir::Type type, TypeInfo info = {});
     void AddModule(const std::string &name, NamedModule *module);
     void AddTypeFactory(const std::string &name, TypeFactoryFunction factory);
     void AddFunction(const std::string &name,

@@ -190,7 +190,8 @@ void FunctionGenerator::Generate(ast::FunctionDef *func) {
                     << "type annotation is required for argument: " << name;
                 return;
             }
-            auto type = ctx_->syms->ResolveType(annotation);
+            auto resolved_type = ctx_->syms->ResolveTypeWithInfo(annotation);
+            auto type = resolved_type.type;
             if (!type) {
                 ctx_->diagnostic_manager->Report(
                     basic::DiagnosticCode::kUnimplemented,
@@ -217,7 +218,7 @@ void FunctionGenerator::Generate(ast::FunctionDef *func) {
                 mlir::DictionaryAttr::get(builder_.getContext(), attrs));
             argNames.push_back(name);
             argTypes.push_back(type);
-            argTypeInfos.push_back(GetTypeInfo(annotation));
+            argTypeInfos.push_back(resolved_type.info);
             argLocs.push_back(mlir_loc);
         }
     }

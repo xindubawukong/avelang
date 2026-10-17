@@ -83,14 +83,6 @@ static mlir::Value createStaticIntTuple(llvm::ArrayRef<int64_t> values,
         .getResult();
 }
 
-// Helper to resolve and validate element type for tensor operations
-static mlir::Type resolveAndValidateTensorElementType(
-    ast::Expr *dtype_expr, GeneratorContext *ctx,
-    clang::SourceLocation location, const std::string &context_name) {
-    mlir::Type elementType = ctx->syms->ResolveBuiltinType(dtype_expr);
-    return elementType;
-}
-
 // Helper to create ave memref type with optional memory space.
 static cf::MemRefType
 createTensorMemRefType(llvm::ArrayRef<int64_t> shape, mlir::Type elementType,
@@ -506,17 +498,17 @@ void AveLangModule::Initialize() {
     OpBuilder builder(ir_context_->GetMLIRContext());
 
     // Scalar types
-    AddType("i8", builder.getI8Type());
-    AddType("i16", builder.getI16Type());
-    AddType("i32", builder.getI32Type());
-    AddType("i64", builder.getI64Type());
+    AddType("i8", builder.getI8Type(), TypeInfo{false});
+    AddType("i16", builder.getI16Type(), TypeInfo{false});
+    AddType("i32", builder.getI32Type(), TypeInfo{false});
+    AddType("i64", builder.getI64Type(), TypeInfo{false});
 
     // MLIR uses integer types for both signed and unsigned integers. Therefore
     // we tag the type at the definition of values
-    AddType("u8", builder.getI8Type());
-    AddType("u16", builder.getI16Type());
-    AddType("u32", builder.getI32Type());
-    AddType("u64", builder.getI64Type());
+    AddType("u8", builder.getI8Type(), TypeInfo{true});
+    AddType("u16", builder.getI16Type(), TypeInfo{true});
+    AddType("u32", builder.getI32Type(), TypeInfo{true});
+    AddType("u64", builder.getI64Type(), TypeInfo{true});
 
     AddType("f16", builder.getF16Type());
     AddType("f32", builder.getF32Type());
@@ -526,7 +518,7 @@ void AveLangModule::Initialize() {
     AddType("f8e4m3fnuz", Float8E4M3FNUZType::get(builder.getContext()));
 
     // FIXME: Constexpr type (placeholder, currently i32)
-    AddType("constexpr", builder.getI32Type());
+    AddType("constexpr", builder.getI32Type(), TypeInfo{false});
 
     AddSymbol("jit", [&builder]() -> mlir::Value {
         // special marker for @avelang.jit
@@ -541,31 +533,25 @@ void AveLangModule::Initialize() {
     }());
 
     // Add Tensor type factory function
-    AddTypeFactory(
-        "Tensor",
-        [](NamedModule *module, ast::Call *call_expr,
-           GeneratorContext *gen_ctx) -> mlir::Type {
-            auto *avelang_module = static_cast<AveLangModule *>(module);
-            return avelang_module->CreateTensorType(call_expr, gen_ctx);
-        });
+    AddTypeFactory("Tensor",
+                   [this](ast::Call *call_expr,
+                          GeneratorContext *gen_ctx) -> ResolvedType {
+                       return CreateTensorType(call_expr, gen_ctx);
+                   });
 
     // Add Pointer type factory function
-    AddTypeFactory(
-        "Pointer",
-        [](NamedModule *module, ast::Call *call_expr,
-           GeneratorContext *gen_ctx) -> mlir::Type {
-            auto *avelang_module = static_cast<AveLangModule *>(module);
-            return avelang_module->CreatePointerType(call_expr, gen_ctx);
-        });
+    AddTypeFactory("Pointer",
+                   [this](ast::Call *call_expr,
+                          GeneratorContext *gen_ctx) -> ResolvedType {
+                       return CreatePointerType(call_expr, gen_ctx);
+                   });
 
     // Add Layout type factory function
-    AddTypeFactory(
-        "Layout",
-        [](NamedModule *module, ast::Call *call_expr,
-           GeneratorContext *gen_ctx) -> mlir::Type {
-            auto *avelang_module = static_cast<AveLangModule *>(module);
-            return avelang_module->CreateLayoutType(call_expr, gen_ctx);
-        });
+    AddTypeFactory("Layout",
+                   [this](ast::Call *call_expr,
+                          GeneratorContext *gen_ctx) -> ResolvedType {
+                       return CreateLayoutType(call_expr, gen_ctx);
+                   });
 
     // Add function wrappers for convert and bitcast
     AddFunction(
@@ -820,24 +806,24 @@ void AveLangModule::DeclareModules(mlir::ModuleOp module) {
     }
 }
 
-mlir::Type AveLangModule::CreateTensorType(ast::Call *call_expr,
-                                           GeneratorContext *ctx) const {
+ResolvedType AveLangModule::CreateTensorType(ast::Call *call_expr,
+                                             GeneratorContext *ctx) const {
     if (!call_expr)
-        return mlir::Type();
+        return {};
 
     // Expect avelang.Tensor((M,N), dtype) format
     const auto &args = call_expr->GetArgs();
     if (args.size() != 2) {
-        return mlir::Type(); // Invalid number of arguments
+        return {}; // Invalid number of arguments
     }
 
     auto *shape_expr = args[0];
     auto *dtype_expr = args[1];
 
-    mlir::Type element_type = resolveAndValidateTensorElementType(
-        dtype_expr, ctx, call_expr->GetSourceRange().getBegin(), "Tensor");
+    auto element = ctx->syms->ResolveBuiltinType(dtype_expr);
+    auto element_type = element.type;
     if (!element_type) {
-        return mlir::Type();
+        return {};
     }
 
     // Parse shape from first argument
@@ -852,44 +838,45 @@ mlir::Type AveLangModule::CreateTensorType(ast::Call *call_expr,
             }
         }
     } else {
-        return mlir::Type(); // Shape must be a tuple
+        return {}; // Shape must be a tuple
     }
 
     // Create memref type with the parsed shape and element type.
     auto strides = computeRowMajorStrides(shape);
-    return createTensorMemRefType(shape, element_type, {}, strides);
+    return {createTensorMemRefType(shape, element_type, {}, strides),
+            element.info};
 }
 
-mlir::Type AveLangModule::CreatePointerType(ast::Call *call_expr,
-                                            GeneratorContext *ctx) const {
+ResolvedType AveLangModule::CreatePointerType(ast::Call *call_expr,
+                                              GeneratorContext *ctx) const {
     if (!call_expr)
-        return mlir::Type();
+        return {};
 
     const auto &args = call_expr->GetArgs();
     if (args.size() != 1) {
-        return mlir::Type();
+        return {};
     }
 
     auto *dtype_expr = args[0];
-    mlir::Type element_type = resolveAndValidateTensorElementType(
-        dtype_expr, ctx, call_expr->GetSourceRange().getBegin(), "Pointer");
+    auto element = ctx->syms->ResolveBuiltinType(dtype_expr);
+    auto element_type = element.type;
     if (!element_type) {
-        return mlir::Type();
+        return {};
     }
 
     auto *mlirContext = element_type.getContext();
-    return mlir::ptr::PtrType::get(mlirContext, nullptr);
+    return {mlir::ptr::PtrType::get(mlirContext, nullptr), element.info};
 }
 
-mlir::Type AveLangModule::CreateLayoutType(ast::Call *call_expr,
-                                           GeneratorContext *ctx) const {
+ResolvedType AveLangModule::CreateLayoutType(ast::Call *call_expr,
+                                             GeneratorContext *ctx) const {
     if (!call_expr)
-        return mlir::Type();
+        return {};
 
     // Expect avelang.Layout((Dims), (Stride)) format
     const auto &args = call_expr->GetArgs();
     if (args.size() != 2) {
-        return mlir::Type(); // Invalid number of arguments
+        return {}; // Invalid number of arguments
     }
 
     auto *dims_expr = args[0];
@@ -898,7 +885,7 @@ mlir::Type AveLangModule::CreateLayoutType(ast::Call *call_expr,
     // Validate that both arguments are tuples
     if (!llvm::isa<ast::Tuple>(dims_expr) ||
         !llvm::isa<ast::Tuple>(stride_expr)) {
-        return mlir::Type(); // Both must be tuples
+        return {}; // Both must be tuples
     }
 
     auto *dims_tuple = llvm::dyn_cast<ast::Tuple>(dims_expr);
@@ -906,17 +893,17 @@ mlir::Type AveLangModule::CreateLayoutType(ast::Call *call_expr,
 
     // Validate that both tuples have the same number of elements
     if (dims_tuple->GetElts().size() != stride_tuple->GetElts().size()) {
-        return mlir::Type(); // Must have same dimensions
+        return {}; // Must have same dimensions
     }
 
     if (dims_tuple->GetElts().empty()) {
-        return mlir::Type(); // Cannot be empty
+        return {}; // Cannot be empty
     }
 
     // For Layout type, we return an opaque type that represents the layout
     // We use a custom MLIR type (OpaqueType) to store layout information
     auto &builder = ctx->GetCurrentFunctionGenerator()->GetBuilder();
-    return mlir::OpaqueType::get(builder.getStringAttr("ave"), "layout");
+    return {mlir::OpaqueType::get(builder.getStringAttr("ave"), "layout"), {}};
 }
 
 mlir::Value AveLangModule::CreateConvertFunction(
@@ -943,7 +930,8 @@ mlir::Value AveLangModule::CreateConvertFunction(
     auto value = resolved_args[0];
 
     // Resolve the target type from the second argument
-    auto target_type = ctx->syms->ResolveType(args[1]);
+    auto target = ctx->syms->ResolveTypeWithInfo(args[1]);
+    auto target_type = target.type;
     if (!target_type) {
         ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
                                         call_expr->GetSourceRange().getBegin())
@@ -957,14 +945,10 @@ mlir::Value AveLangModule::CreateConvertFunction(
     // Explicit type conversion (allows demotion since user explicitly requested
     // it)
     auto &builder = ctx->GetCurrentFunctionGenerator()->GetBuilder();
-    std::optional<bool> targetUnsigned;
-    if (auto typeInfo = GetTypeInfo(args[1]); typeInfo.is_unsigned_integer) {
-        targetUnsigned = typeInfo.is_unsigned_integer;
-    }
-
     auto result = causalflow::avelang::ir::CreateTypeConversion(
         value, source_type, target_type, location, builder, true,
-        GetTypeInfo(value).is_unsigned_integer, targetUnsigned);
+        GetTypeInfo(value).is_unsigned_integer,
+        target.info.is_unsigned_integer);
     if (!result) {
         std::string source_str, target_str;
         llvm::raw_string_ostream source_os(source_str), target_os(target_str);
@@ -1004,7 +988,8 @@ mlir::Value AveLangModule::CreateBitcastFunction(
     auto value = resolved_args[0];
 
     // Resolve the target type from the second argument
-    auto target_type = ctx->syms->ResolveType(args[1]);
+    auto target = ctx->syms->ResolveTypeWithInfo(args[1]);
+    auto target_type = target.type;
     if (!target_type) {
         ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
                                         call_expr->GetSourceRange().getBegin())
@@ -1018,10 +1003,7 @@ mlir::Value AveLangModule::CreateBitcastFunction(
     auto &builder = ctx->GetCurrentFunctionGenerator()->GetBuilder();
     auto bitcast =
         mlir::arith::BitcastOp::create(builder, location, target_type, value);
-    if (auto targetTypeInfo = GetTypeInfo(args[1]);
-        targetTypeInfo.is_unsigned_integer) {
-        SetTypeInfo(bitcast.getResult(), targetTypeInfo);
-    }
+    SetTypeInfo(bitcast.getResult(), target.info);
     return bitcast.getResult();
 }
 
@@ -1318,8 +1300,8 @@ mlir::Value AveLangModule::CreateMakeTensorFunction(
         return nullptr;
     }
 
-    auto elementType = resolveAndValidateTensorElementType(
-        args[1], ctx, call_expr->GetSourceRange().getBegin(), "make_tensor");
+    auto element = ctx->syms->ResolveBuiltinType(args[1]);
+    auto elementType = element.type;
     if (!elementType) {
         return nullptr;
     }
@@ -1411,10 +1393,8 @@ CreateMakeTensorWithMemorySpace(ast::Call *call_expr, GeneratorContext *ctx,
     mlir::Attribute memorySpaceAttr =
         mlir::gpu::AddressSpaceAttr::get(builder.getContext(), addressSpace);
 
-    int dtypeArgIndex = 1;
-    mlir::Type elementType = resolveAndValidateTensorElementType(
-        args[dtypeArgIndex], ctx, call_expr->GetSourceRange().getBegin(),
-        functionName);
+    auto element = ctx->syms->ResolveBuiltinType(args[1]);
+    auto elementType = element.type;
     if (!elementType) {
         return nullptr;
     }
@@ -1562,7 +1542,7 @@ CreateMakeTensorWithMemorySpace(ast::Call *call_expr, GeneratorContext *ctx,
 
     auto castOp = cf::AveLangMemRefCastOp::create(builder, location, alloca,
                                                   layoutValue, resultType);
-    if (auto typeInfo = GetTypeInfo(args[1]); typeInfo.is_unsigned_integer) {
+    if (auto typeInfo = element.info; typeInfo.is_unsigned_integer) {
         SetTypeInfo(alloca, typeInfo);
         SetTypeInfo(castOp.getResult(), typeInfo);
     }
@@ -1850,7 +1830,8 @@ mlir::Value AveLangModule::CreateFullFunction(
     }
 
     // Resolve the dtype from the third argument
-    mlir::Type element_type = ctx->syms->ResolveType(args[2]);
+    auto element = ctx->syms->ResolveBuiltinType(args[2]);
+    auto element_type = element.type;
     if (!element_type) {
         ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
                                         call_expr->GetSourceRange().getBegin())
@@ -1871,10 +1852,7 @@ mlir::Value AveLangModule::CreateFullFunction(
         target_scalar_type = element_vector_type.getElementType();
     }
 
-    std::optional<bool> targetUnsigned;
-    if (auto typeInfo = GetTypeInfo(args[2]); typeInfo.is_unsigned_integer) {
-        targetUnsigned = typeInfo.is_unsigned_integer;
-    }
+    auto targetUnsigned = element.info.is_unsigned_integer;
 
     if (fill_value.getType() != target_scalar_type) {
         // Convert if needed
@@ -2005,7 +1983,8 @@ mlir::Value AveLangModule::CreateViewFunction(
     }
 
     // Resolve the target tensor type from the second argument
-    mlir::Type target_tensor_type = ctx->syms->ResolveType(args[1]);
+    auto target = ctx->syms->ResolveTypeWithInfo(args[1]);
+    auto target_tensor_type = target.type;
     if (!target_tensor_type) {
         ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
                                         call_expr->GetSourceRange().getBegin())
@@ -2073,8 +2052,7 @@ mlir::Value AveLangModule::CreateViewFunction(
             mlir::VectorType::get(target_elements, target_elem_type);
         mlir::Value bitcasted = mlir::vector::BitCastOp::create(
             builder, location, bitcast_type, flattened);
-        if (auto typeInfo = GetTypeInfo(args[1]);
-            typeInfo.is_unsigned_integer) {
+        if (auto typeInfo = target.info; typeInfo.is_unsigned_integer) {
             SetTypeInfo(bitcasted, typeInfo);
         } else {
             SetTypeInfo(bitcasted, GetTypeInfo(flattened));
@@ -2160,7 +2138,7 @@ mlir::Value AveLangModule::CreateViewFunction(
     // Create the memref.cast op
     auto castOp = cf::AveLangMemRefCastOp::create(
         builder, location, actual_memref_value, target_with_memspace);
-    if (auto typeInfo = GetTypeInfo(args[1]); typeInfo.is_unsigned_integer) {
+    if (auto typeInfo = target.info; typeInfo.is_unsigned_integer) {
         SetTypeInfo(castOp.getResult(), typeInfo);
     } else {
         SetTypeInfo(castOp.getResult(), GetTypeInfo(actual_memref_value));

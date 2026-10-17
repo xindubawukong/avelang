@@ -4,6 +4,7 @@
 #include "IR/ir_context.h"
 #include "IR/mlir_generator.h"
 #include "IR/symbol_table.h"
+#include "IR/type_system.h"
 
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wambiguous-reversed-operator"
@@ -1182,6 +1183,30 @@ def unsigned_bitcast_rshift(out: S.Tensor((1,), S.u32), inp: S.Tensor((1,), S.f3
     EXPECT_TRUE(foundUnsignedAttr);
     EXPECT_TRUE(foundUnsignedShift);
     EXPECT_FALSE(foundSignedShift);
+}
+
+TEST_F(MLIRGeneratorTest, IntegerTypeAliasesKeepSignedness) {
+    const std::string source = R"(
+import avelang
+import avelang.language as S
+from avelang.language import u32 as Word, Tensor as T
+@avelang.jit
+def aliases(x: Word, y: T((2,), Word), out: T((2,), S.i32)):
+    out[0] = x >> 31
+    out[1] = y[0] >> 31
+)";
+    ast::ASTNode *root = nullptr;
+    TryParse(source, &root);
+    auto context = ir::IRContext::Create();
+    ir::MLIRGenerator generator(context.get(), diagnostics_);
+    auto module = generator.Generate(root);
+    ASSERT_FALSE(diagnostics_->GetEngine()->hasErrorOccurred())
+        << diagHandler_.GetErrorMessages();
+    ASSERT_TRUE(module);
+    EXPECT_TRUE(mlir::succeeded(mlir::verify(module)));
+    unsigned shifts = 0;
+    module.walk([&](mlir::arith::ShRUIOp) { ++shifts; });
+    EXPECT_EQ(shifts, 2u);
 }
 
 TEST_F(MLIRGeneratorTest, GenerateMLIRUnsignedBitcastConstantFoldShape) {

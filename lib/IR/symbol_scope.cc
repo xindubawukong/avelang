@@ -15,7 +15,8 @@ SymbolScope::Symbol::Symbol(TypeFactoryFunction tf)
 SymbolScope::Symbol::Symbol(Function ff)
     : kind(kFunction), function(std::move(ff)) {}
 
-SymbolScope::Symbol::Symbol(mlir::Type t) : kind(kType), type(t) {}
+SymbolScope::Symbol::Symbol(mlir::Type t, TypeInfo info)
+    : kind(kType), type_info(info), type(t) {}
 
 SymbolScope::Symbol::Symbol(mlir::Value v) : kind(kValue), value(v) {}
 
@@ -36,7 +37,7 @@ SymbolScope::Symbol::~Symbol() {
 }
 
 SymbolScope::Symbol::Symbol(const Symbol &other)
-    : kind(other.kind), immutable(other.immutable) {
+    : kind(other.kind), immutable(other.immutable), type_info(other.type_info) {
     switch (kind) {
     case kModule:
         module = other.module;
@@ -64,6 +65,7 @@ SymbolScope::Symbol &SymbolScope::Symbol::operator=(const Symbol &other) {
         // Copy construct new content
         kind = other.kind;
         immutable = other.immutable;
+        type_info = other.type_info;
         switch (kind) {
         case kModule:
             module = other.module;
@@ -107,8 +109,9 @@ void SymbolScope::AddValue(const std::string &name, mlir::Value value,
     symbols_[name] = sym;
 }
 
-void SymbolScope::AddType(const std::string &name, mlir::Type type) {
-    symbols_[name] = Symbol(type);
+void SymbolScope::AddType(const std::string &name, mlir::Type type,
+                          TypeInfo info) {
+    symbols_[name] = Symbol(type, info);
 }
 
 void SymbolScope::AddModule(const std::string &name, NamedModule *module) {

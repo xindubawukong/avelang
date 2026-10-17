@@ -212,48 +212,6 @@ TypeInfo GetTypeInfo(mlir::Value value) {
     return GetValueTypeInfo(value);
 }
 
-TypeInfo GetTypeInfo(ast::Expr *expr) {
-    TypeInfo info;
-    auto getTypeInfo = [](llvm::StringRef typeName) -> std::optional<bool> {
-        if (typeName == "u8" || typeName == "u16" || typeName == "u32" ||
-            typeName == "u64") {
-            return true;
-        }
-        if (typeName == "i8" || typeName == "i16" || typeName == "i32" ||
-            typeName == "i64") {
-            return false;
-        }
-        return std::nullopt;
-    };
-
-    if (auto *name = llvm::dyn_cast<ast::Name>(expr)) {
-        info.is_unsigned_integer = getTypeInfo(name->GetId());
-        return info;
-    }
-    if (auto *attr = llvm::dyn_cast<ast::AttributeExpr>(expr)) {
-        info.is_unsigned_integer = getTypeInfo(attr->GetAttr());
-        return info;
-    }
-    if (auto *call = llvm::dyn_cast<ast::Call>(expr)) {
-        auto *func = call->GetFunc();
-        llvm::StringRef calleeName;
-        if (auto *name = llvm::dyn_cast<ast::Name>(func)) {
-            calleeName = name->GetId();
-        } else if (auto *attr = llvm::dyn_cast<ast::AttributeExpr>(func)) {
-            calleeName = attr->GetAttr();
-        }
-
-        const auto &args = call->GetArgs();
-        if (calleeName == "Tensor" && args.size() >= 2) {
-            return GetTypeInfo(args[1]);
-        }
-        if (calleeName == "Pointer" && args.size() == 1) {
-            return GetTypeInfo(args[0]);
-        }
-    }
-    return info;
-}
-
 void SetTypeInfo(mlir::Value value, const TypeInfo &typeInfo) {
     if (!value || !typeInfo.is_unsigned_integer) {
         return;

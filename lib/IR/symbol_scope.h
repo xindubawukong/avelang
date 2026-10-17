@@ -11,6 +11,7 @@
 #include <llvm/ADT/ArrayRef.h>
 
 #include "AST/ast_nodes_expr.h"
+#include "type_system.h"
 
 namespace causalflow::avelang::ir {
 
@@ -28,8 +29,8 @@ class SymbolScope {
         kValue,
     };
 
-    using TypeFactoryFunction = std::function<mlir::Type(
-        NamedModule *, ast::Call *, GeneratorContext *)>;
+    using TypeFactoryFunction =
+        std::function<ResolvedType(ast::Call *, GeneratorContext *)>;
     struct Function {
         using Implementation = std::function<mlir::Value(
             ast::Call *, GeneratorContext *, llvm::ArrayRef<mlir::Value>)>;
@@ -68,6 +69,7 @@ class SymbolScope {
     struct Symbol {
         SymbolKind kind;
         bool immutable = false; // Track whether this symbol is immutable
+        TypeInfo type_info;
         union {
             NamedModule *module;
             TypeFactoryFunction type_factory;
@@ -80,7 +82,7 @@ class SymbolScope {
         Symbol(NamedModule *m);
         Symbol(TypeFactoryFunction tf);
         Symbol(Function ff);
-        Symbol(mlir::Type t);
+        Symbol(mlir::Type t, TypeInfo info = {});
         Symbol(mlir::Value v);
 
         ~Symbol();
@@ -98,7 +100,7 @@ class SymbolScope {
     // Convenience methods for different symbol types
     void AddValue(const std::string &name, mlir::Value value,
                   bool immutable = false);
-    void AddType(const std::string &name, mlir::Type type);
+    void AddType(const std::string &name, mlir::Type type, TypeInfo info = {});
     void AddModule(const std::string &name, NamedModule *module);
     void AddTypeFactory(const std::string &name, TypeFactoryFunction factory);
     void AddFunction(const std::string &name,

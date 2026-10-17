@@ -40,9 +40,9 @@ class SymbolTable {
 
     // Type resolution
     mlir::Type ResolveType(ast::Expr *annotation);
-    // Resolve a primitive type expression which does not support the Call
-    // expression.
-    mlir::Type ResolveBuiltinType(ast::Expr *annotation);
+    ResolvedType ResolveTypeWithInfo(ast::Expr *annotation);
+    // Resolve and validate a primitive scalar/vector type with its metadata.
+    ResolvedType ResolveBuiltinType(ast::Expr *annotation);
     // Resolve a reference expression to a value. return a null value if failed.
     mlir::Value ResolveRefExpr(ast::Expr *expr);
     // Resolve a registered function for calling functions

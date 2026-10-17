@@ -161,39 +161,13 @@ struct IntegerTypeInfo {
 };
 
 static std::optional<IntegerTypeInfo>
-GetBuiltinIntegerTypeInfo(ast::Expr *expr) {
-    auto typeInfo = GetTypeInfo(expr);
-    if (!typeInfo.is_unsigned_integer) {
+GetBuiltinIntegerTypeInfo(ast::Expr *expr, GeneratorContext *ctx) {
+    auto resolved = ctx->syms->ResolveTypeWithInfo(expr);
+    auto type = mlir::dyn_cast_or_null<mlir::IntegerType>(resolved.type);
+    if (!type || !resolved.info.is_unsigned_integer) {
         return std::nullopt;
     }
-
-    auto getBitWidth = [](llvm::StringRef typeName) -> std::optional<unsigned> {
-        if (typeName.ends_with("8")) {
-            return 8;
-        }
-        if (typeName.ends_with("16")) {
-            return 16;
-        }
-        if (typeName.ends_with("32")) {
-            return 32;
-        }
-        if (typeName.ends_with("64")) {
-            return 64;
-        }
-        return std::nullopt;
-    };
-
-    if (auto *name = llvm::dyn_cast<ast::Name>(expr)) {
-        if (auto width = getBitWidth(name->GetId())) {
-            return IntegerTypeInfo{*width, *typeInfo.is_unsigned_integer};
-        }
-    }
-    if (auto *attr = llvm::dyn_cast<ast::AttributeExpr>(expr)) {
-        if (auto width = getBitWidth(attr->GetAttr())) {
-            return IntegerTypeInfo{*width, *typeInfo.is_unsigned_integer};
-        }
-    }
-    return std::nullopt;
+    return IntegerTypeInfo{type.getWidth(), *resolved.info.is_unsigned_integer};
 }
 
 static bool IsBitcastCall(const ast::Call *call) {
@@ -224,13 +198,14 @@ static bool IsConvertCall(const ast::Call *call) {
     return false;
 }
 
-static bool IsUnsignedIntegerExpr(ast::Expr *expr) {
+static bool IsUnsignedIntegerExpr(ast::Expr *expr, GeneratorContext *ctx) {
     if (auto *call = llvm::dyn_cast<ast::Call>(expr)) {
         if (call->GetArgs().size() != 2) {
             return false;
         }
         if (IsBitcastCall(call) || IsConvertCall(call)) {
-            auto typeInfo = GetTypeInfo(call->GetArgs()[1]);
+            auto typeInfo =
+                ctx->syms->ResolveTypeWithInfo(call->GetArgs()[1]).info;
             return typeInfo.is_unsigned_integer.value_or(false);
         }
         return false;
@@ -241,10 +216,10 @@ static bool IsUnsignedIntegerExpr(ast::Expr *expr) {
         if (op == "BitAnd" || op == "BitOr" || op == "BitXor" ||
             op == "LShift" || op == "RShift" || op == "Add" || op == "Sub" ||
             op == "Mult" || op == "Div" || op == "Mod" || op == "FloorDiv") {
-            if (IsUnsignedIntegerExpr(binop->GetLeft())) {
+            if (IsUnsignedIntegerExpr(binop->GetLeft(), ctx)) {
                 return true;
             }
-            return IsUnsignedIntegerExpr(binop->GetRight());
+            return IsUnsignedIntegerExpr(binop->GetRight(), ctx);
         }
     }
 
@@ -507,7 +482,7 @@ std::optional<int64_t> ConstantFolder::Evaluate(ast::Expr *expr) const {
         if ((IsBitcastCall(call) || IsConvertCall(call)) &&
             call->GetArgs().size() == 2) {
             auto value = Evaluate(call->GetArgs()[0]);
-            auto typeInfo = GetBuiltinIntegerTypeInfo(call->GetArgs()[1]);
+            auto typeInfo = GetBuiltinIntegerTypeInfo(call->GetArgs()[1], ctx_);
             if (!value || !typeInfo) {
                 return std::nullopt;
             }
@@ -552,7 +527,7 @@ std::optional<int64_t> ConstantFolder::Evaluate(ast::Expr *expr) const {
             if (*rhs == 0) {
                 return std::nullopt;
             }
-            if (IsUnsignedIntegerExpr(binop->GetLeft())) {
+            if (IsUnsignedIntegerExpr(binop->GetLeft(), ctx_)) {
                 return static_cast<uint64_t>(*lhs) /
                        static_cast<uint64_t>(*rhs);
             }
@@ -567,7 +542,7 @@ std::optional<int64_t> ConstantFolder::Evaluate(ast::Expr *expr) const {
             if (*rhs == 0) {
                 return std::nullopt;
             }
-            if (IsUnsignedIntegerExpr(binop->GetLeft())) {
+            if (IsUnsignedIntegerExpr(binop->GetLeft(), ctx_)) {
                 if ((static_cast<uint64_t>(*lhs) %
                      static_cast<uint64_t>(*rhs)) != 0) {
                     return std::nullopt;
@@ -584,7 +559,7 @@ std::optional<int64_t> ConstantFolder::Evaluate(ast::Expr *expr) const {
             if (*rhs == 0) {
                 return std::nullopt;
             }
-            if (IsUnsignedIntegerExpr(binop->GetLeft())) {
+            if (IsUnsignedIntegerExpr(binop->GetLeft(), ctx_)) {
                 return static_cast<uint64_t>(*lhs) %
                        static_cast<uint64_t>(*rhs);
             }
@@ -594,7 +569,7 @@ std::optional<int64_t> ConstantFolder::Evaluate(ast::Expr *expr) const {
             return *lhs << *rhs;
         }
         if (op == "RShift") {
-            if (IsUnsignedIntegerExpr(binop->GetLeft())) {
+            if (IsUnsignedIntegerExpr(binop->GetLeft(), ctx_)) {
                 return static_cast<int64_t>(static_cast<uint64_t>(*lhs) >>
                                             static_cast<uint64_t>(*rhs));
             }

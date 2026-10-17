@@ -23,8 +23,9 @@ void NamedModule::AddSymbol(const std::string &name, mlir::Value value) {
     symbols_.AddValue(name, value);
 }
 
-void NamedModule::AddType(const std::string &name, mlir::Type type) {
-    symbols_.AddType(name, type);
+void NamedModule::AddType(const std::string &name, mlir::Type type,
+                          TypeInfo info) {
+    symbols_.AddType(name, type, info);
 }
 
 void NamedModule::AddModule(const std::string &name, NamedModule *module) {

@@ -1542,15 +1542,18 @@ mlir::Value ExprGenerator::VisitCall(ast::Call *call) {
             continue;
         }
 
+        auto *symbol_expr = arg_expr;
         if (auto *call_arg = llvm::dyn_cast<ast::Call>(arg_expr)) {
-            if (auto *attr_func =
-                    llvm::dyn_cast<ast::AttributeExpr>(call_arg->GetFunc())) {
-                auto attr_name = attr_func->GetAttr();
-                if (attr_name == "Tensor" || attr_name == "Pointer" ||
-                    attr_name == "Layout") {
-                    resolved_args.emplace_back();
-                    continue;
-                }
+            symbol_expr = call_arg->GetFunc();
+        }
+        if (llvm::isa<ast::Name, ast::AttributeExpr>(symbol_expr)) {
+            auto symbol = parent_->GetContext()->syms->ResolveSymbol(
+                symbol_expr, std::nullopt, /*report_not_found=*/false);
+            if (symbol &&
+                (symbol->isa(SymbolScope::SymbolKind::kType) ||
+                 symbol->isa(SymbolScope::SymbolKind::kTypeFactory))) {
+                resolved_args.emplace_back();
+                continue;
             }
         }
 

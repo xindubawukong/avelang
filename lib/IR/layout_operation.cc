@@ -221,7 +221,8 @@ LayoutOperation::createViewFunction(ast::Call *callExpr, GeneratorContext *ctx,
     }
 
     // Resolve the element type from the second argument
-    auto elementType = ctx->syms->ResolveBuiltinType(args[1]);
+    auto element = ctx->syms->ResolveBuiltinType(args[1]);
+    auto elementType = element.type;
     if (!elementType || !elementType.isSignlessIntOrFloat()) {
         ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
                                         callExpr->GetSourceRange().getBegin())
@@ -298,7 +299,7 @@ LayoutOperation::createViewFunction(ast::Call *callExpr, GeneratorContext *ctx,
     // Create the new memref.cast op from the AveLang dialect
     auto castOp = cf::AveLangMemRefCastOp::create(
         builder, location, memrefValue, layoutValue, newMemRefType);
-    if (auto typeInfo = GetTypeInfo(args[1]); typeInfo.is_unsigned_integer) {
+    if (auto typeInfo = element.info; typeInfo.is_unsigned_integer) {
         SetTypeInfo(castOp.getResult(), typeInfo);
     } else {
         SetTypeInfo(castOp.getResult(), GetTypeInfo(memrefValue));

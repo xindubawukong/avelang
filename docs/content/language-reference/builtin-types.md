@@ -16,6 +16,9 @@ import avelang.language as al
 
 For value types, Ave supports signed integers (`al.i8`, `al.i16`, `al.i32`, `al.i64`), unsigned integers (`al.u8`, `al.u16`, `al.u32`, `al.u64`), and floating point values (`al.f16`, `al.bf16`, `al.f32`, `al.f64`). It also supports the `al.void` type to denote void type.
 
+Imported type aliases preserve the complete type, including integer signedness,
+in annotations and explicit dtype arguments.
+
 Value conversion is described in [Builtin Functions](../builtin-functions/).
 
 ## Tensor Types

@@ -233,13 +233,12 @@ mlir::Value SymbolTable::ResolveRefExpr(ast::Expr *expr) {
     return symbol ? symbol->value : mlir::Value();
 }
 
-mlir::Type SymbolTable::ResolveBuiltinType(ast::Expr *expr) {
-    auto symbol = ResolveSymbol(expr, SymbolKind::kType);
-    if (!symbol) {
-        return mlir::Type();
+ResolvedType SymbolTable::ResolveBuiltinType(ast::Expr *expr) {
+    auto resolved = ResolveTypeWithInfo(expr);
+    auto type = resolved.type;
+    if (!type) {
+        return {};
     }
-
-    auto type = symbol->type;
 
     // Validate that this is a builtin type (builtin scalar / vector types)
     if (!type.isIntOrFloat() && !type.isIndex() &&
@@ -247,41 +246,40 @@ mlir::Type SymbolTable::ResolveBuiltinType(ast::Expr *expr) {
         parent_->diagnostic_manager->Report(
             basic::DiagnosticCode::kTypeMismatch, parent_->current_source_loc)
             << "Expected primitive type, got complex type";
-        return mlir::Type();
+        return {};
     }
 
-    return type;
+    return resolved;
 }
 
 mlir::Type SymbolTable::ResolveType(ast::Expr *expr) {
-    if (auto *call_expr = llvm::dyn_cast<ast::Call>(expr)) {
-        auto symbol =
-            ResolveSymbol(call_expr->GetFunc(), SymbolKind::kTypeFactory);
-        if (symbol) {
-            return symbol->type_factory(symbol->module, call_expr, parent_);
-        }
-    }
+    return ResolveTypeWithInfo(expr).type;
+}
 
-    // Handle Attribute expressions (e.g., S.f32 as an attribute access)
-    // These are like S.f32 without the call parentheses
-    if (llvm::isa<ast::AttributeExpr>(expr)) {
-        // Try to resolve it as a type first
-        auto symbol = ResolveSymbol(expr, SymbolKind::kType);
-        if (symbol && symbol->type) {
-            return symbol->type;
-        }
-        // If not a type directly, try as a type factory with empty args
-        auto factory_symbol = ResolveSymbol(expr, SymbolKind::kTypeFactory);
-        if (factory_symbol) {
-            // Create a dummy call with no arguments for the type factory
-            // This handles cases like S.f32 where f32 is a type factory
-            return factory_symbol->type;
-        }
+ResolvedType SymbolTable::ResolveTypeWithInfo(ast::Expr *expr) {
+    if (!expr) {
+        return {};
     }
-
-    // Handle direct Name symbols
+    if (auto *call = llvm::dyn_cast_or_null<ast::Call>(expr)) {
+        auto symbol = ResolveSymbol(call->GetFunc(), SymbolKind::kTypeFactory);
+        if (!symbol) {
+            return {};
+        }
+        return symbol->type_factory(call, parent_);
+    }
     auto symbol = ResolveSymbol(expr, SymbolKind::kType);
-    return symbol ? symbol->type : mlir::Type();
+    if (!symbol) {
+        return {};
+    }
+    if ((IsIntegerValueOrVectorOfIntegers(symbol->type) ||
+         IsMemRefWithIntegerElements(symbol->type)) &&
+        !symbol->type_info.is_unsigned_integer) {
+        parent_->diagnostic_manager->Report(
+            basic::DiagnosticCode::kTypeMismatch, parent_->current_source_loc)
+            << "Integer type is missing signedness";
+        return {};
+    }
+    return {symbol->type, symbol->type_info};
 }
 
 NamedModule::Function SymbolTable::ResolveFunction(ast::Expr *expr) {

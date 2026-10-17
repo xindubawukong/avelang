@@ -16,12 +16,12 @@ class AveLangModule : public NamedModule {
     explicit AveLangModule(IRContext *ir_context);
     void Initialize() override;
     void DeclareModules(mlir::ModuleOp module) override;
-    mlir::Type CreateTensorType(ast::Call *call_expr,
-                                GeneratorContext *ctx) const;
-    mlir::Type CreatePointerType(ast::Call *call_expr,
-                                 GeneratorContext *ctx) const;
-    mlir::Type CreateLayoutType(ast::Call *call_expr,
-                                GeneratorContext *ctx) const;
+    ResolvedType CreateTensorType(ast::Call *call_expr,
+                                  GeneratorContext *ctx) const;
+    ResolvedType CreatePointerType(ast::Call *call_expr,
+                                   GeneratorContext *ctx) const;
+    ResolvedType CreateLayoutType(ast::Call *call_expr,
+                                  GeneratorContext *ctx) const;
     mlir::Value
     CreateConvertFunction(ast::Call *call_expr, GeneratorContext *ctx,
                           llvm::ArrayRef<mlir::Value> resolved_args) const;
