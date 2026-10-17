@@ -1338,6 +1338,82 @@ def dynamic_layout(n: S.u32, stride: S.u32, signed_stride: S.i32):
     EXPECT_EQ(signedCasts, 2u);
 }
 
+TEST_F(MLIRGeneratorTest, IntegerSignednessSurvivesAliasesAndValueProducers) {
+    const std::string source = R"(
+import avelang
+import avelang.language as S
+from avelang.language import u32 as Word, u64 as Wide, Tensor as T
+
+@avelang.jit
+def signedness_sources(p: S.Pointer(Word), x: Word, out: T((5,), S.i64)):
+    t = S.make_tensor(p, Word, S.make_layout((2,), (1,)))
+    out[0] = x >> 31
+    out[1] = S.convert(-1, Wide) >> 1
+    out[2] = t[0] >> 31
+    out[3] = S.amdgpu.readfirstlane(x) >> 31
+    out[4] = S.shuffle(x, 0, 32) >> 31
+)";
+    ast::ASTNode *root = nullptr;
+    TryParse(source, &root);
+    ASSERT_NE(root, nullptr);
+    auto irContext = ir::IRContext::Create();
+    ir::MLIRGenerator generator(irContext.get(), diagnostics_);
+    auto module = generator.Generate(root);
+    ASSERT_FALSE(diagnostics_->GetEngine()->hasErrorOccurred())
+        << diagHandler_.GetErrorMessages();
+    ASSERT_TRUE(module);
+    ASSERT_TRUE(mlir::succeeded(mlir::verify(module)));
+    unsigned unsignedShifts = 0;
+    module.walk([&](mlir::arith::ShRUIOp) { ++unsignedShifts; });
+    module.walk(
+        [&](mlir::arith::ShRSIOp) { ADD_FAILURE() << "Lost unsigned type"; });
+    EXPECT_EQ(unsignedShifts, 5u);
+}
+
+TEST_F(MLIRGeneratorTest, FunctionResultsKeepIndependentDeclaredSignedness) {
+    const std::string source = R"(
+import avelang
+import avelang.language as S
+from avelang.language import u32 as Word
+
+@avelang.jit
+def split_signedness(x: S.i32) -> (S.i32, Word):
+    return x, x
+
+@avelang.jit
+def call_signedness(x: S.i32, out: S.Tensor((2,), S.i32)):
+    s, u = split_signedness(x)
+    out[0] = s >> 31
+    out[1] = u >> 31
+)";
+    ast::ASTNode *root = nullptr;
+    TryParse(source, &root);
+    ASSERT_NE(root, nullptr);
+    auto irContext = ir::IRContext::Create();
+    ir::MLIRGenerator generator(irContext.get(), diagnostics_);
+    RegisterJitDependencies(root, generator, {"split_signedness"});
+    auto module = generator.Generate(root);
+    ASSERT_FALSE(diagnostics_->GetEngine()->hasErrorOccurred())
+        << diagHandler_.GetErrorMessages();
+    ASSERT_TRUE(module);
+    ASSERT_TRUE(mlir::succeeded(mlir::verify(module)));
+    unsigned calls = 0;
+    module.walk([&](mlir::func::CallOp call) {
+        if (call.getNumResults() != 2)
+            return;
+        ++calls;
+        EXPECT_EQ(ir::GetTypeInfo(call.getResult(0)).is_unsigned_integer,
+                  false);
+        EXPECT_EQ(ir::GetTypeInfo(call.getResult(1)).is_unsigned_integer, true);
+    });
+    unsigned signedShifts = 0, unsignedShifts = 0;
+    module.walk([&](mlir::arith::ShRSIOp) { ++signedShifts; });
+    module.walk([&](mlir::arith::ShRUIOp) { ++unsignedShifts; });
+    EXPECT_EQ(calls, 1u);
+    EXPECT_EQ(signedShifts, 1u);
+    EXPECT_EQ(unsignedShifts, 1u);
+}
+
 TEST_F(MLIRGeneratorTest, GenerateMLIRUnsignedBitcastConstantFoldShape) {
     static const std::string kSourceCode = R"""""(
 import avelang

@@ -45,6 +45,68 @@ def literal_operand_order(inp: S.Tensor((2,), S.u64), out: S.Tensor((2,), S.i64)
 
 
 @avelang.jit
+def split_signedness(x: S.i32) -> (S.i32, S.u32):
+    return x, x
+
+
+@avelang.jit
+def widen_returns(x: S.i32, u: S.u32) -> (S.u64, S.i64):
+    return x, u
+
+
+@avelang.jit
+def unsigned_argument(x: S.u64) -> S.u64:
+    return x >> 1
+
+
+@avelang.jit
+def function_signedness(inp: S.Tensor((2,), S.i32), out: S.Tensor((5,), S.i64)):
+    x = inp[0]
+    s, u = split_signedness(x)
+    wide_u, wide_s = widen_returns(x, u)
+    out[0] = s >> 31
+    out[1] = u >> 31
+    out[2] = wide_u >> 63
+    out[3] = wide_s
+    out[4] = unsigned_argument(-1)
+
+
+@avelang.jit
+def split_tensor_signedness(x: S.Tensor((2,), S.i32)) -> (S.Tensor((2,), S.i32), S.Tensor((2,), S.u32)):
+    return x, x
+
+
+@avelang.jit
+def tensor_result_signedness(inp: S.Tensor((2,), S.i32), out: S.Tensor((2,), S.i64)):
+    s, u = split_tensor_signedness(inp)
+    out[0] = s[0] >> 31
+    out[1] = u[0] >> 31
+
+
+@avelang.jit
+def tensor_and_shuffle_signedness(p: S.Pointer(S.u32), out: S.Tensor((5,), S.i64)):
+    t = S.make_tensor(p, S.u32, S.make_layout((2,), (1,)))
+    x = t[0]
+    idx = S.shuffle(x, 0, 32)
+    xor = S.shuffle_xor(x, 0, 32)
+    up = S.shuffle_up(x, 0, 32)
+    down = S.shuffle_down(x, 0, 32)
+    if S.thread_id(0) == 0:
+        out[0] = x >> 31
+        out[1] = idx >> 31
+        out[2] = xor >> 31
+        out[3] = up >> 31
+        out[4] = down >> 31
+
+
+@avelang.jit
+def readfirstlane_signedness(inp: S.Tensor((2,), S.u32), out: S.Tensor((2,), S.i64)):
+    x = inp[0]
+    out[0] = S.amdgpu.readfirstlane(x) >> 31
+    out[1] = S.amdgpu.readfirstlane(S.convert(x, S.i32)) >> 31
+
+
+@avelang.jit
 def bitwise_extension_policy(inp: S.Tensor((2,), S.i32), out: S.Tensor((2,), S.i64)):
     x = inp[0]
     zero = S.convert(0, S.i64)
@@ -65,7 +127,7 @@ def folded_integer_runtime(out: S.Tensor((5,), S.i64)):
 class TestIntegerSignedness(unittest.TestCase):
     def run_kernel(self, kernel, expected, *args):
         out = torch.empty(len(expected), dtype=torch.int64, device="cuda")
-        threads = 1
+        threads = 32 if kernel is tensor_and_shuffle_signedness else 1
         kernel[lambda: ((1, 1, 1), (threads, 1, 1))](*args, out)
         self.assertEqual(out.tolist(), expected)
 
@@ -97,6 +159,19 @@ class TestIntegerSignedness(unittest.TestCase):
             [2, 2],
             torch.tensor([-(2**63), 0], dtype=torch.int64, device="cuda"),
         )
+
+    def test_function_arguments_and_multiple_results(self):
+        self.run_kernel(function_signedness, [-1, 1, 1, 2**31, 2**63 - 1], self.high_bit_input())
+
+    def test_tensor_results(self):
+        self.run_kernel(tensor_result_signedness, [-1, 1], self.high_bit_input())
+
+    def test_make_tensor_and_shuffle(self):
+        self.run_kernel(tensor_and_shuffle_signedness, [1] * 5, self.high_bit_input())
+
+    @unittest.skipUnless(torch.version.hip, "AMDGPU intrinsic")
+    def test_readfirstlane(self):
+        self.run_kernel(readfirstlane_signedness, [1, -1], self.high_bit_input())
 
     def test_bitwise_widening_stays_zero_extended(self):
         self.run_kernel(

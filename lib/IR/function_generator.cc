@@ -225,6 +225,7 @@ void FunctionGenerator::Generate(ast::FunctionDef *func) {
 
     // Resolve return type if present
     SmallVector<mlir::Type> returnTypes;
+    SmallVector<TypeInfo> returnTypeInfos;
     if (auto *returns_expr = func->GetReturns()) {
         auto materialize_value_return_type =
             [&](mlir::Type type) -> mlir::Type {
@@ -249,7 +250,8 @@ void FunctionGenerator::Generate(ast::FunctionDef *func) {
 
         auto resolve_tuple_types = [&](auto *tuple_expr) -> bool {
             for (auto *elem : tuple_expr->GetElts()) {
-                auto elem_type = ctx_->syms->ResolveType(elem);
+                auto resolved_type = ctx_->syms->ResolveTypeWithInfo(elem);
+                auto elem_type = resolved_type.type;
                 if (!elem_type) {
                     ctx_->diagnostic_manager->Report(
                         basic::DiagnosticCode::kUnimplemented,
@@ -263,6 +265,7 @@ void FunctionGenerator::Generate(ast::FunctionDef *func) {
                     return false;
                 }
                 returnTypes.push_back(elem_type);
+                returnTypeInfos.push_back(resolved_type.info);
             }
             if (returnTypes.empty()) {
                 ctx_->diagnostic_manager->Report(
@@ -283,7 +286,8 @@ void FunctionGenerator::Generate(ast::FunctionDef *func) {
                 return;
             }
         } else {
-            auto return_type = ctx_->syms->ResolveType(returns_expr);
+            auto resolved_type = ctx_->syms->ResolveTypeWithInfo(returns_expr);
+            auto return_type = resolved_type.type;
             if (!return_type) {
                 ctx_->diagnostic_manager->Report(
                     basic::DiagnosticCode::kUnimplemented,
@@ -297,6 +301,7 @@ void FunctionGenerator::Generate(ast::FunctionDef *func) {
                 return;
             }
             returnTypes.push_back(return_type);
+            returnTypeInfos.push_back(resolved_type.info);
         }
     }
 
@@ -336,6 +341,9 @@ void FunctionGenerator::Generate(ast::FunctionDef *func) {
     func_op->setAttr("ave.gpu_func",
                      builder_.getI32IntegerAttr((int)function_type_));
     func_op.setAllArgAttrs(argAttrs);
+    for (size_t i = 0; i < returnTypeInfos.size(); ++i) {
+        SetFunctionResultTypeInfo(func_op, i, returnTypeInfos[i]);
+    }
 
     if (function_type_ == MLIRGenerator::FunctionType::kPrivateFunction) {
         func_op.setPrivate();
@@ -443,11 +451,17 @@ void FunctionGenerator::VisitReturn(ast::Return *ret) {
                         auto cast_value = expr_generator_.CastTensorVector(
                             value, expected_type,
                             value_expr->GetSourceRange().getBegin());
+                        auto expected_info =
+                            GetFunctionResultTypeInfo(func_op, result_index);
                         if (cast_value &&
-                            cast_value.getType() != expected_type) {
+                            (cast_value.getType() != expected_type ||
+                             GetTypeInfo(cast_value).is_unsigned_integer !=
+                                 expected_info.is_unsigned_integer)) {
                             cast_value = CreateTypeConversion(
                                 cast_value, cast_value.getType(), expected_type,
-                                return_loc, builder_);
+                                return_loc, builder_, false,
+                                GetTypeInfo(cast_value).is_unsigned_integer,
+                                expected_info.is_unsigned_integer);
                         }
                         return cast_value && cast_value.getType() == expected_type
                                    ? cast_value

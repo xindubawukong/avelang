@@ -405,14 +405,17 @@ mlir::Location ExprGenerator::GetMLIRLocation(clang::SourceLocation loc) const {
 mlir::Value ExprGenerator::EnsureCompatibleTypes(mlir::Value value,
                                                  mlir::Type source_type,
                                                  mlir::Type target_type,
-                                                 clang::SourceLocation loc) {
+                                                 clang::SourceLocation loc,
+                                                 TypeInfo targetInfo) {
     auto *ctx = parent_->GetContext();
     auto &builder = parent_->GetBuilder();
     auto *diagnostics = ctx->diagnostic_manager.get();
 
-    // If types are already the same, no conversion needed
     if (source_type == target_type) {
-        return value;
+        return CreateTypeConversion(value, source_type, target_type,
+                                    GetMLIRLocation(loc), builder, false,
+                                    GetTypeInfo(value).is_unsigned_integer,
+                                    targetInfo.is_unsigned_integer);
     }
 
     auto source_memref = mlir::dyn_cast<cf::MemRefType>(source_type);
@@ -492,8 +495,9 @@ mlir::Value ExprGenerator::EnsureCompatibleTypes(mlir::Value value,
     }
 
     // For non-vector types, use the standard type conversion
-    auto result = CreateTypeConversion(value, source_type, target_type,
-                                       GetMLIRLocation(loc), builder);
+    auto result = CreateTypeConversion(
+        value, source_type, target_type, GetMLIRLocation(loc), builder, false,
+        GetTypeInfo(value).is_unsigned_integer, targetInfo.is_unsigned_integer);
     if (!result) {
         if (diagnostics) {
             std::string source_str, target_str;
@@ -1280,6 +1284,7 @@ mlir::Value ExprGenerator::CastTensorVector(mlir::Value value,
                 auto indices = createZeroIndices(target_memref_type.getRank());
                 cf::AveLangMemRefStoreOp::create(builder, mlir_loc, value,
                                                  alloca, indices);
+                SetTypeInfo(alloca.getResult(), GetTypeInfo(value));
                 return alloca.getResult();
             }
         }
@@ -1339,9 +1344,10 @@ ExprGenerator::GenerateFuncCall(ast::Call *call, mlir::func::FuncOp func_op,
         auto cast_value =
             CastTensorVector(arg_value, expected_type, source_loc);
 
-        if (cast_value.getType() != expected_type) {
-            cast_value = EnsureCompatibleTypes(cast_value, cast_value.getType(),
-                                               expected_type, source_loc);
+        if (cast_value) {
+            cast_value = EnsureCompatibleTypes(
+                cast_value, cast_value.getType(), expected_type, source_loc,
+                GetFunctionArgumentTypeInfo(func_op, i));
         }
 
         if (!cast_value || cast_value.getType() != expected_type) {
@@ -1364,6 +1370,10 @@ ExprGenerator::GenerateFuncCall(ast::Call *call, mlir::func::FuncOp func_op,
 
     auto call_op = mlir::func::CallOp::create(
         builder, loc, func_op.getSymName(), result_types, call_args);
+    for (unsigned i = 0; i < result_types.size(); ++i) {
+        SetTypeInfo(call_op.getResult(i),
+                    GetFunctionResultTypeInfo(func_op, i));
+    }
     if (result_types.empty()) {
         return CreateVoidValue();
     }

@@ -137,6 +137,17 @@ TEST_F(IntegerSignednessTest, BitwiseWideningKeepsZeroExtensionPolicy) {
     EXPECT_EQ(GetTypeInfo(rhs).is_unsigned_integer, false);
 }
 
+TEST_F(IntegerSignednessTest, MultiResultSignednessIsIndependent) {
+    auto op = mlir::UnrealizedConversionCastOp::create(
+        builder, loc,
+        mlir::TypeRange{builder.getI32Type(), builder.getI32Type()},
+        mlir::ValueRange{Integer(32, false), Integer(32, true)});
+    SetTypeInfo(op.getResult(0), TypeInfo{false});
+    SetTypeInfo(op.getResult(1), TypeInfo{true});
+    EXPECT_EQ(GetTypeInfo(op.getResult(0)).is_unsigned_integer, false);
+    EXPECT_EQ(GetTypeInfo(op.getResult(1)).is_unsigned_integer, true);
+}
+
 TEST_F(IntegerSignednessTest, FoldingUsesInstructionWidthsAndPredicates) {
     for (unsigned width : {8, 16, 32, 64}) {
         auto minusOne = Integer(width, false);

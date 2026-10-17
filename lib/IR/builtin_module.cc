@@ -1231,6 +1231,7 @@ CreateShuffleFunctionImpl(ast::Call *call_expr, GeneratorContext *ctx,
 
     auto shuffle = mlir::gpu::ShuffleOp::create(builder, location, value,
                                                 offset, width, mode);
+    SetTypeInfo(shuffle.getShuffleResult(), GetTypeInfo(value));
     return shuffle.getShuffleResult();
 }
 
@@ -1351,6 +1352,7 @@ mlir::Value AveLangModule::CreateMakeTensorFunction(
 
     auto castOp = cf::AveLangMemRefCastOp::create(builder, location, ptrValue,
                                                   layoutValue, resultType);
+    SetTypeInfo(castOp.getResult(), element.info);
     return castOp.getResult();
 }
 

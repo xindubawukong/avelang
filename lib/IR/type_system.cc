@@ -61,12 +61,24 @@ mlir::IntegerAttr EncodeTypeInfoAttr(mlir::MLIRContext *ctx, bool isUnsigned) {
                                         : IntegerSignednessAttr::kSigned));
 }
 
-std::optional<bool> GetTypeInfoAttr(mlir::Operation *op,
+std::optional<bool> GetTypeInfoAttr(mlir::Value value,
                                     llvm::StringRef attrName) {
+    auto *op = value.getDefiningOp();
     if (!op) {
         return std::nullopt;
     }
-    return DecodeTypeInfoAttr(op->getAttrOfType<mlir::IntegerAttr>(attrName));
+    if (auto attrs = op->getAttrOfType<mlir::ArrayAttr>(attrName)) {
+        auto index = mlir::cast<mlir::OpResult>(value).getResultNumber();
+        if (index < attrs.size()) {
+            return DecodeTypeInfoAttr(
+                mlir::dyn_cast<mlir::IntegerAttr>(attrs[index]));
+        }
+        return std::nullopt;
+    }
+    return op->getNumResults() == 1
+               ? DecodeTypeInfoAttr(
+                     op->getAttrOfType<mlir::IntegerAttr>(attrName))
+               : std::nullopt;
 }
 
 std::optional<bool> GetFunctionArgTypeInfoAttr(mlir::BlockArgument arg,
@@ -100,7 +112,7 @@ TypeInfo GetValueTypeInfo(mlir::Value value) {
         return DefaultTypeInfo(value.getType());
     }
 
-    if (auto attr = GetTypeInfoAttr(defOp, kValueTypeInfoAttr)) {
+    if (auto attr = GetTypeInfoAttr(value, kValueTypeInfoAttr)) {
         return TypeInfoFromAttr(attr);
     }
 
@@ -168,7 +180,7 @@ TypeInfo GetMemRefTypeInfo(mlir::Value value) {
         return DefaultTypeInfo(value.getType());
     }
 
-    if (auto attr = GetTypeInfoAttr(defOp, kMemRefTypeInfoAttr)) {
+    if (auto attr = GetTypeInfoAttr(value, kMemRefTypeInfoAttr)) {
         return TypeInfoFromAttr(attr);
     }
 
@@ -231,7 +243,25 @@ void SetTypeInfo(mlir::Value value, const TypeInfo &typeInfo) {
             return;
         }
         if (auto *defOp = value.getDefiningOp()) {
-            defOp->setAttr(attrName, attr);
+            if (defOp->getNumResults() == 1) {
+                defOp->setAttr(attrName, attr);
+            } else {
+                llvm::SmallVector<mlir::Attribute> attrs(
+                    defOp->getNumResults(),
+                    mlir::IntegerAttr::get(
+                        mlir::IntegerType::get(value.getContext(), 32), 0));
+                if (auto existing =
+                        defOp->getAttrOfType<mlir::ArrayAttr>(attrName)) {
+                    for (size_t i = 0; i < attrs.size() && i < existing.size();
+                         ++i) {
+                        attrs[i] = existing[i];
+                    }
+                }
+                attrs[mlir::cast<mlir::OpResult>(value).getResultNumber()] =
+                    attr;
+                defOp->setAttr(attrName,
+                               mlir::ArrayAttr::get(value.getContext(), attrs));
+            }
         }
     };
 
@@ -240,6 +270,41 @@ void SetTypeInfo(mlir::Value value, const TypeInfo &typeInfo) {
     } else if (IsIntegerValueOrVectorOfIntegers(value.getType())) {
         setAttr(kValueTypeInfoAttr);
     }
+}
+
+TypeInfo GetFunctionArgumentTypeInfo(mlir::func::FuncOp function,
+                                     unsigned index) {
+    auto type = function.getFunctionType().getInput(index);
+    auto attrName = IsMemRefWithIntegerElements(type) ? kMemRefTypeInfoAttr
+                                                      : kValueTypeInfoAttr;
+    auto info = DecodeTypeInfoAttr(
+        function.getArgAttrOfType<mlir::IntegerAttr>(index, attrName));
+    return info ? TypeInfoFromAttr(info) : DefaultTypeInfo(type);
+}
+
+TypeInfo GetFunctionResultTypeInfo(mlir::func::FuncOp function,
+                                   unsigned index) {
+    auto type = function.getFunctionType().getResult(index);
+    auto attrName = IsMemRefWithIntegerElements(type) ? kMemRefTypeInfoAttr
+                                                      : kValueTypeInfoAttr;
+    auto info = DecodeTypeInfoAttr(
+        function.getResultAttrOfType<mlir::IntegerAttr>(index, attrName));
+    return info ? TypeInfoFromAttr(info) : DefaultTypeInfo(type);
+}
+
+void SetFunctionResultTypeInfo(mlir::func::FuncOp function, unsigned index,
+                               const TypeInfo &typeInfo) {
+    auto type = function.getFunctionType().getResult(index);
+    if (!typeInfo.is_unsigned_integer ||
+        (!IsIntegerValueOrVectorOfIntegers(type) &&
+         !IsMemRefWithIntegerElements(type))) {
+        return;
+    }
+    auto attrName = IsMemRefWithIntegerElements(type) ? kMemRefTypeInfoAttr
+                                                      : kValueTypeInfoAttr;
+    function.setResultAttr(index, attrName,
+                           EncodeTypeInfoAttr(function.getContext(),
+                                              *typeInfo.is_unsigned_integer));
 }
 
 } // namespace causalflow::avelang::ir

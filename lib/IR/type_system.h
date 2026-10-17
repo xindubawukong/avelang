@@ -7,6 +7,10 @@
 
 #include <optional>
 
+namespace mlir::func {
+class FuncOp;
+}
+
 namespace causalflow::avelang::ir {
 
 struct TypeInfo {
@@ -25,5 +29,10 @@ bool IsMemRefWithIntegerElements(mlir::Type type);
 
 TypeInfo GetTypeInfo(mlir::Value value);
 void SetTypeInfo(mlir::Value value, const TypeInfo &typeInfo);
+TypeInfo GetFunctionArgumentTypeInfo(mlir::func::FuncOp function,
+                                     unsigned index);
+TypeInfo GetFunctionResultTypeInfo(mlir::func::FuncOp function, unsigned index);
+void SetFunctionResultTypeInfo(mlir::func::FuncOp function, unsigned index,
+                               const TypeInfo &typeInfo);
 
 } // namespace causalflow::avelang::ir

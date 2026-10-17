@@ -70,7 +70,8 @@ class ExprGenerator : public ast::ASTVisitor<ExprGenerator, mlir::Value> {
   private:
     mlir::Value EnsureCompatibleTypes(mlir::Value value, mlir::Type source_type,
                                       mlir::Type target_type,
-                                      clang::SourceLocation loc);
+                                      clang::SourceLocation loc,
+                                      TypeInfo targetInfo = {});
 
     FunctionGenerator *parent_;
 };
