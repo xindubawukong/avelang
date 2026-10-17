@@ -716,6 +716,18 @@ mlir::Value ExprGenerator::VisitUnaryOp(ast::UnaryOp *unaryop) {
     auto &builder = parent_->GetBuilder();
     auto location = GetMLIRLocation(unaryop);
 
+    // The parser represents INT32_MIN as unary minus applied to 2147483648.
+    // Materialize it as one literal before checking the positive operand.
+    if (op == "USub") {
+        if (auto *literal =
+                llvm::dyn_cast<ast::Constant>(unaryop->GetOperand());
+            literal &&
+            ParseConstantInteger(literal->GetValue()) == int64_t{2147483648}) {
+            return mlir::arith::ConstantIntOp::create(builder, location,
+                                                      int64_t{-2147483648}, 32);
+        }
+    }
+
     // Generate operand
     auto operand = Dispatch(unaryop->GetOperand());
     if (!operand) {
@@ -1107,11 +1119,20 @@ mlir::Value ExprGenerator::VisitConstant(ast::Constant *constant) {
     const std::string &value = constant->GetValue();
     auto location = GetMLIRLocation(constant);
 
-    // Try to parse as integer first
-    if (auto intValue = ParseConstantInteger(value)) {
-        // For integer constants, we'll use a default i32 type unless context
-        // suggests otherwise This can be extended later to infer type from
-        // usage context
+    // Runtime integer literals retain the default i32 type. Reject values
+    // that would be silently truncated, including overflow during parsing.
+    llvm::StringRef integerText(value);
+    integerText.consume_front("-");
+    if (!integerText.empty() &&
+        integerText.find_first_not_of("0123456789") == llvm::StringRef::npos) {
+        auto intValue = ParseConstantInteger(value);
+        if (!intValue || *intValue < int64_t{-2147483648} ||
+            *intValue > int64_t{2147483647}) {
+            Report(this, basic::DiagnosticCode::kTypeMismatch,
+                   constant->GetSourceRange().getBegin())
+                << "Integer literal is out of range for the default i32 type";
+            return nullptr;
+        }
         auto intType = builder.getI32Type();
 
         // Create integer constant using ConstantOp instead of deprecated

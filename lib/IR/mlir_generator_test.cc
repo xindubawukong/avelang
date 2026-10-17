@@ -1414,6 +1414,61 @@ def call_signedness(x: S.i32, out: S.Tensor((2,), S.i32)):
     EXPECT_EQ(unsignedShifts, 1u);
 }
 
+TEST_F(MLIRGeneratorTest, IntegerLiteralBounds) {
+    RunMLIRGenerationTest(R"(
+import avelang
+import avelang.language as S
+@avelang.jit
+def literal_bounds(out: S.Tensor((2,), S.i32)):
+    out[0] = -2147483648
+    out[1] = 2147483647
+)");
+}
+
+TEST_F(MLIRGeneratorTest, ReadFirstLaneRejectsImplicitTruncation) {
+    RunMLIRGenerationErrorTest(R"(
+import avelang
+import avelang.language as S
+@avelang.jit
+def readfirstlane_wide(value: S.u64, out: S.Tensor((2,), S.u64)):
+    out[0] = S.amdgpu.readfirstlane(value)
+)",
+                               "readfirstlane() expects i32 or u32");
+}
+
+TEST_F(MLIRGeneratorTest, RejectTruncatedIntegerLiteral) {
+    RunMLIRGenerationErrorTest(R"(
+import avelang
+import avelang.language as S
+@avelang.jit
+def literal_overflow(out: S.Tensor((2,), S.i64)):
+    out[0] = S.convert(4294967296, S.u64)
+)",
+                               "Integer literal is out of range");
+}
+
+TEST_F(MLIRGeneratorTest, RejectIntegerLiteralBelowMinimum) {
+    RunMLIRGenerationErrorTest(R"(
+import avelang
+import avelang.language as S
+@avelang.jit
+def literal_underflow(out: S.Tensor((2,), S.i32)):
+    out[0] = -2147483649
+)",
+                               "Integer literal is out of range");
+}
+
+TEST_F(MLIRGeneratorTest, RejectIntegerLiteralParseOverflow) {
+    RunMLIRGenerationErrorTest(R"(
+import avelang
+import avelang.language as S
+@avelang.jit
+def literal_parse_overflow(out: S.Tensor((2,), S.i64)):
+    out[0] = 9223372036854775808
+)",
+                               "Integer literal is out of range");
+}
+
 TEST_F(MLIRGeneratorTest, GenerateMLIRUnsignedBitcastConstantFoldShape) {
     static const std::string kSourceCode = R"""""(
 import avelang

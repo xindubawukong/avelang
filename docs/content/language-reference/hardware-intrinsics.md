@@ -94,6 +94,10 @@ The common GEMM pattern is to create one descriptor for the block-owned rows, th
 
 ## Other AMDGPU Helpers
 
+`al.amdgpu.readfirstlane(value)` broadcasts the first active lane's `i32` or
+`u32` value and preserves its signedness. Other integer widths and index values
+require an explicit `al.convert(value, al.i32)` or `al.convert(value, al.u32)`.
+
 `al.amdgpu.rcp(x)` lowers to an AMDGPU reciprocal instruction for `f32` values.
 
 ```python

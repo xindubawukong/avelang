@@ -1,4 +1,5 @@
 #include "parsing_utils.h"
+#include <cerrno>
 #include <cstdlib>
 
 namespace causalflow::avelang::ir {
@@ -8,10 +9,11 @@ std::optional<long long> ParseConstantInteger(const std::string &value) {
         return std::nullopt;
 
     char *end;
+    errno = 0;
     long long result = std::strtoll(value.c_str(), &end, 10);
 
     // Check if the entire string was consumed and conversion was successful
-    if (end != value.c_str() && *end == '\0') {
+    if (end != value.c_str() && *end == '\0' && errno != ERANGE) {
         return result;
     }
 

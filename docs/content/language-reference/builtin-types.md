@@ -34,6 +34,11 @@ Bitwise operations retain zero extension when widening; a shift's signedness
 comes from its left operand. Compile-time integer folding follows the same
 width, wrapping, and signedness rules as runtime operations.
 
+Runtime integer literals default to `i32` and must fit in the range
+`[-2147483648, 2147483647]`. Out-of-range literals are rejected rather than
+truncated, even inside `al.convert`. This does not restrict compile-time
+shape expressions to `i32`.
+
 ## Tensor Types
 
 `al.Tensor(shape, type)` denotes the type of a tensor. A tensor is a multidimensional view over a memory region. The shape describes the logical dimensions of the tensor, and the type describes the value type of each element. For example, `al.Tensor((16, 16), al.f32)` denotes a two-dimensional tensor with 16 rows and 16 columns of 32-bit floating point values.

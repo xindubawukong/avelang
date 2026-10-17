@@ -852,7 +852,7 @@ mlir::Value AMDGPUIntrinsic::CreateReadFirstLaneFunction(
     llvm::ArrayRef<mlir::Value> resolved_args) const {
     auto &builder = ctx->GetCurrentFunctionGenerator()->GetBuilder();
     auto location = GetCallLocation(ctx, call_expr);
-    auto value = ConvertToI32(builder, location, resolved_args[0]);
+    auto value = resolved_args[0];
     auto op = mlir::ROCDL::ReadfirstlaneOp::create(builder, location,
                                                    value.getType(), value);
     SetTypeInfo(op.getResult(), GetTypeInfo(resolved_args[0]));
@@ -1543,10 +1543,11 @@ bool AMDGPUIntrinsic::CheckReadFirstLaneFunction(
         return false;
     }
 
-    if (!resolved_args[0].getType().isIntOrIndex()) {
+    if (!resolved_args[0].getType().isInteger(32)) {
         ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
                                         call_expr->GetSourceRange().getBegin())
-            << "readfirstlane() expects an integer or index argument";
+            << "readfirstlane() expects i32 or u32; convert other widths "
+               "explicitly";
         return false;
     }
 
