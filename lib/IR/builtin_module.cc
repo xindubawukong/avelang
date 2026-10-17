@@ -1129,16 +1129,15 @@ mlir::Value AveLangModule::CreateRangeFunction(
 
     // Convert to index type if needed
     if (!lower_bound.getType().isIndex()) {
-        lower_bound = mlir::arith::IndexCastOp::create(
-            builder, location, builder.getIndexType(), lower_bound);
+        lower_bound = CreateIndexCast(builder, location, builder.getIndexType(),
+                                      lower_bound);
     }
     if (!upper_bound.getType().isIndex()) {
-        upper_bound = mlir::arith::IndexCastOp::create(
-            builder, location, builder.getIndexType(), upper_bound);
+        upper_bound = CreateIndexCast(builder, location, builder.getIndexType(),
+                                      upper_bound);
     }
     if (!step.getType().isIndex()) {
-        step = mlir::arith::IndexCastOp::create(builder, location,
-                                                builder.getIndexType(), step);
+        step = CreateIndexCast(builder, location, builder.getIndexType(), step);
     }
 
     // Create the range object with normalized lower_bound, upper_bound, step
@@ -1195,8 +1194,8 @@ CreateShuffleFunctionImpl(ast::Call *call_expr, GeneratorContext *ctx,
                               llvm::StringRef operandName) -> mlir::Value {
         auto inputType = input.getType();
         if (inputType.isIndex()) {
-            return mlir::arith::IndexCastOp::create(
-                builder, location, builder.getI32Type(), input);
+            return CreateIndexCast(builder, location, builder.getI32Type(),
+                                   input);
         }
 
         auto intType = mlir::dyn_cast<mlir::IntegerType>(inputType);
@@ -1675,7 +1674,7 @@ mlir::Value AveLangModule::CreateSubviewFunction(
 
             // Convert to index type if needed
             if (!dynamic_value.getType().isIndex()) {
-                dynamic_value = mlir::arith::IndexCastOp::create(
+                dynamic_value = CreateIndexCast(
                     builder, location, builder.getIndexType(), dynamic_value);
             }
 

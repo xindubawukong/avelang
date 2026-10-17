@@ -139,18 +139,32 @@ mlir::Value CreateTypeConversion(mlir::Value value, mlir::Type source_type,
 
     // Index type conversions
     if (source_type.isIndex() && target_type.isInteger()) {
-        auto result = mlir::arith::IndexCastOp::create(builder, location,
-                                                       target_type, value);
+        auto result = CreateIndexCast(builder, location, target_type, value);
         SetTypeInfo(result, TypeInfo{target_unsigned.value_or(false)});
         return result;
     }
     if (source_type.isInteger() && target_type.isIndex()) {
-        return mlir::arith::IndexCastOp::create(builder, location, target_type,
-                                                value);
+        return CreateIndexCast(builder, location, target_type, value);
     }
 
     // Unsupported conversion - return nullptr to indicate failure
     return nullptr;
+}
+
+mlir::Value CreateIndexCast(mlir::OpBuilder &builder, mlir::Location location,
+                            mlir::Type targetType, mlir::Value value) {
+    if (value.getType() == targetType) {
+        return value;
+    }
+    // Index itself retains the existing signed interpretation. Integer inputs
+    // must be extended according to their interpretation, including bool's 0/1.
+    if (value.getType().isInteger(1) ||
+        GetTypeInfo(value).is_unsigned_integer.value_or(false)) {
+        return mlir::arith::IndexCastUIOp::create(builder, location, targetType,
+                                                  value);
+    }
+    return mlir::arith::IndexCastOp::create(builder, location, targetType,
+                                            value);
 }
 
 namespace {

@@ -35,6 +35,10 @@ CreateTypeConversion(mlir::Value value, mlir::Type source_type,
                      std::optional<bool> source_unsigned = std::nullopt,
                      std::optional<bool> target_unsigned = std::nullopt);
 
+/// Cast between integer and index types using the integer source's signedness.
+mlir::Value CreateIndexCast(mlir::OpBuilder &builder, mlir::Location location,
+                            mlir::Type targetType, mlir::Value value);
+
 /// Converts two values to compatible types for arithmetic operations.
 /// This function promotes both operands to a common type following these rules:
 /// - Integer types use the wider width and are unsigned if either operand is

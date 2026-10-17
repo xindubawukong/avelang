@@ -5,6 +5,7 @@
 #include "generator_context.h"
 #include "mlir_generator_impl.h"
 #include "parsing_utils.h"
+#include "type_promotion.h"
 #include "type_system.h"
 
 #include <mlir/Dialect/Affine/IR/AffineOps.h>
@@ -62,8 +63,7 @@ mlir::Value LayoutOperation::CastToIndex(mlir::OpBuilder &builder,
         return value;
     }
     if (value.getType().isIntOrIndexOrFloat()) {
-        return mlir::arith::IndexCastOp::create(builder, loc,
-                                                builder.getIndexType(), value);
+        return CreateIndexCast(builder, loc, builder.getIndexType(), value);
     }
     return value;
 }
@@ -362,8 +362,35 @@ mlir::Value LayoutOperation::createMakeLayoutFunction(
         return nullptr;
     }
 
+    // Normalize while TypeInfo is still available. Lowering can then consume
+    // index leaves directly without guessing signedness from signless MLIR.
+    auto toIndexTuple = [&](auto &&self, mlir::Value value) -> mlir::Value {
+        if (auto tuple = value.getDefiningOp<cf::MakeIntTupleOp>()) {
+            llvm::SmallVector<mlir::Value> elements;
+            for (auto element : tuple.getElements()) {
+                auto converted = self(self, element);
+                if (!converted)
+                    return nullptr;
+                elements.push_back(converted);
+            }
+            return cf::MakeIntTupleOp::create(builder, location, elements);
+        }
+        if (!value.getType().isIntOrIndex())
+            return nullptr;
+        return CreateIndexCast(builder, location, builder.getIndexType(),
+                               value);
+    };
+    dimsValue = toIndexTuple(toIndexTuple, dimsValue);
+    strideValue = toIndexTuple(toIndexTuple, strideValue);
+    if (!dimsValue || !strideValue) {
+        ctx->diagnostic_manager->Report(basic::DiagnosticCode::kUnimplemented,
+                                        callExpr->GetSourceRange().getBegin())
+            << "Dims and stride arguments to make_layout() must be integer "
+               "tuples";
+        return nullptr;
+    }
     auto makeLayoutOp =
-        cf::MakeLayoutOp::create(builder, location, dimsTupleOp, strideTupleOp);
+        cf::MakeLayoutOp::create(builder, location, dimsValue, strideValue);
 
     return makeLayoutOp.getResult();
 }

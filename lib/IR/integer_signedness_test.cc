@@ -114,6 +114,21 @@ TEST_F(IntegerSignednessTest, BooleanConversionsZeroExtend) {
     EXPECT_TRUE(floating.getDefiningOp<mlir::arith::UIToFPOp>());
 }
 
+TEST_F(IntegerSignednessTest, UnsignedIndexCastsZeroExtend) {
+    for (unsigned width : {1, 8, 16, 32}) {
+        auto value = Integer(width, true);
+        auto index =
+            CreateIndexCast(builder, loc, builder.getIndexType(), value);
+        EXPECT_TRUE(index.getDefiningOp<mlir::arith::IndexCastUIOp>());
+        EXPECT_EQ(ConstantFolder::FoldIntValue(index),
+                  (int64_t{1} << width) - 1);
+    }
+    auto signedIndex = CreateIndexCast(builder, loc, builder.getIndexType(),
+                                       Integer(32, false));
+    EXPECT_TRUE(signedIndex.getDefiningOp<mlir::arith::IndexCastOp>());
+    EXPECT_EQ(ConstantFolder::FoldIntValue(signedIndex), -1);
+}
+
 TEST_F(IntegerSignednessTest, BitwiseWideningKeepsZeroExtensionPolicy) {
     auto [lhs, rhs] = ConvertTypesForBitwise(Integer(32, false),
                                              Integer(64, false), builder, loc);

@@ -1272,6 +1272,72 @@ def mixed_floats(a: S.bf16, b: S.f16, out: S.Tensor((2,), S.f32)):
         "Cannot perform arithmetic with incompatible types");
 }
 
+TEST_F(MLIRGeneratorTest, UnsignedRangeAndSubscriptUseIndexCastUI) {
+    const std::string source = R"(
+import avelang
+import avelang.language as S
+@avelang.jit
+def unsigned_indices(start: S.u32, end: S.u32, step: S.u32, out: S.Tensor((8,), S.i32)):
+    for i in S.range(start, end, step):
+        out[start] = 1
+)";
+    ast::ASTNode *root = nullptr;
+    TryParse(source, &root);
+    auto context = ir::IRContext::Create();
+    ir::MLIRGenerator generator(context.get(), diagnostics_);
+    auto module = generator.Generate(root);
+    ASSERT_FALSE(diagnostics_->GetEngine()->hasErrorOccurred())
+        << diagHandler_.GetErrorMessages();
+    ASSERT_TRUE(module);
+    EXPECT_TRUE(mlir::succeeded(mlir::verify(module)));
+    unsigned casts = 0;
+    module.walk([&](mlir::arith::IndexCastUIOp cast) {
+        if (cast.getType().isIndex())
+            ++casts;
+    });
+    EXPECT_EQ(casts, 4u);
+}
+
+TEST_F(MLIRGeneratorTest, DynamicLayoutConvertsNestedLeavesWithSignedness) {
+    const std::string source = R"(
+import avelang
+import avelang.language as S
+@avelang.jit
+def dynamic_layout(n: S.u32, stride: S.u32, signed_stride: S.i32):
+    layout = S.make_layout(((n, 2),), ((stride, signed_stride),))
+)";
+    ast::ASTNode *root = nullptr;
+    TryParse(source, &root);
+    auto context = ir::IRContext::Create();
+    ir::MLIRGenerator generator(context.get(), diagnostics_);
+    auto module = generator.Generate(root);
+    ASSERT_FALSE(diagnostics_->GetEngine()->hasErrorOccurred())
+        << diagHandler_.GetErrorMessages();
+    ASSERT_TRUE(module);
+    EXPECT_TRUE(mlir::succeeded(mlir::verify(module)));
+    unsigned layouts = 0, unsignedCasts = 0, signedCasts = 0;
+    module.walk([&](cf::MakeLayoutOp layout) {
+        ++layouts;
+        auto inspect = [&](auto &&self, mlir::Value value) -> void {
+            if (auto tuple = value.getDefiningOp<cf::MakeIntTupleOp>()) {
+                for (auto elem : tuple.getElements())
+                    self(self, elem);
+            } else {
+                EXPECT_TRUE(value.getType().isIndex());
+                unsignedCasts +=
+                    !!value.getDefiningOp<mlir::arith::IndexCastUIOp>();
+                signedCasts +=
+                    !!value.getDefiningOp<mlir::arith::IndexCastOp>();
+            }
+        };
+        inspect(inspect, layout.getDims());
+        inspect(inspect, layout.getStride());
+    });
+    EXPECT_EQ(layouts, 1u);
+    EXPECT_EQ(unsignedCasts, 2u);
+    EXPECT_EQ(signedCasts, 2u);
+}
+
 TEST_F(MLIRGeneratorTest, GenerateMLIRUnsignedBitcastConstantFoldShape) {
     static const std::string kSourceCode = R"""""(
 import avelang

@@ -1,4 +1,5 @@
 #include "Utils/assert.h"
+#include "constant_folder.h"
 #include "layout_operation.h"
 #include "mlir_generator_impl.h"
 #include "parsing_utils.h"
@@ -98,29 +99,6 @@ GetStaticByteSize(const cf::MemRefType &memrefType) {
         return std::nullopt;
     }
     return *elementCount * *elementBytes;
-}
-
-static std::optional<int64_t> GetConstantIndexLikeValue(mlir::Value value) {
-    if (!value) {
-        return std::nullopt;
-    }
-
-    if (auto constIndex = value.getDefiningOp<mlir::arith::ConstantIndexOp>()) {
-        return constIndex.value();
-    }
-
-    if (auto indexCast = value.getDefiningOp<mlir::arith::IndexCastOp>()) {
-        return GetConstantIndexLikeValue(indexCast.getIn());
-    }
-
-    if (auto constOp = value.getDefiningOp<mlir::arith::ConstantOp>()) {
-        if (auto intAttr =
-                mlir::dyn_cast<mlir::IntegerAttr>(constOp.getValue())) {
-            return intAttr.getValue().getSExtValue();
-        }
-    }
-
-    return std::nullopt;
 }
 
 static mlir::Value LoadScalarFromMemref(mlir::OpBuilder &builder,
@@ -951,9 +929,8 @@ mlir::Value ExprGenerator::VisitSubscript(ast::Subscript *subscript) {
                 return nullptr;
             // Convert to index type if needed
             if (!index.getType().isIndex()) {
-                index = mlir::arith::IndexCastOp::create(
-                    builder, GetMLIRLocation(element), builder.getIndexType(),
-                    index);
+                index = CreateIndexCast(builder, GetMLIRLocation(element),
+                                        builder.getIndexType(), index);
             }
             indices.push_back(index);
         }
@@ -964,9 +941,8 @@ mlir::Value ExprGenerator::VisitSubscript(ast::Subscript *subscript) {
             return nullptr;
         // Convert to index type if needed
         if (!index.getType().isIndex()) {
-            index = mlir::arith::IndexCastOp::create(
-                builder, GetMLIRLocation(slice_expr), builder.getIndexType(),
-                index);
+            index = CreateIndexCast(builder, GetMLIRLocation(slice_expr),
+                                    builder.getIndexType(), index);
         }
         indices.push_back(index);
     }
@@ -986,7 +962,7 @@ mlir::Value ExprGenerator::VisitSubscript(ast::Subscript *subscript) {
         llvm::SmallVector<mlir::OpFoldResult> position_indices;
         position_indices.reserve(indices.size());
         for (auto idx : indices) {
-            if (auto constantIndex = GetConstantIndexLikeValue(idx)) {
+            if (auto constantIndex = ConstantFolder::FoldIntValue(idx)) {
                 position_indices.push_back(
                     builder.getIndexAttr(*constantIndex));
             } else {

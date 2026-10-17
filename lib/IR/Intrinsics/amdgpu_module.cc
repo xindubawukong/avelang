@@ -6,6 +6,7 @@
 #include "IR/generator_context.h"
 #include "IR/mlir_generator_impl.h"
 #include "IR/named_module.h"
+#include "IR/type_promotion.h"
 #include "IR/type_system.h"
 #include "Utils/assert.h"
 #include "Utils/embedded_filesystem_view.h"
@@ -519,8 +520,7 @@ mlir::Type GetMfmaElemType(amdgpu_mfma::VectorElemKind kind,
 mlir::Value ConvertToI32(mlir::OpBuilder &builder, mlir::Location location,
                          mlir::Value value) {
     if (value.getType().isIndex()) {
-        return mlir::arith::IndexCastOp::create(builder, location,
-                                                builder.getI32Type(), value);
+        return CreateIndexCast(builder, location, builder.getI32Type(), value);
     }
 
     auto intType = mlir::dyn_cast<mlir::IntegerType>(value.getType());
@@ -544,8 +544,7 @@ mlir::Value ConvertToIndex(mlir::OpBuilder &builder, mlir::Location location,
     if (!intType) {
         return value;
     }
-    return mlir::arith::IndexCastOp::create(builder, location,
-                                            builder.getIndexType(), value);
+    return CreateIndexCast(builder, location, builder.getIndexType(), value);
 }
 
 std::optional<mlir::Type> GetAtomicElementType(mlir::Type type) {
@@ -718,8 +717,8 @@ mlir::Value AMDGPUIntrinsic::CreateMakeRsrcFunction(
 
     auto ptrIndex = cf::AveLangMemRefExtractAlignedPointerAsIndexOp::create(
         builder, location, builder.getIndexType(), memref);
-    auto ptrI64 = mlir::arith::IndexCastOp::create(
-        builder, location, builder.getI64Type(), ptrIndex);
+    auto ptrI64 =
+        CreateIndexCast(builder, location, builder.getI64Type(), ptrIndex);
 
     auto shiftAmount =
         mlir::arith::ConstantIntOp::create(builder, location, 32, 64);
@@ -731,8 +730,8 @@ mlir::Value AMDGPUIntrinsic::CreateMakeRsrcFunction(
         builder, location, builder.getI32Type(), ptrHighI64);
     mlir::Value rangeI32 = rangeValue;
     if (rangeI32.getType().isIndex()) {
-        rangeI32 = mlir::arith::IndexCastOp::create(
-            builder, location, builder.getI32Type(), rangeI32);
+        rangeI32 =
+            CreateIndexCast(builder, location, builder.getI32Type(), rangeI32);
     } else if (auto intType =
                    mlir::dyn_cast<mlir::IntegerType>(rangeI32.getType())) {
         if (intType.getWidth() < 32) {
@@ -1649,8 +1648,8 @@ mlir::Value AMDGPUIntrinsic::CreateGlobalAtomicAddFunction(
     auto pointerIndex =
         cf::AveLangMemRefExtractAlignedPointerAsIndexOp::create(
             builder, location, builder.getIndexType(), resolved_args[2]);
-    auto baseAddress = mlir::arith::IndexCastOp::create(
-        builder, location, builder.getI64Type(), pointerIndex);
+    auto baseAddress =
+        CreateIndexCast(builder, location, builder.getI64Type(), pointerIndex);
     auto byteOffset = mlir::arith::ExtUIOp::create(
         builder, location, builder.getI64Type(), resolved_args[0]);
     auto address = mlir::arith::AddIOp::create(builder, location, baseAddress,
